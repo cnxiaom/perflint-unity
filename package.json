@@ -1,0 +1,23 @@
+{
+  "name": "com.perflint.unity",
+  "version": "0.25.0",
+  "displayName": "PerfLint for Unity",
+  "description": "One-click scan your project inside the editor to locate performance bottlenecks and version-migration blockers, with actionable fixes. All analysis runs locally — your code and art assets are never uploaded.",
+  "unity": "2021.3",
+  "documentationUrl": "https://perflint.dev/docs",
+  "changelogUrl": "https://perflint.dev/changelog",
+  "licensesUrl": "https://perflint.dev/license",
+  "keywords": [
+    "performance",
+    "optimization",
+    "lint",
+    "migration",
+    "profiler",
+    "editor-tools"
+  ],
+  "author": {
+    "name": "Tim",
+    "url": "https://perflint.dev"
+  },
+  "type": "tool"
+}

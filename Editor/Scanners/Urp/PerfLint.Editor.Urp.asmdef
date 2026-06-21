@@ -1,0 +1,30 @@
+{
+  "name": "PerfLint.Editor.Urp",
+  "rootNamespace": "PerfLint",
+  "references": [
+    "PerfLint.Editor",
+    "Unity.RenderPipelines.Core.Editor",
+    "Unity.RenderPipelines.Core.Runtime",
+    "Unity.RenderPipelines.Universal.Editor",
+    "Unity.RenderPipelines.Universal.Runtime"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [
+    "PERFLINT_URP"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.unity.render-pipelines.universal",
+      "expression": "10.0.0",
+      "define": "PERFLINT_URP"
+    }
+  ],
+  "noEngineReferences": false
+}

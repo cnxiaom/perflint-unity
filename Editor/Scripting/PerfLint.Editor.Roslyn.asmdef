@@ -1,0 +1,23 @@
+{
+  "name": "PerfLint.Editor.Roslyn",
+  "rootNamespace": "PerfLint",
+  "references": [
+    "PerfLint.Editor"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": true,
+  "precompiledReferences": [
+    "Microsoft.CodeAnalysis.dll",
+    "Microsoft.CodeAnalysis.CSharp.dll"
+  ],
+  "autoReferenced": true,
+  "defineConstraints": [
+    "PERFLINT_ROSLYN"
+  ],
+  "versionDefines": [],
+  "noEngineReferences": false
+}
