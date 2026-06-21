@@ -20,7 +20,7 @@ namespace PerfLint.Llm
 
         private void CreateGUI() => Rebuild();
 
-        // Provider / language changes affect available options and copy, so the entire panel is rebuilt.
+        // Provider changes affect available options and copy, so the entire panel is rebuilt.
         private void Rebuild()
         {
             var root = rootVisualElement;
@@ -29,17 +29,8 @@ namespace PerfLint.Llm
             root.style.paddingLeft = 10;
             root.style.paddingRight = 10;
 
-            // ── Language ──
-            var lang = new DropdownField(
-                L.Tr("Language", "语言"),
-                new List<string> { "English", "中文" },
-                (int)L.Current);
-            lang.RegisterValueChangedCallback(e =>
-            {
-                L.Current = lang.index == 1 ? Lang.Chinese : Lang.English;
-                Rebuild();
-            });
-            root.Add(lang);
+            // Language switch intentionally not exposed: the UI ships English-only by default.
+            // The bilingual infrastructure (L.Tr / Chinese strings) is kept for internal use.
 
             // ── Zero-config ready card (Hosted default) ──
             bool byo = LlmSettings.Mode == LlmMode.ByoKey;

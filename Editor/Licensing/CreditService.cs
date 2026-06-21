@@ -20,6 +20,12 @@ namespace PerfLint.Licensing
         private const string KReset = "PerfLint.Credits.Reset";         // reset timestamp (ISO, provided by the server)
         private const string KKnown = "PerfLint.Credits.Known";         // whether a balance has ever been received from the server
 
+        // Display-only mirror of the server's QUOTA (backend/creem-license-proxy/worker.js). The server stays
+        // authoritative; these only feed the idle "ready" label so new users see their allowance before the
+        // first call returns a real balance. Keep in sync if QUOTA changes there.
+        private const int FreeDailyLimit = 10;
+        private const int ProMonthlyLimit = 5000;
+
         /// <summary>Fired whenever the remaining balance changes, so the UI can refresh its display.</summary>
         public static event Action Changed;
 
@@ -63,7 +69,10 @@ namespace PerfLint.Licensing
         /// <summary>Single-line balance label for use in the UI.</summary>
         public static string RemainingText()
         {
-            if (!Known) return L.Tr("AI credits: ready (zero-config)", "AI 额度：就绪（零配置）");
+            if (!Known)
+                return LicenseService.IsPro
+                    ? L.Tr($"AI credits: {ProMonthlyLimit}/month · ready", $"AI 额度：每月 {ProMonthlyLimit} 次 · 就绪")
+                    : L.Tr($"AI credits: {FreeDailyLimit}/day free · ready", $"AI 额度：每日 {FreeDailyLimit} 次免费 · 就绪");
             string reset = string.IsNullOrEmpty(ResetAt) ? "" : " · " + L.Tr("resets ", "重置于 ") + LicenseService.FormatExpiryLocal(ResetAt);
             return L.Tr("AI credits left this period: ", "本期 AI 剩余额度：") + Remaining + reset;
         }

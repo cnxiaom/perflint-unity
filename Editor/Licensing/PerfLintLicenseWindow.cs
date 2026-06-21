@@ -34,17 +34,8 @@ namespace PerfLint.Licensing
             root.style.paddingLeft = 10;
             root.style.paddingRight = 10;
 
-            // ── Language ──
-            var lang = new DropdownField(
-                L.Tr("Language", "语言"),
-                new System.Collections.Generic.List<string> { "English", "中文" },
-                (int)L.Current);
-            lang.RegisterValueChangedCallback(_ =>
-            {
-                L.Current = lang.index == 1 ? Lang.Chinese : Lang.English;
-                Rebuild();
-            });
-            root.Add(lang);
+            // Language switch intentionally not exposed: the UI ships English-only by default.
+            // The bilingual infrastructure (L.Tr / Chinese strings) is kept for internal use.
 
             // ── Current status ──
             _status = new Label { style = { fontSize = 16, unityFontStyleAndWeight = FontStyle.Bold, marginTop = 10 } };
