@@ -29,6 +29,11 @@ namespace PerfLint.Licensing
         /// <summary>Fired whenever the remaining balance changes, so the UI can refresh its display.</summary>
         public static event Action Changed;
 
+        // Pro entitlement at the last seen change, so a Free↔Pro flip can drop the now-stale balance:
+        // Free (daily) and Pro (monthly) are two separate server-side pools, so a count from one pool is
+        // meaningless for the other. Initialized on first access to the current state (no spurious reset).
+        private static bool _lastIsPro = LicenseService.IsPro;
+
         public static bool Known => EditorPrefs.GetBool(KKnown, false);
         public static int Remaining => EditorPrefs.GetInt(KRemaining, -1);
         public static string ResetAt => EditorPrefs.GetString(KReset, "");
@@ -80,6 +85,21 @@ namespace PerfLint.Licensing
         private static void Raise()
         {
             try { Changed?.Invoke(); } catch { /* UI callback exceptions must not affect billing logic */ }
+        }
+
+        /// <summary>
+        /// Called by <see cref="LicenseService"/> on any license change. If Pro entitlement just flipped
+        /// (Free↔Pro), the cached balance belongs to the wrong pool, so drop it — <see cref="RemainingText"/>
+        /// then shows the new tier's standby allowance ("5000/month · ready" / "10/day free · ready") until
+        /// the next /llm call returns the real balance. No-op when the tier is unchanged, so background
+        /// re-validations don't wipe a known balance.
+        /// </summary>
+        internal static void OnLicenseChanged()
+        {
+            bool now = LicenseService.IsPro;
+            if (now == _lastIsPro) return;
+            _lastIsPro = now;
+            ResetCache();
         }
 
         /// <summary>Clears the locally cached balance (returns to the "unknown" state). Intended for tests and license-deactivation resets.</summary>

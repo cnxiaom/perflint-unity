@@ -175,10 +175,14 @@ namespace PerfLint.Core
                     {
                         CopyIfNewer(Path.Combine(bundle, d), Path.Combine(TargetDir, d));
                         // Also copy the pre-authored .meta file (already configured: Editor-only, Validate References off),
-                        // eliminating the need to configure each DLL manually.
+                        // eliminating the need to configure each DLL manually. Support DLLs (the System.* closure) ship
+                        // without a preset .meta — author an equivalent Editor-only one so they import the same way the
+                        // core DLLs do; relying on Unity's default import (Any Platform, Validate References on) can
+                        // re-break Roslyn compilation.
                         string meta = d + ".meta";
                         string srcMeta = Path.Combine(bundle, meta);
                         if (File.Exists(srcMeta)) CopyIfNewer(srcMeta, Path.Combine(TargetDir, meta));
+                        else WriteEditorOnlyPluginMeta(Path.Combine(TargetDir, meta));
                     }
                     AssetDatabase.Refresh();
 
@@ -273,6 +277,12 @@ namespace PerfLint.Core
                 foreach (var f in Directory.GetFiles(assets, "*.dll", SearchOption.AllDirectories))
                 {
                     if (Path.GetFullPath(f).StartsWith(target, StringComparison.OrdinalIgnoreCase)) continue;
+                    // Skip DLLs inside a Unity-ignored folder (any path segment ending in '~', e.g. the package's
+                    // dormant Editor/Scripting/RoslynDlls~). Under an Asset Store install the package lives under
+                    // Assets/, so those bundled DLLs are present on disk but invisible to Unity — counting them as
+                    // "already in the project" would make Install skip copying the real DLLs, leaving PERFLINT_ROSLYN
+                    // defined with no usable assemblies (CS0246 on every Roslyn type).
+                    if (IsInsideHiddenFolder(f)) continue;
                     string name = Path.GetFileName(f);
                     if (!map.ContainsKey(name)) map[name] = f;
                 }
@@ -312,6 +322,67 @@ namespace PerfLint.Core
         {
             if (File.Exists(dst) && File.GetLastWriteTimeUtc(dst) >= File.GetLastWriteTimeUtc(src)) return;
             File.Copy(src, dst, overwrite: true);
+        }
+
+        /// <summary>True if any directory segment of <paramref name="path"/> ends with '~' — a folder Unity ignores entirely (e.g. the package's dormant RoslynDlls~). Such files exist on disk but are invisible to the editor. Internal for regression testing.</summary>
+        internal static bool IsInsideHiddenFolder(string path)
+        {
+            string dir = Path.GetDirectoryName(path);
+            if (string.IsNullOrEmpty(dir)) return false;
+            foreach (var seg in dir.Replace('\\', '/').Split('/'))
+                if (seg.EndsWith("~", StringComparison.Ordinal)) return true;
+            return false;
+        }
+
+        // Editor-only managed-plugin .meta (Any disabled, Editor enabled, Validate References off) — mirrors the
+        // pre-authored .meta shipped for the core Roslyn DLLs and tests/roslyn-plugin-meta.template. {0} = GUID.
+        private const string EditorOnlyPluginMetaTemplate =
+            "fileFormatVersion: 2\n" +
+            "guid: {0}\n" +
+            "PluginImporter:\n" +
+            "  externalObjects: {{}}\n" +
+            "  serializedVersion: 2\n" +
+            "  iconMap: {{}}\n" +
+            "  executionOrder: {{}}\n" +
+            "  defineConstraints: []\n" +
+            "  isPreloaded: 0\n" +
+            "  isOverridable: 0\n" +
+            "  isExplicitlyReferenced: 0\n" +
+            "  validateReferences: 0\n" +
+            "  platformData:\n" +
+            "  - first:\n" +
+            "      Any:\n" +
+            "    second:\n" +
+            "      enabled: 0\n" +
+            "      settings: {{}}\n" +
+            "  - first:\n" +
+            "      Editor: Editor\n" +
+            "    second:\n" +
+            "      enabled: 1\n" +
+            "      settings:\n" +
+            "        DefaultValueInitialized: true\n" +
+            "  userData:\n" +
+            "  assetBundleName:\n" +
+            "  assetBundleVariant:\n";
+
+        /// <summary>Writes an Editor-only plugin .meta for a copied support DLL that ships without one (the System.* closure). No-op if a .meta already exists. GUID is derived deterministically from the file name so re-running install is stable.</summary>
+        private static void WriteEditorOnlyPluginMeta(string metaPath)
+        {
+            if (File.Exists(metaPath)) return;
+            string seed = Path.GetFileName(metaPath);   // e.g. System.Collections.Immutable.dll.meta
+            File.WriteAllText(metaPath, string.Format(EditorOnlyPluginMetaTemplate, DeterministicGuid(seed)));
+        }
+
+        /// <summary>32-hex-char GUID derived deterministically from <paramref name="seed"/> (stable across runs; avoids Date/random).</summary>
+        private static string DeterministicGuid(string seed)
+        {
+            using (var md5 = System.Security.Cryptography.MD5.Create())
+            {
+                var bytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes("PerfLintRoslyn:" + seed));
+                var sb = new System.Text.StringBuilder(32);
+                foreach (var b in bytes) sb.Append(b.ToString("x2"));
+                return sb.ToString();
+            }
         }
 
         // ── Scripting Define operations (targeting the currently active Build Target Group) ──────────

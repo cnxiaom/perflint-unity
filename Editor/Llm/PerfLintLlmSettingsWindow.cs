@@ -20,6 +20,20 @@ namespace PerfLint.Llm
 
         private void CreateGUI() => Rebuild();
 
+        // Live-refresh the credits line when the balance changes (after a /llm call) or the license tier
+        // flips (Free↔Pro) — otherwise an already-open panel keeps showing the previous tier's allowance.
+        private void OnEnable()
+        {
+            Licensing.CreditService.Changed += Rebuild;
+            Licensing.LicenseService.Changed += Rebuild;
+        }
+
+        private void OnDisable()
+        {
+            Licensing.CreditService.Changed -= Rebuild;
+            Licensing.LicenseService.Changed -= Rebuild;
+        }
+
         // Provider changes affect available options and copy, so the entire panel is rebuilt.
         private void Rebuild()
         {
@@ -29,8 +43,9 @@ namespace PerfLint.Llm
             root.style.paddingLeft = 10;
             root.style.paddingRight = 10;
 
-            // Language switch intentionally not exposed: the UI ships English-only by default.
-            // The bilingual infrastructure (L.Tr / Chinese strings) is kept for internal use.
+            // English-only by default. A dev-only EN/中 switch is injected here ONLY in a PERFLINT_DEV editor
+            // (no-op in release — see L.InjectDevLangSwitch); flipping it rebuilds the panel in the new language.
+            L.InjectDevLangSwitch(root, Rebuild);
 
             // ── Zero-config ready card (Hosted default) ──
             bool byo = LlmSettings.Mode == LlmMode.ByoKey;
@@ -91,6 +106,7 @@ namespace PerfLint.Llm
                 {
                     value = LlmSettings.Enabled
                 };
+                WrapToggleLabel(enable);
                 enable.RegisterValueChangedCallback(e => LlmSettings.Enabled = e.newValue);
                 adv.Add(enable);
 
@@ -150,7 +166,10 @@ namespace PerfLint.Llm
         /// <summary>Makes the Toggle label wrap instead of overflowing horizontally — otherwise a long label pushes the checkbox off the right edge of the window, making it unreachable.</summary>
         private static void WrapToggleLabel(Toggle t)
         {
-            var lbl = t.Q<Label>();
+            // Use BaseField.labelElement (populated in the constructor) rather than t.Q<Label>(): on Unity 2021.3 the
+            // label child isn't queryable yet right after `new Toggle(...)`, so Q<Label>() returns null here and the
+            // styling was silently skipped (the label never wrapped). labelElement is non-null immediately across versions.
+            var lbl = t.labelElement ?? t.Q<Label>();
             if (lbl == null) return;
             lbl.style.whiteSpace = WhiteSpace.Normal;
             lbl.style.flexShrink = 1;

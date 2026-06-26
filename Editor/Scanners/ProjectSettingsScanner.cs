@@ -13,6 +13,8 @@ namespace PerfLint.Scanners
     ///   PROJ002 — Managed Stripping disabled under IL2CPP (increases build size).
     ///   PROJ003 — Incremental GC not enabled (bulk GC collections can cause stutter spikes). Includes an executable action "Enable".
     ///   PROJ005 — Prebake Collision Meshes not enabled (build cost on first collision/load at runtime). Includes an executable action "Enable".
+    ///   PROJ008 — Multithreaded Rendering disabled on a mobile target (the render thread stays on the main thread, raising CPU frame time). Includes an executable action "Enable".
+    ///   PROJ009 — Optimize Mesh Data disabled (unused vertex attributes such as Color/Tangent ship in every mesh, inflating memory and build size). Includes an executable action "Enable".
     /// (Dynamic batching detection has been removed because there is no stable public API to read it.)
     /// Project-level findings have no specific asset path (targetPath is null). PROJ003/005 include a FindingAction
     /// (modifies project settings, not undoable, Pro-gated).
@@ -113,6 +115,82 @@ namespace PerfLint.Scanners
                             return FixResult.Ok(L.Tr("Prebake Collision Meshes enabled.", "已开启 Prebake Collision Meshes。"));
                         }));
             }
+
+            // PROJ008 — Multithreaded Rendering disabled on a mobile target (only meaningful for Android/iOS; includes executable action)
+            var mobileGroup = ResolveMobileGroup(context);
+            if (mobileGroup != BuildTargetGroup.Unknown && !PlayerSettings.GetMobileMTRendering(mobileGroup))
+            {
+                var mtGroup = mobileGroup; // capture for the action delegate
+                yield return new Finding(
+                    ruleId: "PROJ008",
+                    domain: Domain.ProjectSettings,
+                    severity: Severity.Info,
+                    title: L.Tr("Multithreaded Rendering is off (mobile)", "移动端 Multithreaded Rendering 未开启"),
+                    detail: L.Tr($"Multithreaded Rendering is off for {mtGroup}. The render thread runs on the main thread, so all graphics-submission " +
+                            "work piles onto CPU frame time. Enabling it moves submission to a separate thread and usually lowers main-thread cost on multi-core mobile devices. " +
+                            "Recommended for the vast majority of mobile projects; verify the gain in the Profiler afterward.",
+                            $"{mtGroup} 平台的 Multithreaded Rendering 未开启。渲染线程跑在主线程上，所有图形提交开销都压在 CPU 帧时间里。" +
+                            "开启后提交工作移到独立线程，在多核移动设备上通常能降低主线程耗时。绝大多数移动项目建议开启；开启后用 Profiler 验证收益。"),
+                    targetPath: null,
+                    action: new FindingAction(
+                        label: L.Tr("Enable Multithreaded Rendering", "开启 Multithreaded Rendering"),
+                        confirmMessage: L.Tr($"Enable Mobile Multithreaded Rendering for {mtGroup} in Player Settings.\n" +
+                                        "This modifies project settings (ProjectSettings.asset) and cannot be reverted with Edit > Undo; commit to version control first.",
+                                        $"为 {mtGroup} 平台开启 Mobile Multithreaded Rendering。\n" +
+                                        "此操作修改项目设置（ProjectSettings.asset），无法用 Edit > Undo 撤销；建议先提交版本控制。"),
+                        run: () =>
+                        {
+                            PlayerSettings.SetMobileMTRendering(mtGroup, true);
+                            AssetDatabase.SaveAssets();
+                            return FixResult.Ok(L.Tr("Multithreaded Rendering enabled.", "已开启 Multithreaded Rendering。"));
+                        }));
+            }
+
+            // PROJ009 — Optimize Mesh Data disabled (project-wide; includes executable action)
+            if (!PlayerSettings.stripUnusedMeshComponents)
+            {
+                yield return new Finding(
+                    ruleId: "PROJ009",
+                    domain: Domain.ProjectSettings,
+                    severity: Severity.Info,
+                    title: L.Tr("Optimize Mesh Data is off", "Optimize Mesh Data 未开启"),
+                    detail: L.Tr("Optimize Mesh Data is off in Player Settings. With it on, the build strips vertex attributes a mesh's shaders never use " +
+                            "(Color, Tangent, extra UVs…), reducing mesh memory and build size. Caveat: if you swap a renderer's material at runtime to one needing more attributes, " +
+                            "those attributes may have been stripped — assign such materials in the prefab before building so the importer keeps them.",
+                            "Player Settings 的 Optimize Mesh Data 未开启。开启后构建会剔除网格 Shader 用不到的顶点属性" +
+                            "（Color、Tangent、多余 UV 等），减少网格内存与包体。注意：若运行时把 Renderer 的材质换成需要更多属性的材质，" +
+                            "这些属性可能已被剔除——请在 Prefab 上先挂好此类材质再构建，导入器才会保留。"),
+                    targetPath: null,
+                    action: new FindingAction(
+                        label: L.Tr("Enable Optimize Mesh Data", "开启 Optimize Mesh Data"),
+                        confirmMessage: L.Tr("Set Optimize Mesh Data to on in Player Settings.\n" +
+                                        "This modifies project settings (ProjectSettings.asset) and cannot be reverted with Edit > Undo; commit to version control first.",
+                                        "将 Player Settings 的 Optimize Mesh Data 设为开启。\n" +
+                                        "此操作修改项目设置（ProjectSettings.asset），无法用 Edit > Undo 撤销；建议先提交版本控制。"),
+                        run: () =>
+                        {
+                            PlayerSettings.stripUnusedMeshComponents = true;
+                            AssetDatabase.SaveAssets();
+                            return FixResult.Ok(L.Tr("Optimize Mesh Data enabled.", "已开启 Optimize Mesh Data。"));
+                        }));
+            }
+        }
+
+        /// <summary>
+        /// Resolves the mobile build target group to evaluate for PROJ008. Respects an injected ScanContext.TargetPlatform
+        /// ("Android"/"iPhone") for tests and multi-platform diagnostics; otherwise uses the active build target. Returns
+        /// BuildTargetGroup.Unknown for any non-mobile target, which makes PROJ008 not fire (the rule is mobile-only).
+        /// </summary>
+        private static BuildTargetGroup ResolveMobileGroup(ScanContext context)
+        {
+            if (!string.IsNullOrEmpty(context.TargetPlatform))
+            {
+                if (context.TargetPlatform == "Android") return BuildTargetGroup.Android;
+                if (context.TargetPlatform == "iPhone") return BuildTargetGroup.iOS;
+                return BuildTargetGroup.Unknown;
+            }
+            var g = BuildPipeline.GetBuildTargetGroup(EditorUserBuildSettings.activeBuildTarget);
+            return (g == BuildTargetGroup.Android || g == BuildTargetGroup.iOS) ? g : BuildTargetGroup.Unknown;
         }
 
         private static int CountAlwaysIncludedShaders()

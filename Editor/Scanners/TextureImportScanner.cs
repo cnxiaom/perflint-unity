@@ -13,6 +13,7 @@ namespace PerfLint.Scanners
     ///   PERF.TEX002 — Large texture uses Uncompressed format, multiplying VRAM/build size several times over.
     ///   PERF.TEX003 — Oversized texture (≥4096), high VRAM/memory usage; Info / reporting category.
     ///   PERF.TEX004 — Sprite/UI texture has Mipmap enabled (~33% extra memory), high-confidence waste, auto-fixable.
+    ///   PERF.TEX005 — Compression was requested but the imported texture is actually uncompressed (the importer silently fell back, multiplying VRAM/memory). The usual cause is dimensions a block format can't handle: ETC/ETC2 need multiples of 4, PVRTC needs square power-of-two. Evaluated against the active build target's real imported format → the engine's literal verdict, so zero false positives.
     /// </summary>
     public sealed class TextureImportScanner : IScanner
     {
@@ -118,7 +119,52 @@ namespace PerfLint.Scanners
                         ping: () => ScannerUtil.PingAsset(path),
                         fix: new TextureToggleFix(path, mipmap: false));
                 }
+
+                // PERF.TEX005 — Compression requested but the imported texture is actually uncompressed (silent fallback).
+                // Judged against the ACTIVE build target's real imported format (Texture2D.format) — the engine's own verdict,
+                // so there are no false positives. The intent is read for the active platform too (so the two sides match);
+                // this rule therefore ignores context.TargetPlatform (which is about hypothetical other platforms, not what was actually built).
+                string activePlatform = ScannerUtil.ActivePlatformName();
+                if (tex != null
+                    && IsSilentCompressionFallback(!IsEffectivelyUncompressed(importer, activePlatform), tex.format))
+                {
+                    yield return new Finding(
+                        ruleId: "PERF.TEX005",
+                        domain: Domain.Performance,
+                        severity: Severity.Warning,
+                        title: L.Tr("Texture compression silently failed", "纹理压缩静默失败"),
+                        detail: L.Tr($"'{file}' ({w}x{h}) is set to Compressed, but the importer fell back to an uncompressed format ({tex.format}), " +
+                                "multiplying its VRAM and memory use. The usual cause is dimensions a block format can't compress: ETC/ETC2 require both sides to be multiples of 4, " +
+                                "and PVRTC requires square power-of-two. Resize to a compatible size (a multiple of 4, ideally power-of-two), or switch to a format that allows these dimensions (e.g. ASTC).",
+                                $"'{file}' ({w}x{h}) 设为 Compressed，但导入器回退成了未压缩格式（{tex.format}），显存与内存占用翻数倍。" +
+                                "常见原因是尺寸不满足块压缩要求：ETC/ETC2 要求宽高均为 4 的倍数，PVRTC 要求正方形且为 2 的幂。" +
+                                "请改为兼容尺寸（4 的倍数，最好是 2 的幂），或改用允许该尺寸的格式（如 ASTC）。"),
+                        targetPath: path,
+                        ping: () => ScannerUtil.PingAsset(path));
+                }
             }
+        }
+
+        /// <summary>
+        /// The TEX005 decision as a pure predicate (separated out so it is deterministically unit-testable without depending on
+        /// whether a given engine/platform actually falls back on NPOT — desktop DXT pads NPOT and compresses fine, while mobile
+        /// ETC2/PVRTC genuinely fall back to uncompressed). Fires only when compression was requested yet the imported format is uncompressed.
+        /// </summary>
+        internal static bool IsSilentCompressionFallback(bool compressionRequested, TextureFormat actual)
+            => compressionRequested && IsUncompressedRuntimeFormat(actual);
+
+        /// <summary>
+        /// Whether a runtime <see cref="TextureFormat"/> belongs to the uncompressed family. Mirrors <see cref="IsUncompressedFormat"/>
+        /// (which works on the import-time TextureImporterFormat) but for the actually-imported runtime format. Compressed families
+        /// are detected by name prefix (DXT/BC/PVRTC/ETC/EAC/ASTC/Crunched); everything else (RGBA32/RGB24/RGBAHalf/Alpha8/R8…) is uncompressed.
+        /// </summary>
+        internal static bool IsUncompressedRuntimeFormat(TextureFormat fmt)
+        {
+            string n = fmt.ToString();
+            bool compressed = n.StartsWith("DXT") || n.StartsWith("BC") || n.StartsWith("PVRTC")
+                || n.StartsWith("ETC") || n.StartsWith("EAC") || n.StartsWith("ASTC")
+                || n.Contains("Crunched");
+            return !compressed;
         }
 
         /// <summary>

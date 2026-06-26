@@ -80,6 +80,10 @@ namespace PerfLint.UI
             openMain.style.height = 26;
             openMain.style.marginLeft = 6;
             toolbar.Add(openMain);
+
+            // Dev-only EN/中 switch (no-op in release — see L.InjectDevLangSwitch). CreateGUI appends without
+            // clearing, so a flip wipes root before rebuilding to avoid stacking a second copy of the panel.
+            L.InjectDevLangSwitch(toolbar, () => { root.Clear(); CreateGUI(); });
             root.Add(toolbar);
 
             _stateLabel = new Label { style = { whiteSpace = WhiteSpace.Normal, marginBottom = 4 } };

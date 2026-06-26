@@ -12,6 +12,7 @@ namespace PerfLint.Scanners
     ///   PERF.AUD001 — A moderately long clip uses Decompress On Load, decompressing the whole clip into memory, large footprint.
     ///   PERF.AUD002 — A very long clip (background music) does not use Streaming, staying resident in memory.
     ///   PERF.AUD003 — Uses uncompressed PCM format (largest size; almost never necessary on mobile).
+    ///   PERF.AUD005 — Multi-channel clip without Force To Mono (a mono-source SFX shipped as stereo doubles its memory). Info, because forcing mono on genuinely stereo music/ambience degrades it — the user decides.
     /// </summary>
     public sealed class AudioImportScanner : IScanner
     {
@@ -101,6 +102,25 @@ namespace PerfLint.Scanners
                         ping: () => ScannerUtil.PingAsset(path),
                         fix: new AudioCompressionFix(path, AudioCompressionFormat.Vorbis, platform));
                 }
+
+                // PERF.AUD005 — Multi-channel clip not forced to mono. forceToMono is a global import setting (not per-platform).
+                // Info only: many sound effects are mono at the source but authored/exported as stereo, wasting half their memory;
+                // but genuinely stereo music/ambience must stay stereo, so the call is left to the user.
+                if (clip != null && clip.channels > 1 && !importer.forceToMono)
+                {
+                    yield return new Finding(
+                        ruleId: "PERF.AUD005",
+                        domain: Domain.Performance,
+                        severity: Severity.Info,
+                        title: L.Tr("Stereo clip without Force To Mono", "立体声音频未开 Force To Mono"),
+                        detail: L.Tr($"'{file}' ({clip.channels} channels) does not have Force To Mono enabled. If the source is effectively mono (most SFX: " +
+                                "footsteps, gunshots, UI clicks), enabling Force To Mono halves its memory and size. Leave it off for music or ambience where stereo width matters.",
+                                $"'{file}'（{clip.channels} 声道）未开启 Force To Mono。若音源本质上是单声道（多数音效：脚步、枪声、UI 点击），" +
+                                "开启 Force To Mono 可把内存与体积减半。需要立体声声场的音乐/环境声请保持关闭。"),
+                        targetPath: path,
+                        ping: () => ScannerUtil.PingAsset(path),
+                        fix: new AudioForceMonoFix(path));
+                }
             }
         }
 
@@ -187,6 +207,28 @@ namespace PerfLint.Scanners
             EditorUtility.SetDirty(importer);
             importer.SaveAndReimport();
             return FixResult.Ok(L.Tr($"Compression Format set to {_target}: {_path}", $"已设置 Compression Format = {_target}: {_path}"));
+        }
+    }
+
+    /// <summary>Turns on Force To Mono (a global, non-per-platform AudioImporter setting) and reimports.</summary>
+    internal sealed class AudioForceMonoFix : IFix
+    {
+        private readonly string _path;
+        public AudioForceMonoFix(string path) => _path = path;
+
+        public string Description => L.Tr("Enable Force To Mono and reimport.", "开启 Force To Mono 并重新导入。");
+        public string Preview() => $"{_path}: Force To Mono → true";
+
+        public FixResult Apply()
+        {
+            if (AssetImporter.GetAtPath(_path) is not AudioImporter importer)
+                return FixResult.Fail(L.Tr($"Importer not found: {_path}", $"找不到导入器: {_path}"));
+            if (importer.forceToMono) return FixResult.Ok(L.Tr("Already enabled.", "已是开启状态。"));
+
+            importer.forceToMono = true;
+            EditorUtility.SetDirty(importer);
+            importer.SaveAndReimport();
+            return FixResult.Ok(L.Tr($"Force To Mono enabled: {_path}", $"已开启 Force To Mono: {_path}"));
         }
     }
 }

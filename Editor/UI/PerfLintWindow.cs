@@ -141,9 +141,10 @@ namespace PerfLint.UI
             llmButton.style.marginLeft = 6;
             toolbar.Add(llmButton);
 
-            // Language toggle intentionally not exposed: the scan UI ships English-only by default.
-            // The bilingual infrastructure (L.Tr / Chinese strings) is kept for internal use, but no
-            // user-facing EN/中 switch is offered here.
+            // English-only by default. A dev-only EN/中 switch is injected into the toolbar ONLY in a PERFLINT_DEV
+            // editor (no-op in release — see L.InjectDevLangSwitch). CreateGUI appends without clearing, so a flip
+            // must wipe root before rebuilding to avoid stacking a second copy of the whole panel.
+            L.InjectDevLangSwitch(toolbar, () => { root.Clear(); CreateGUI(); });
 
             _licenseButton = new Button(PerfLintLicenseWindow.Open);
             _licenseButton.style.height = 26;
@@ -361,7 +362,9 @@ namespace PerfLint.UI
 
             // By default a BaseField's label has a min-width and stretches, pushing the checkbox to the right.
             // Tighten the label so the checkbox sits right next to the text.
-            var lbl = t.Q<Label>();
+            // Use labelElement (populated in the constructor): on Unity 2021.3 t.Q<Label>() is null right after construction,
+            // so this styling was silently skipped there; labelElement is available immediately across versions.
+            var lbl = t.labelElement ?? t.Q<Label>();
             if (lbl != null)
             {
                 lbl.style.minWidth = 0;

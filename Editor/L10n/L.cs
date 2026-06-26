@@ -1,4 +1,6 @@
+using System;
 using UnityEditor;
+using UnityEngine.UIElements;
 
 namespace PerfLint.L10n
 {
@@ -21,14 +23,31 @@ namespace PerfLint.L10n
     {
         private const string Key = "PerfLint.Lang";
 
-        // Default to English. Chinese stays reachable via EditorPrefs (internal/dev), but it's neither
-        // auto-detected from the system language nor switchable from the scan UI.
+        // Release ships English-only and IGNORES the persisted pref: the EditorPrefs key is machine-global
+        // (cross-project), so once the dev switch wrote Chinese it would otherwise leak into a release/no-dev
+        // editor with no UI to switch back. Only a PERFLINT_DEV editor — where the never-shipped dev file has set
+        // DevLangSwitchInjector — honors the stored language. DevUnlockHook-style gating, no #if in shipped code.
         public static Lang Current
         {
-            get => (Lang)EditorPrefs.GetInt(Key, (int)Lang.English);
+            get => DevLangSwitchInjector != null
+                ? (Lang)EditorPrefs.GetInt(Key, (int)Lang.English)
+                : Lang.English;
             set => EditorPrefs.SetInt(Key, (int)value);
         }
 
         public static string Tr(string en, string zh) => Current == Lang.Chinese ? zh : en;
+
+        /// <summary>
+        /// Dev-only UI-language switch injector. Release: null — no switch is shown, so the UI stays English-only.
+        /// Set ONLY by the never-shipped <c>PerfLintL10nDev.cs</c> (gated by PERFLINT_DEV + export-ignore), mirroring
+        /// <see cref="Licensing.LicenseService.DevUnlockHook"/>. This is why the three panels carry no
+        /// PERFLINT_DEV compile branch: they just call <see cref="InjectDevLangSwitch"/>, which is a no-op in release.
+        /// </summary>
+        /// <remarks>(parent, onChanged) — the impl appends an EN/中 control to <c>parent</c> and calls <c>onChanged</c> after a flip so the panel rebuilds in the new language.</remarks>
+        internal static Action<VisualElement, Action> DevLangSwitchInjector;
+
+        /// <summary>No-op in release; in a PERFLINT_DEV editor it adds an EN/中 switch to <paramref name="parent"/> that flips <see cref="Current"/> and calls <paramref name="onChanged"/>.</summary>
+        public static void InjectDevLangSwitch(VisualElement parent, Action onChanged)
+            => DevLangSwitchInjector?.Invoke(parent, onChanged);
     }
 }

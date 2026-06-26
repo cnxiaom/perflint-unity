@@ -193,6 +193,9 @@ namespace PerfLint.Licensing
 
         private static void Raise()
         {
+            // Drop the stale credit balance if the Pro tier just flipped (Free daily ↔ Pro monthly are
+            // separate pools) BEFORE notifying UI, so panels re-render against the correct allowance.
+            CreditService.OnLicenseChanged();
             try { Changed?.Invoke(); } catch { /* UI callback exceptions must not affect licensing logic */ }
         }
     }

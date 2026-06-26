@@ -51,4 +51,6 @@ explicitly use Explain or AI Fix — the finding metadata or the single snippet 
 
 ## License
 
-Proprietary. See **[perflint.dev/license](https://perflint.dev/license)**.
+Proprietary. Copies from the **Unity Asset Store** are governed by the Unity Asset Store EULA;
+copies from our website / the UPM Git URL are governed by **[perflint.dev/license](https://perflint.dev/license)**.
+See [LICENSE.md](LICENSE.md).

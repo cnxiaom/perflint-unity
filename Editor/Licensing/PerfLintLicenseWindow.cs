@@ -34,8 +34,9 @@ namespace PerfLint.Licensing
             root.style.paddingLeft = 10;
             root.style.paddingRight = 10;
 
-            // Language switch intentionally not exposed: the UI ships English-only by default.
-            // The bilingual infrastructure (L.Tr / Chinese strings) is kept for internal use.
+            // English-only by default. A dev-only EN/中 switch is injected here ONLY in a PERFLINT_DEV editor
+            // (no-op in release — see L.InjectDevLangSwitch); flipping it rebuilds the panel in the new language.
+            L.InjectDevLangSwitch(root, Rebuild);
 
             // ── Current status ──
             _status = new Label { style = { fontSize = 16, unityFontStyleAndWeight = FontStyle.Bold, marginTop = 10 } };
