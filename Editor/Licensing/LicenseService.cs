@@ -114,7 +114,13 @@ namespace PerfLint.Licensing
                 }
                 else if (resp.ServerReached)
                 {
-                    onDone(false, L.Tr("Activation failed: ", "激活失败：") + resp.Error);
+                    // 404 = the key doesn't exist on the billing side (typo, or a test-mode key against the live
+                    // proxy). Show a clean message instead of the raw "[404] …" server text.
+                    if (resp.HttpCode == 404)
+                        onDone(false, L.Tr("That license key wasn't found. Double-check you copied the whole key correctly.",
+                                           "未找到该许可证密钥，请确认是否完整复制无误。"));
+                    else
+                        onDone(false, L.Tr("Activation failed: ", "激活失败：") + resp.Error);
                 }
                 else
                 {
