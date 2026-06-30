@@ -26,6 +26,7 @@ namespace PerfLint.UI
         private readonly RuntimeSampler _sampler = new RuntimeSampler();
 
         private Button _toggleButton;
+        private Button _deepProfileButton;
         private Label _stateLabel;
         private Label _liveLabel;
         private ScrollView _results;
@@ -74,6 +75,9 @@ namespace PerfLint.UI
             _toggleButton = new Button(ToggleSampling) { text = L.Tr("Start Sampling", "开始采样") };
             _toggleButton.style.height = 26;
             _toggleButton.style.flexGrow = 1;
+            // Primary action: bold white text on an accent fill (the fill color is set per-state in RefreshState).
+            _toggleButton.style.unityFontStyleAndWeight = FontStyle.Bold;
+            _toggleButton.style.color = Color.white;
             toolbar.Add(_toggleButton);
 
             var openMain = new Button(PerfLintWindow.Open) { text = L.Tr("Static Scan Panel", "静态扫描面板") };
@@ -81,27 +85,49 @@ namespace PerfLint.UI
             openMain.style.marginLeft = 6;
             toolbar.Add(openMain);
 
+            // One-click Deep Profile toggle — mirrors the Unity Profiler's own toggle so users can refine CPU hotspots to
+            // method level (ClassName.Method) without leaving this panel. State reflects ProfilerDriver.deepProfiling; takes
+            // effect on the next Play Mode sample (instrumentation is set up when entering Play Mode).
+            _deepProfileButton = new Button(ToggleDeepProfile);
+            _deepProfileButton.style.height = 26;
+            _deepProfileButton.style.marginLeft = 6;
+            toolbar.Add(_deepProfileButton);
+
             // Dev-only EN/中 switch (no-op in release — see L.InjectDevLangSwitch). CreateGUI appends without
             // clearing, so a flip wipes root before rebuilding to avoid stacking a second copy of the panel.
             L.InjectDevLangSwitch(toolbar, () => { root.Clear(); CreateGUI(); });
             root.Add(toolbar);
 
-            _stateLabel = new Label { style = { whiteSpace = WhiteSpace.Normal, marginBottom = 4 } };
-            root.Add(_stateLabel);
+            // ── Status card (mirrors the main panel's header card for a consistent look) ──
+            var headerCard = new VisualElement
+            {
+                style =
+                {
+                    marginBottom = 8,
+                    paddingTop = 10, paddingBottom = 10, paddingLeft = 14, paddingRight = 14,
+                    backgroundColor = new Color(1f, 1f, 1f, 0.03f),
+                    borderTopLeftRadius = 10, borderTopRightRadius = 10,
+                    borderBottomLeftRadius = 10, borderBottomRightRadius = 10,
+                    borderTopWidth = 1, borderBottomWidth = 1, borderLeftWidth = 1, borderRightWidth = 1,
+                }
+            };
+            SetBorderColor(headerCard, new Color(1f, 1f, 1f, 0.07f));
 
-            // ── Live readout ───────────────────────────
+            _stateLabel = new Label { style = { whiteSpace = WhiteSpace.Normal } };
+            headerCard.Add(_stateLabel);
+
+            // Live readout while sampling (bold; hidden until sampling starts).
             _liveLabel = new Label
             {
                 style =
                 {
-                    whiteSpace = WhiteSpace.Normal, marginBottom = 4,
+                    whiteSpace = WhiteSpace.Normal, marginTop = 6,
                     unityFontStyleAndWeight = FontStyle.Bold,
                     display = DisplayStyle.None
                 }
             };
-            root.Add(_liveLabel);
-
-            root.Add(MakeDivider());
+            headerCard.Add(_liveLabel);
+            root.Add(headerCard);
 
             _results = new ScrollView(ScrollViewMode.Vertical) { style = { flexGrow = 1 } };
             root.Add(_results);
@@ -197,14 +223,65 @@ namespace PerfLint.UI
                 $"内存 {Human(mem)}   ·   Draw {draw:0}   ·   SetPass {setpass:0}");
         }
 
+        /// <summary>Reflects the current Deep Profile state on the toggle button (label + color + tooltip).</summary>
+        private void RefreshDeepProfileButton()
+        {
+            if (_deepProfileButton == null) return;
+            bool on = UnityEditorInternal.ProfilerDriver.deepProfiling;
+            _deepProfileButton.text = on ? L.Tr("Deep Profile ●", "Deep Profile ●") : L.Tr("Deep Profile", "Deep Profile");
+            _deepProfileButton.style.color = on ? new Color(0.40f, 0.80f, 0.45f) : new StyleColor(StyleKeyword.Null);
+            _deepProfileButton.tooltip = on
+                ? L.Tr("Deep Profile is ON: CPU hotspots refine to specific script methods (ClassName.Method), but it has high overhead — use it for localization, not for measuring real frame rate. Click to turn off.", "Deep Profile 已开启：CPU 热点会细化到具体脚本方法（ClassName.Method），但开销很大——仅用于定位、勿用于测真实帧率。点击关闭。")
+                : L.Tr("Turn on Deep Profile to refine CPU hotspots to specific script methods (ClassName.Method). High overhead — for localization only. Takes effect on the next Play Mode sample.", "开启 Deep Profile 可把 CPU 热点细化到具体脚本方法（ClassName.Method）。开销很大、仅用于定位。在下次 Play Mode 采样时生效。");
+        }
+
+        /// <summary>One-click Deep Profile toggle. Mirrors Unity's own Profiler "Deep Profile" button: setting
+        /// ProfilerDriver.deepProfiling alone is NOT enough — the deep-profiling instrumentation is (un)injected during a
+        /// script/domain reload, so we must RequestScriptReload() for it to actually apply. Without the reload the flag flips
+        /// but sampling still produces coarse markers (BehaviourUpdate) instead of ClassName.Method().
+        /// A reload can't happen during Play Mode without leaving it, so in Play Mode we confirm first (it will exit Play Mode).</summary>
+        private void ToggleDeepProfile()
+        {
+            bool now = !UnityEditorInternal.ProfilerDriver.deepProfiling;
+            bool wasPlaying = EditorApplication.isPlaying;
+
+            if (wasPlaying)
+            {
+                bool ok = EditorUtility.DisplayDialog(
+                    L.Tr("Deep Profile", "Deep Profile"),
+                    (now
+                        ? L.Tr("Turning Deep Profile ON recompiles scripts and will exit the current Play Mode. Continue?\n\nDeep Profile refines CPU hotspots to specific script methods (ClassName.Method) but has high overhead — use it for localization, not for measuring real frame rate. After it's on, re-enter Play Mode and sample.", "开启 Deep Profile 需要重新编译脚本，会退出当前 Play Mode。继续？\n\nDeep Profile 能把 CPU 热点细化到具体脚本方法（ClassName.Method），但开销很大——仅用于定位、勿用于测真实帧率。开启后重新进入 Play Mode 采样。")
+                        : L.Tr("Turning Deep Profile OFF recompiles scripts and will exit the current Play Mode. Continue?", "关闭 Deep Profile 需要重新编译脚本，会退出当前 Play Mode。继续？")),
+                    L.Tr("Continue", "继续"), L.Tr("Cancel", "取消"));
+                if (!ok) return;
+            }
+
+            UnityEditorInternal.ProfilerDriver.deepProfiling = now;
+            // The reload is what actually (un)injects the instrumentation. In Play Mode this also exits Play Mode (a domain
+            // reload can't run while playing). The deepProfiling flag persists across the reload, so the button reflects it correctly afterward.
+            EditorUtility.RequestScriptReload();
+            RefreshDeepProfileButton();
+
+            if (!wasPlaying)
+                ShowNotification(new GUIContent(now
+                    ? L.Tr("Deep Profile on — enter Play Mode and sample", "Deep Profile 已开 — 进入 Play Mode 采样")
+                    : L.Tr("Deep Profile turned off", "已关闭 Deep Profile")));
+        }
+
         private void RefreshState()
         {
             if (_toggleButton == null) return;
+
+            RefreshDeepProfileButton();
 
             bool playing = EditorApplication.isPlaying;
             bool sampling = _sampler.IsRunning;
 
             _toggleButton.text = sampling ? L.Tr("Stop & Analyze", "停止并分析") : L.Tr("Start Sampling", "开始采样");
+            // Accent blue to start; a red "recording — click to stop" tint while sampling.
+            _toggleButton.style.backgroundColor = sampling
+                ? new Color(0.78f, 0.28f, 0.28f)
+                : new Color(0.20f, 0.45f, 0.85f);
 
             if (sampling)
                 _stateLabel.text = L.Tr("Sampling runtime data… drive the game into the scene/action you want to diagnose, then click \"Stop & Analyze\".", "正在采样运行时数据……让游戏进入要诊断的场景/操作，然后点「停止并分析」。");
@@ -251,11 +328,15 @@ namespace PerfLint.UI
             {
                 style =
                 {
-                    marginTop = 10, paddingTop = 6, paddingBottom = 6, paddingLeft = 8, paddingRight = 8,
-                    backgroundColor = new Color(1, 1, 1, 0.04f)
+                    marginTop = 10, paddingTop = 8, paddingBottom = 8, paddingLeft = 10, paddingRight = 10,
+                    backgroundColor = new Color(1, 1, 1, 0.04f),
+                    borderTopLeftRadius = 8, borderTopRightRadius = 8,
+                    borderBottomLeftRadius = 8, borderBottomRightRadius = 8,
+                    borderTopWidth = 1, borderBottomWidth = 1, borderLeftWidth = 1, borderRightWidth = 1,
                 }
             };
-            box.Add(new Label(L.Tr("Raw sampling readout (average)", "采样原始读数（平均）")) { style = { unityFontStyleAndWeight = FontStyle.Bold, marginBottom = 2 } });
+            SetBorderColor(box, new Color(1f, 1f, 1f, 0.06f));
+            box.Add(new Label(L.Tr("Raw sampling readout (average)", "采样原始读数（平均）")) { style = { unityFontStyleAndWeight = FontStyle.Bold, marginBottom = 4 } });
             box.Add(RawLine(L.Tr("Frame time CPU", "帧时间 CPU"), _lastResult.FrameTimeNs, v => $"{v / 1_000_000.0:0.0} ms ({(v > 0 ? 1_000_000_000.0 / v : 0):0} FPS)"));
             box.Add(RawLine(L.Tr("Frame time GPU", "帧时间 GPU"), _lastResult.GpuFrameTimeNs, v => $"{v / 1_000_000.0:0.0} ms"));
             box.Add(RawLine(L.Tr("GC/frame", "GC/帧"), _lastResult.GcPerFrameBytes, v => $"{Human(v)}"));
@@ -288,23 +369,30 @@ namespace PerfLint.UI
         private VisualElement MakeFindingCard(Finding f)
         {
             // Outer column container: card body + on-demand expandable AI sub-panels.
-            var col = new VisualElement { style = { marginTop = 4 } };
+            var col = new VisualElement { style = { marginTop = 6 } };
 
             var card = new VisualElement
             {
                 style =
                 {
-                    paddingTop = 6, paddingBottom = 6, paddingLeft = 8, paddingRight = 8,
-                    backgroundColor = new Color(1, 1, 1, 0.03f),
-                    borderLeftWidth = 3, borderLeftColor = SeverityColor(f.Severity)
+                    paddingTop = 8, paddingBottom = 8, paddingLeft = 10, paddingRight = 8,
+                    backgroundColor = new Color(1, 1, 1, 0.035f),
+                    borderTopLeftRadius = 8, borderTopRightRadius = 8,
+                    borderBottomLeftRadius = 8, borderBottomRightRadius = 8,
+                    borderLeftWidth = 3, borderTopWidth = 1, borderRightWidth = 1, borderBottomWidth = 1,
                 }
             };
+            // Severity accent on the left edge; a faint border on the other three sides (matches the main panel's cards).
+            card.style.borderLeftColor = SeverityColor(f.Severity);
+            card.style.borderTopColor = new Color(1f, 1f, 1f, 0.06f);
+            card.style.borderRightColor = new Color(1f, 1f, 1f, 0.06f);
+            card.style.borderBottomColor = new Color(1f, 1f, 1f, 0.06f);
 
             var titleRow = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center } };
-            titleRow.Add(new Label("●") { style = { color = SeverityColor(f.Severity), marginRight = 6, minWidth = 12 } });
+            titleRow.Add(new Label("●") { style = { color = SeverityColor(f.Severity), marginRight = 6, minWidth = 12, flexShrink = 0 } });
             titleRow.Add(new Label($"{f.RuleId} · {f.Title}")
             {
-                style = { unityFontStyleAndWeight = FontStyle.Bold, flexGrow = 1, whiteSpace = WhiteSpace.Normal }
+                style = { unityFontStyleAndWeight = FontStyle.Bold, flexGrow = 1, whiteSpace = WhiteSpace.Normal, fontSize = 12 }
             });
 
             if (f.Ping != null)
@@ -499,24 +587,22 @@ namespace PerfLint.UI
             }
         }
 
-        /// <summary>Opens the static scan panel and focuses on this script: automatically filters to all line-level findings for this script (GC001/GC004 etc.) + AI Fix.</summary>
+        /// <summary>Switches to the static scan panel and focuses the report on this script (file-level GC/Roslyn analysis + AI Fix live there).
+        /// Deliberately does NOT open the .cs in the IDE — that's the separate "Locate" button's job (which lands on the hotspot method, not line 1).</summary>
         private static void OpenScriptInMainPanel(string scriptPath)
         {
-            // First open the script in the IDE/editor to locate it, then open the main panel and focus the report on this script (line-level GC analysis + AI Fix live there).
-            var obj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(scriptPath);
-            if (obj != null)
-            {
-                EditorGUIUtility.PingObject(obj);
-                AssetDatabase.OpenAsset(obj);
-            }
             var win = PerfLintWindow.OpenWindow();
             win.FocusOnScript(scriptPath);
         }
 
-        private static VisualElement MakeDivider() => new VisualElement
+        /// <summary>Set all four border-side colors at once (UIElements inline style has no single 'borderColor' shorthand).</summary>
+        private static void SetBorderColor(VisualElement e, Color c)
         {
-            style = { height = 1, backgroundColor = new Color(1, 1, 1, 0.1f), marginTop = 4, marginBottom = 4 }
-        };
+            e.style.borderTopColor = c;
+            e.style.borderBottomColor = c;
+            e.style.borderLeftColor = c;
+            e.style.borderRightColor = c;
+        }
 
         private static Color SeverityColor(Severity s) => s switch
         {

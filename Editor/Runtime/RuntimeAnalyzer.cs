@@ -216,8 +216,9 @@ namespace PerfLint.Runtime
                     title: L.Tr($"Sustained per-frame GC allocation: avg {Human(avgBytes)}/frame (peak {Human(maxBytes)})", $"运行时持续每帧 GC 分配：平均 {Human(avgBytes)}/帧（峰值 {Human(maxBytes)}）"),
                     detail: L.Tr($"During sampling, an average of {Human(avgBytes)} of managed-heap allocation was produced per frame (peak {Human(maxBytes)}). ", $"采样期间平均每帧产生 {Human(avgBytes)} 托管堆分配（峰值 {Human(maxBytes)}）。") +
                             L.Tr("Sustained per-frame allocation periodically triggers GC and causes stutter. This is runtime-**confirmed** GC pressure — ", "持续的每帧分配会周期性触发 GC、造成卡顿。这是运行时**证实**的 GC 压力——") +
-                            L.Tr("next, run a scan in the main panel: the \"Script GC / per-frame allocation\" analysis pinpoints allocation sites line by line (GetComponent / string concatenation / LINQ, etc.), ", "下一步在主面板运行扫描，「脚本 GC / 每帧分配」分析会逐行定位分配点（GetComponent/字符串拼接/LINQ 等），") +
-                            L.Tr("and AI Fix can patch them in one click. Entries marked as scripts in the \"CPU Hotspots\" below are the first things to investigate.", "并可用 AI Fix 一键修复。下方「CPU 热点」中标为脚本的条目是优先排查对象。")));
+                            L.Tr("click Locate to jump to the main panel's \"Script GC / per-frame allocation\" findings, which pinpoint allocation sites line by line (GetComponent / string concatenation / LINQ, etc.) ", "点 Locate 跳到主面板的「脚本 GC / 每帧分配」问题，它会逐行定位分配点（GetComponent/字符串拼接/LINQ 等），") +
+                            L.Tr("with one-click AI Fix (run Scan Project first if you haven't). Entries marked as scripts in the \"CPU Hotspots\" below are the first things to investigate.", "并支持一键 AI Fix（若还没扫描，先点 Scan Project）。下方「CPU 热点」中标为脚本的条目是优先排查对象。"),
+                    ping: () => PerfLint.UI.PerfLintWindow.OpenWindow().FocusOnScriptGcRules()));
             }
         }
 
@@ -304,7 +305,7 @@ namespace PerfLint.Runtime
                     severity: sev,
                     title: L.Tr($"High runtime SetPass calls: avg {setPass.Avg:0}/frame (peak {setPass.Max:0})", $"运行时 SetPass 调用偏高：平均 {setPass.Avg:0}/帧（峰值 {setPass.Max:0}）"),
                     detail: L.Tr($"An average of {setPass.Avg:0} SetPass calls per frame. SetPass affects CPU render cost more than Draw Calls do. ", $"平均每帧 {setPass.Avg:0} 次 SetPass。SetPass 比 Draw Call 更影响 CPU 渲染开销。") +
-                            L.Tr("Things to check: too many material/shader variants breaking batching, SRP Batcher compatibility (see material diagnostics MAT001/MAT002 in the main panel), ", "可排查：材质/Shader 变体过多导致批处理断裂、SRP Batcher 兼容性（见主面板材质诊断 MAT001/MAT002）、") +
+                            L.Tr("Things to check: too many material/shader variants breaking batching, and SRP Batcher compatibility — run a project scan and PerfLint flags any SRP-incompatible materials it finds, ", "可排查：材质/Shader 变体过多导致批处理断裂、SRP Batcher 兼容性——运行一次项目扫描，PerfLint 会标出存在的 SRP 不兼容材质，") +
                             L.Tr("and interleaving of transparent objects / different render queues. The exact threshold depends on your platform.", "半透明/不同渲染队列穿插。具体阈值取决于目标平台。")));
             }
 
@@ -395,21 +396,44 @@ namespace PerfLint.Runtime
             if (tri == null || !tri.HasData) return;
 
             double avgTri = tri.Avg;
-            if (avgTri >= 300_000)
+            if (avgTri < 300_000) return;
+
+            Severity sev = avgTri >= 600_000 ? Severity.Critical : Severity.Warning;
+
+            // Localize to the heaviest meshes loaded in the scene (Play-Mode-only attribution). Authored triangle counts —
+            // not equal to the post-cull per-frame counter above, but they name the concrete models worth investigating first.
+            var sb = r.SceneBatching;
+            string breakdown = "";
+            System.Action ping = null;
+            if (sb != null && sb.HasData && sb.TopTriangleMeshes != null && sb.TopTriangleMeshes.Count > 0)
             {
-                Severity sev = avgTri >= 600_000 ? Severity.Critical : Severity.Warning;
-                findings.Add(new Finding(
-                    ruleId: "RUN.GPU002",
-                    domain: Domain.Runtime,
-                    severity: sev,
-                    title: L.Tr($"High runtime triangle count: avg {avgTri / 1000.0:0.0}K tris/frame (peak {tri.Max / 1000.0:0.0}K)", $"运行时三角面数偏高：平均 {avgTri / 1000.0:0.0}K 面/帧（峰值 {tri.Max / 1000.0:0.0}K）"),
-                    detail: L.Tr($"During sampling, an average of {avgTri / 1000.0:0.0}K triangles were rendered per frame — a direct indicator of GPU geometry-processing cost. ", $"采样期间平均每帧渲染 {avgTri / 1000.0:0.0}K 个三角面，这是 GPU 几何处理开销的直接指标。") +
-                            L.Tr("Optimization directions:\n", "优化方向：\n") +
-                            L.Tr("1. Set up LOD Groups for complex models (3-4 levels recommended; distant models can drop below 10% of the triangle count);\n", "1. 为复杂模型设置 LOD Group（推荐 3~4 级，远距离模型面数可降至 10% 以下）；\n") +
-                            L.Tr("2. Check visibility culling: is Occlusion Culling baked, and is the camera's Far Clip too large;\n", "2. 检查可见性剔除：Occlusion Culling 是否已烘焙，相机 Far Clip 是否过大；\n") +
-                            L.Tr("3. For high-poly characters/foliage instanced in large numbers, consider GPU Instancing + simplified LODs.\n", "3. 高面数角色/植被若大量实例化，考虑 GPU Instancing + 简化 LOD。\n") +
-                            L.Tr("Reference baselines: <50K for mobile, <200K for mid-range PC scenes, up to 500K+ on high-end PC/console.", "参考基准：移动端建议 <50K，PC 中档场景 <200K，高端 PC/Console 可至 500K+。")));
+                breakdown = L.Tr("\n\nHeaviest geometry loaded in the scene (authored triangle counts; the per-frame counter above is post-cull, but these are the usual suspects):\n", "\n\n场景中最重的几何（建模三角面数；上面的每帧计数是剔除后的，而这些是首要排查对象）：\n");
+                foreach (var m in sb.TopTriangleMeshes)
+                {
+                    breakdown += m.InstanceCount > 1
+                        ? L.Tr($"  • {m.MeshName}: {m.TrianglesPerInstance / 1000.0:0.0}K tris × {m.InstanceCount} = {m.TotalTriangles / 1000.0:0.0}K\n", $"  • {m.MeshName}：{m.TrianglesPerInstance / 1000.0:0.0}K 面 × {m.InstanceCount} = {m.TotalTriangles / 1000.0:0.0}K\n")
+                        : L.Tr($"  • {m.MeshName}: {m.TotalTriangles / 1000.0:0.0}K tris\n", $"  • {m.MeshName}：{m.TotalTriangles / 1000.0:0.0}K 面\n");
+                }
+                if (sb.HasTopMeshExamples)
+                {
+                    breakdown += L.Tr("Click Locate to select the GameObjects using the heaviest mesh.", "点 Locate 选中使用最重网格的 GameObject。");
+                    ping = sb.SelectTopTriangleMeshExamples;
+                }
             }
+
+            findings.Add(new Finding(
+                ruleId: "RUN.GPU002",
+                domain: Domain.Runtime,
+                severity: sev,
+                title: L.Tr($"High runtime triangle count: avg {avgTri / 1000.0:0.0}K tris/frame (peak {tri.Max / 1000.0:0.0}K)", $"运行时三角面数偏高：平均 {avgTri / 1000.0:0.0}K 面/帧（峰值 {tri.Max / 1000.0:0.0}K）"),
+                detail: L.Tr($"During sampling, an average of {avgTri / 1000.0:0.0}K triangles were rendered per frame — a direct indicator of GPU geometry-processing cost. ", $"采样期间平均每帧渲染 {avgTri / 1000.0:0.0}K 个三角面，这是 GPU 几何处理开销的直接指标。") +
+                        breakdown + "\n\n" +
+                        L.Tr("Optimization directions:\n", "优化方向：\n") +
+                        L.Tr("1. Set up LOD Groups for complex models (3-4 levels recommended; distant models can drop below 10% of the triangle count);\n", "1. 为复杂模型设置 LOD Group（推荐 3~4 级，远距离模型面数可降至 10% 以下）；\n") +
+                        L.Tr("2. Check visibility culling: is Occlusion Culling baked, and is the camera's Far Clip too large;\n", "2. 检查可见性剔除：Occlusion Culling 是否已烘焙，相机 Far Clip 是否过大；\n") +
+                        L.Tr("3. For high-poly characters/foliage instanced in large numbers, consider GPU Instancing + simplified LODs.\n", "3. 高面数角色/植被若大量实例化，考虑 GPU Instancing + 简化 LOD。\n") +
+                        L.Tr("Reference baselines: <50K for mobile, <200K for mid-range PC scenes, up to 500K+ on high-end PC/console.", "参考基准：移动端建议 <50K，PC 中档场景 <200K，高端 PC/Console 可至 500K+。"),
+                ping: ping));
         }
 
         private static void BatchingEfficiency(RuntimeProfileResult r, List<Finding> findings)
@@ -421,13 +445,51 @@ namespace PerfLint.Runtime
             // Only evaluate when the Draw Call count is large enough for batching to provide a benefit; the ratio is meaningless when it is too small.
             if (draw.Avg < 50) return;
 
-            double ratio = batch.Avg / draw.Avg; // The closer to 1, the worse the batching (every DC is an independent Batch)
+            double ratio = batch.Avg / draw.Avg; // The closer to 1, the fewer Draw Calls were merged into batches.
             if (ratio < 0.9) return;
 
+            var sb = r.SceneBatching;
+            bool isSrp = sb != null && sb.HasData && sb.IsSrp;
+            var setPass = r.SetPassCalls;
+            bool haveSetPass = setPass != null && setPass.HasData && draw.Avg > 0;
+            double setPassRatio = haveSetPass ? setPass.Avg / draw.Avg : -1;
+            // RUN.GPU004 is only emitted at this instancing threshold; gate every cross-reference to it so it never dangles.
+            bool gpu004 = sb != null && sb.HasData && sb.InstancedMaterialRendererCount >= MaterialInstancingMinCount;
+
+            if (isSrp)
+            {
+                // Under an SRP the SRP Batcher does NOT reduce the Batch count — Batches ≈ Draw Calls is *by design*. It lowers SetPass instead.
+                // So a high Batches/Draw ratio is expected and not itself a problem; judging SRP projects by that ratio would false-positive on nearly every one of them.
+                // The real signal is SetPass relative to Draw Calls. When SetPass is well below Draw Calls the Batcher is engaging → say nothing.
+                if (haveSetPass && setPassRatio <= 0.6) return;
+
+                string spText = haveSetPass
+                    ? L.Tr($"SetPass is {setPass.Avg:0}/frame — {setPassRatio:P0} of the Draw Call count, so the SRP Batcher is barely merging render state. ", $"SetPass 为 {setPass.Avg:0}/帧——占 Draw Call 数的 {setPassRatio:P0}，说明 SRP Batcher 几乎没在合并渲染状态。")
+                    : L.Tr("SetPass data isn't available this run, so Batcher health can't be confirmed from counters alone. ", "本次无 SetPass 数据，单凭计数器无法确认 Batcher 是否生效。");
+
+                findings.Add(new Finding(
+                    ruleId: "RUN.GPU003",
+                    domain: Domain.Runtime,
+                    severity: Severity.Info, // SRP-Batcher-not-engaging is real but rarely the top bottleneck — keep it Info, never alarm on the (expected) high Batch count.
+                    title: haveSetPass
+                        ? L.Tr($"SRP Batcher not engaging: SetPass {setPass.Avg:0}/frame stays high vs {draw.Avg:0} Draw Calls", $"SRP Batcher 未生效：SetPass {setPass.Avg:0}/帧 相对 {draw.Avg:0} Draw Call 仍偏高")
+                        : L.Tr($"Under SRP the high Batch count ({batch.Avg:0}) is expected — judge batching by SetPass", $"SRP 下 Batch 数偏高（{batch.Avg:0}）属正常——批处理应看 SetPass"),
+                    detail: L.Tr("Your project is on URP/HDRP. Under an SRP the Batches counter staying close to the Draw Call count is **expected** — the SRP Batcher lowers SetPass, not the Batch count — so the high Batches/Draw ratio is not itself the problem. ", "你的项目是 URP/HDRP。SRP 下 Batches 接近 Draw Call 数是**正常**的——SRP Batcher 降的是 SetPass，不是 Batch 数——所以高 Batches/Draw 比率本身不是问题。") +
+                            spText + "\n\n" +
+                            L.Tr("When SetPass stays high under SRP, the Batcher isn't engaging. Most likely causes, in order:\n", "SRP 下 SetPass 仍高，说明 Batcher 没生效，最可能的原因（按顺序）：\n") +
+                            L.Tr("1. SRP Batcher-incompatible shaders (material properties not wrapped in a per-material CBUFFER) — run a project scan and PerfLint will flag any it finds;\n", "1. Shader 不兼容 SRP Batcher（材质属性未封装进 per-material CBUFFER）——运行一次项目扫描，PerfLint 会标出存在的问题；\n") +
+                            (gpu004
+                                ? L.Tr($"2. Runtime material instancing: {sb.InstancedMaterialRendererCount} objects cloned their material, and each clone drops out of the Batcher — see RUN.GPU004;\n", $"2. 运行时材质实例化：{sb.InstancedMaterialRendererCount} 个物体克隆了材质，每个克隆都会退出 Batcher——见 RUN.GPU004；\n")
+                                : L.Tr("2. Materials with GPU Instancing enabled under SRP — Instancing kicks them out of the SRP Batcher (a scan flags these too);\n", "2. SRP 下材质开启了 GPU Instancing——Instancing 会把它们踢出 SRP Batcher（扫描同样会标出）；\n")) +
+                            L.Tr("3. Frequent material / render-state switches (transparent objects, many render queues) interrupting the batch.", "3. 材质/渲染状态频繁切换（半透明、多渲染队列穿插）打断批次。")));
+                return;
+            }
+
+            // Built-in pipeline: here Batches/Draw Calls genuinely reflects static/dynamic batching merging draws, so the ratio IS the signal.
             Severity sev = ratio >= 0.97 ? Severity.Warning : Severity.Info;
 
-            // Use actual scene measurements to turn "why isn't it batching" from a generic checklist into a concrete diagnosis.
-            var sb = r.SceneBatching;
+            // Use actual scene measurements to prune the checklist down to causes the data hasn't already ruled out.
+            bool goodReuse = sb != null && sb.HasData && sb.MaterialReuseRatio >= 4.0;
             string sceneInsight = "";
             if (sb != null && sb.HasData)
             {
@@ -435,27 +497,38 @@ namespace PerfLint.Runtime
                     L.Tr($"\n\nMeasured in this scene: {sb.RendererCount} mesh Renderers actually use {sb.UniqueMaterialCount} distinct material objects", $"\n\n本次场景实测：{sb.RendererCount} 个网格 Renderer 实际用了 {sb.UniqueMaterialCount} 个不同材质对象");
                 if (sb.MaterialReuseRatio < 1.5)
                     sceneInsight += L.Tr(" — nearly one material per object; the lack of material reuse is the direct reason batching can't merge them.", "——几乎一物一材质，材质不复用是批处理无法合并的直接原因。");
+                else if (goodReuse)
+                    sceneInsight += L.Tr($" (reuse ratio {sb.MaterialReuseRatio:0.0}:1 — material reuse is healthy, so the cause lies in the batching settings below, not in material sharing).", $"（复用率 {sb.MaterialReuseRatio:0.0}:1——材质复用良好，原因应在下面的批处理设置，而非材质共享）。");
                 else
                     sceneInsight += L.Tr($" (material reuse ratio {sb.MaterialReuseRatio:0.0}:1).", $"（材质复用率 {sb.MaterialReuseRatio:0.0}:1）。");
-                if (sb.InstancedMaterialRendererCount > 0)
+                if (gpu004)
                     sceneInsight += L.Tr($" Also detected {sb.InstancedMaterialRendererCount} objects instancing their materials at runtime — this is the primary root cause; see RUN.GPU004.", $" 并检测到 {sb.InstancedMaterialRendererCount} 个物体在运行时实例化了材质——这是首要根因，详见 RUN.GPU004。");
             }
+
+            // Build the checklist, dropping items the measured data has already ruled out (so it reads as targeted diagnosis, not a generic dump).
+            var items = new List<string>();
+            if (!goodReuse) // when materials are already well-shared, runtime instancing isn't the cause — omit this item
+                items.Add(L.Tr("Runtime material instancing: accessing renderer.material (instead of sharedMaterial) in a script clones the material, and each clone is a separate batch; switch to MaterialPropertyBlock or sharedMaterial", "运行时材质实例化：脚本里访问 renderer.material（而非 sharedMaterial）会克隆材质，每个克隆都是独立 batch；改用 MaterialPropertyBlock 或 sharedMaterial") +
+                          (gpu004 ? L.Tr(" (see RUN.GPU004)", "（见 RUN.GPU004）") : ""));
+            items.Add(L.Tr("Static batching: confirm that non-moving objects in the scene have Batching Static checked", "静态批处理：确认场景中不会移动的物体已勾选 Batching Static"));
+            items.Add(L.Tr("Dynamic batching: meshes with <300 vertices can use it (Project Settings → Player → Dynamic Batching)", "动态批处理：顶点数 <300 的 Mesh 可启用（Project Settings → Player → Dynamic Batching）"));
+            items.Add(L.Tr("GPU Instancing: for many objects sharing the same Mesh and Material (e.g. grass/bullets), enable \"Enable GPU Instancing\"", "GPU Instancing：大量同 Mesh 同 Material 的物体（如草地/子弹）启用 Enable GPU Instancing"));
+
+            string checklist = L.Tr("Checklist (ordered by prevalence):\n", "排查清单（按常见程度排序）：\n");
+            for (int i = 0; i < items.Count; i++)
+                checklist += $"{i + 1}. {items[i]}\n";
 
             findings.Add(new Finding(
                 ruleId: "RUN.GPU003",
                 domain: Domain.Runtime,
                 severity: sev,
                 title: L.Tr($"Low batching efficiency: {batch.Avg:0} separate batches out of {draw.Avg:0} Draw Calls (ratio {ratio:P0})", $"批处理效率低：{draw.Avg:0} Draw Call 中 {batch.Avg:0} 个独立 Batch（比率 {ratio:P0}）"),
-                detail: L.Tr($"Batches / Draw Calls ≈ {ratio:P0}, meaning batching is barely working — the vast majority of Draw Calls are not merged. ", $"Batches / Draw Calls ≈ {ratio:P0}，说明批处理几乎未生效——绝大多数 Draw Call 都未被合并。") +
-                        sceneInsight + "\n\n" +
-                        L.Tr("Checklist (ordered by prevalence):\n", "排查清单（按常见程度排序）：\n") +
-                        L.Tr("1. Runtime material instancing: accessing renderer.material (instead of sharedMaterial) in a script clones the material, and each clone is a separate batch; switch to MaterialPropertyBlock or sharedMaterial (see RUN.GPU004);\n", "1. 运行时材质实例化：脚本里访问 renderer.material（而非 sharedMaterial）会克隆材质，每个克隆都是独立 batch；改用 MaterialPropertyBlock 或 sharedMaterial（见 RUN.GPU004）；\n") +
-                        L.Tr("2. SRP projects: check whether materials are SRP Batcher-compatible (the shader must wrap properties in a CBUFFER); see \"MAT001 / MAT002\" in the main panel;\n", "2. SRP 项目：检查材质是否兼容 SRP Batcher（要求 Shader 用 CBUFFER 封装属性）；见主面板「MAT001 / MAT002」；\n") +
-                        L.Tr("3. Static batching: confirm that non-moving objects in the scene have Batching Static checked;\n", "3. 静态批处理：确认场景中不会移动的物体已勾选 Batching Static；\n") +
-                        L.Tr("4. Dynamic batching: meshes with <300 vertices can use it (Project Settings → Player → Dynamic Batching);\n", "4. 动态批处理：顶点数 <300 的 Mesh 可启用（Project Settings → Player → Dynamic Batching）；\n") +
-                        L.Tr("5. GPU Instancing: for many objects sharing the same Mesh and Material (e.g. grass/bullets), enable \"Enable GPU Instancing\".\n", "5. GPU Instancing：大量同 Mesh 同 Material 的物体（如草地/子弹）启用 Enable GPU Instancing。\n") +
-                        L.Tr("Note: under URP/HDRP the SRP Batcher reduces SetPass cost, so the Batch count not dropping is normal; what matters is whether SetPass is already well below the Draw Call count.", "注意：URP/HDRP 下 SRP Batcher 减少的是 SetPass 开销，Batch 数不降也正常；关键看 SetPass 是否已大幅低于 Draw Call 数。")));
+                detail: L.Tr($"Batches / Draw Calls ≈ {ratio:P0} on the Built-in pipeline, meaning batching is barely working — the vast majority of Draw Calls are not merged. ", $"Built-in 管线下 Batches / Draw Calls ≈ {ratio:P0}，说明批处理几乎未生效——绝大多数 Draw Call 都未被合并。") +
+                        sceneInsight + "\n\n" + checklist));
         }
+
+        /// <summary>Minimum runtime-instanced renderer count to raise RUN.GPU004; below this a few instances may be intentional (avoid noise). Shared so GPU003's cross-reference matches GPU004's actual emission.</summary>
+        private const int MaterialInstancingMinCount = 5;
 
         /// <summary>
         /// Runtime material-instancing detection — **impossible via static scanning, unique to Play Mode**. Accessing renderer.material (not sharedMaterial)
@@ -466,7 +539,7 @@ namespace PerfLint.Runtime
         {
             var sb = r.SceneBatching;
             if (sb == null || !sb.HasData) return;
-            if (sb.InstancedMaterialRendererCount < 5) return; // Threshold: a small number of instances may be intentional; avoid noise
+            if (sb.InstancedMaterialRendererCount < MaterialInstancingMinCount) return; // Threshold: a small number of instances may be intentional; avoid noise
 
             int n = sb.InstancedMaterialRendererCount;
             Severity sev = n >= 20 ? Severity.Warning : Severity.Info;
@@ -559,8 +632,8 @@ namespace PerfLint.Runtime
                         severity: sev,
                         title: L.Tr($"CPU hotspot (script): {h.Marker} — {msText} ({h.SharePercent:0.0}%)", $"CPU 热点（脚本）：{h.Marker} — {msText}（{h.SharePercent:0.0}%）"),
                         detail: L.Tr($"Main-thread self-time hotspot \"{h.Marker}\" averages {h.SelfMsPerFrame:0.00} ms per frame, about {h.SharePercent:0.0}% of frame time. ", $"主线程 self-time 热点「{h.Marker}」平均每帧 {h.SelfMsPerFrame:0.00} ms，占帧时间约 {h.SharePercent:0.0}%。") +
-                                L.Tr("Runtime has confirmed this script is a CPU hotspot. Click Locate to open the script, then optimize line by line with the \"Script GC / per-frame allocation\" analysis in the main panel; ", "运行时已证实此脚本是 CPU 热点。点 Locate 打开脚本，结合主面板「脚本 GC / 每帧分配」分析逐行优化；") +
-                                L.Tr("if the hotspot stems from per-frame allocation, AI Fix can patch it.", "若热点源于每帧分配，可用 AI Fix 修复。") + spikeDetail,
+                                L.Tr("Runtime has confirmed this script is a CPU hotspot. Click \"Line-level analysis\" — there are two cases: (1) if the cost is per-frame allocation, the main panel pinpoints the lines and AI Fix can patch them; ", "运行时已证实此脚本是 CPU 热点。点「逐行分析」——分两种情况：① 若开销来自每帧分配，主面板会逐行定位、AI Fix 可一键修复；") +
+                                L.Tr("(2) if the analysis finds nothing, the hotspot is compute-bound (heavy loops/math, not allocation) — line-level GC analysis can't flag that; optimize the algorithm instead: do less per frame (throttle / spread across frames), cache results, or reduce iteration counts. The panel will tell you which case this is.", "② 若分析查不到东西，说明是计算密集型热点（重循环/数学，而非分配）——逐行 GC 分析标不出来，应改优化算法：每帧少干活（节流/分摊多帧）、缓存结果、减少迭代次数。面板会告诉你属于哪种情况。") + spikeDetail,
                         targetPath: capturedPath,
                         ping: () => ScannerUtil.OpenScript(capturedPath, capturedMethod),
                         codeFile: capturedPath));
@@ -604,7 +677,7 @@ namespace PerfLint.Runtime
                         severity: Severity.Info,
                         title: L.Tr("Want hotspots pinpointed to specific script methods? Enable Deep Profile and re-sample", "想把热点定位到具体脚本方法？开启 Deep Profile 再采样"),
                         detail: L.Tr("This run's hotspots are coarse-grained markers (e.g. BehaviourUpdate aggregates the Update of all scripts), so they can't be narrowed to a specific script. ", "本次热点为粗粒度 marker（如 BehaviourUpdate 聚合了所有脚本的 Update），未能精确到某个脚本。") +
-                                L.Tr("Enable \"Deep Profile\" in the Unity Profiler window, then re-enter Play Mode and sample; markers will refine to ClassName.Method(), ", "在 Unity Profiler 窗口开启「Deep Profile」后重新进入 Play Mode 采样，marker 会细化为 ClassName.Method()，") +
+                                L.Tr("Turn on the \"Deep Profile\" toggle at the top of this panel (or in the Unity Profiler window), then re-enter Play Mode and sample; markers will refine to ClassName.Method(), ", "用本面板顶部的「Deep Profile」开关开启（或在 Unity Profiler 窗口开启）后重新进入 Play Mode 采样，marker 会细化为 ClassName.Method()，") +
                                 L.Tr("and this panel can then map hotspots to scripts and offer Locate / line-level analysis. Note that Deep Profile has high overhead — use it for localization only, not for measuring real frame rate.", "本面板即可把热点映射到脚本并提供 Locate / 逐行分析。注意 Deep Profile 开销很大，仅用于定位、勿用于测真实帧率。")));
                 }
             }
@@ -621,12 +694,13 @@ namespace PerfLint.Runtime
         private static string Signed(double bytes) =>
             (bytes >= 0 ? "+" : "−") + Human(System.Math.Abs(bytes));
 
-        /// <summary>Extracts the method name from a marker display name: "LevelGenerator.AllVehiclesHavePaths()" → "AllVehiclesHavePaths". Returns null if none.</summary>
+        /// <summary>Extracts the method name from a marker display name: "LevelGenerator.AllVehiclesHavePaths()" → "AllVehiclesHavePaths". Returns null if none.
+        /// Markers may carry a profiler sample-label suffix ("ScriptableRenderer.Execute: PC_High_Renderer") or args — strip anything from the first ':', ' ', or '(' so FindMethodLine can match the bare declaration.</summary>
         private static string MethodNameOf(string marker)
         {
             if (string.IsNullOrEmpty(marker)) return null;
-            int paren = marker.IndexOf('(');
-            string head = paren >= 0 ? marker.Substring(0, paren) : marker;
+            int cut = marker.IndexOfAny(new[] { '(', ':', ' ' });
+            string head = cut >= 0 ? marker.Substring(0, cut) : marker;
             int dot = head.LastIndexOf('.');
             string m = dot >= 0 ? head.Substring(dot + 1) : head;
             return string.IsNullOrEmpty(m) ? null : m;

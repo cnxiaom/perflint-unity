@@ -23,7 +23,13 @@ namespace PerfLint.UI
     public sealed class PerfLintWindow : EditorWindow
     {
         private Label _scoreLabel;
-        private Label _summaryLabel;
+        private Label _gradeLabel;     // "Grade C" next to the big score number
+        private Label _fixableLabel;   // "80 one-click-fixable · 1.4s" subtext
+        private Label _critPill;       // rounded severity-count badges (Critical / Warning / Info)
+        private Label _warnPill;
+        private Label _infoPill;
+        private VisualElement _pillRow; // hidden until the first scan populates the counts
+        private ScoreRing _scoreRing;   // Painter2D ring gauge with the letter grade in the center
         private VisualElement _roslynBox;
         private Label _roslynNotice;
         private Button _roslynButton;
@@ -35,6 +41,18 @@ namespace PerfLint.UI
         private Button _fixAllButton;
         private Button _licenseButton;
         private ScanResult _lastResult;
+
+        // "Enabling script analysis" busy state. Clicking the one-click enable copies the Roslyn DLLs, adds the
+        // PERFLINT_ROSLYN define and triggers a recompile + domain reload — during which the editor stays responsive
+        // and the panel would otherwise look unchanged, so users think nothing happened and keep clicking. We lock the
+        // panel behind a full-cover overlay and unlock it automatically once the module compiles in (or it times out).
+        // The intent must survive the domain reload (which destroys this window), so it lives in SessionState.
+        private VisualElement _enablingOverlay;
+        private Label _enablingLabel;
+        private bool _pollingEnabling;
+        private int _enablingTick;
+        private const string KRoslynEnabling = "PerfLint.Roslyn.Enabling";
+        private const string KRoslynEnablingDeadline = "PerfLint.Roslyn.EnablingDeadline";
 
         // State after a report is restored from disk (surviving domain reload / window reopen): restored findings carry no
         // Fix/Action instances (those aren't serializable). Only these rules previously had one-click fixes; clicking
@@ -50,6 +68,13 @@ namespace PerfLint.UI
         private string _search = string.Empty;
         private TextField _searchField; // Promoted to a field: lets the "line-by-line analysis" jump set the search term externally
         private Toggle _infoToggle;     // Same: the jump needs Info enabled (line-level clues are mostly Info)
+        // Set by FocusOnScript when a "Line-level analysis" jump from a runtime CPU hotspot found NO static issues in that script:
+        // the hotspot is CPU-bound compute, not allocation. Lets the empty state explain that instead of a bare "no matches" dead-end. Cleared once the user navigates away.
+        private string _focusedScriptNoFindings;
+        // Set by FocusOnScriptGcRules (runtime RUN.GC001 "Locate" jump): narrows the report to the per-frame allocation rule family
+        // (PERF.GC* / PERF.UPD*) so the user lands directly on the actionable allocation findings. Cleared when the user types in the search box.
+        private System.Func<Finding, bool> _ruleFocus;
+        private string _ruleFocusLabel;
 
         // Remember each Foldout's expanded/collapsed state (keys: domain "D:..." / rule "R:..."), restored across rebuilds —
         // otherwise RenderResults rebuilding resets every group to its default expand/collapse, reopening what the user manually folded.
@@ -75,7 +100,11 @@ namespace PerfLint.UI
         }
 
         private void OnEnable() => LicenseService.Changed += RefreshLicenseButton;
-        private void OnDisable() => LicenseService.Changed -= RefreshLicenseButton;
+        private void OnDisable()
+        {
+            LicenseService.Changed -= RefreshLicenseButton;
+            StopEnablingPoll(); // don't leak the EditorApplication.update subscription if the window is closed mid-enable
+        }
 
         private void RefreshLicenseButton()
         {
@@ -103,6 +132,10 @@ namespace PerfLint.UI
             _scanButton = new Button(RunScan) { text = "Scan Project" };
             _scanButton.style.height = 26;
             _scanButton.style.flexGrow = 1;
+            // Primary action: tint it the accent blue so it reads as the main thing to click (matches the marketing visual).
+            _scanButton.style.backgroundColor = new Color(0.20f, 0.45f, 0.85f);
+            _scanButton.style.color = Color.white;
+            _scanButton.style.unityFontStyleAndWeight = FontStyle.Bold;
             toolbar.Add(_scanButton);
 
             _fixAllButton = new Button(FixAllInResult) { text = "Fix All" };
@@ -153,21 +186,55 @@ namespace PerfLint.UI
             RefreshLicenseButton();
             root.Add(toolbar);
 
-            // ── Health score ──────────────────────────────
+            // ── Health score card ──────────────────────────────
             var header = new VisualElement
             {
-                style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginBottom = 4 }
+                style =
+                {
+                    flexDirection = FlexDirection.Row, alignItems = Align.Center, marginBottom = 6,
+                    paddingTop = 10, paddingBottom = 10, paddingLeft = 14, paddingRight = 14,
+                    backgroundColor = new Color(1f, 1f, 1f, 0.03f),
+                    borderTopLeftRadius = 10, borderTopRightRadius = 10,
+                    borderBottomLeftRadius = 10, borderBottomRightRadius = 10,
+                    borderTopWidth = 1, borderBottomWidth = 1, borderLeftWidth = 1, borderRightWidth = 1,
+                }
             };
+            SetBorderColor(header, new Color(1f, 1f, 1f, 0.07f));
+
+            // Big score number. The grade column sits flush beside it, so trim the number's own line box (no extra
+            // top/bottom leading) and let the row's center-alignment line the two up cleanly.
             _scoreLabel = new Label("—")
             {
-                style = { fontSize = 28, unityFontStyleAndWeight = FontStyle.Bold, marginRight = 12 }
-            };
-            _summaryLabel = new Label(L.Tr("Not scanned yet. Click Scan Project to start.", "尚未扫描。点击 Scan Project 开始。"))
-            {
-                style = { whiteSpace = WhiteSpace.Normal, flexGrow = 1 }
+                style = { fontSize = 42, unityFontStyleAndWeight = FontStyle.Bold, marginRight = 14, flexShrink = 0 }
             };
             header.Add(_scoreLabel);
-            header.Add(_summaryLabel);
+
+            var gradeCol = new VisualElement { style = { marginRight = 18, flexShrink = 0, justifyContent = Justify.Center } };
+            _gradeLabel = new Label(L.Tr("Not scanned", "尚未扫描"))
+            {
+                style = { fontSize = 15, unityFontStyleAndWeight = FontStyle.Bold }
+            };
+            _fixableLabel = new Label(L.Tr("Click Scan Project to start", "点击 Scan Project 开始"))
+            {
+                style = { fontSize = 11, opacity = 0.6f, whiteSpace = WhiteSpace.Normal, marginTop = 3 }
+            };
+            gradeCol.Add(_gradeLabel);
+            gradeCol.Add(_fixableLabel);
+            header.Add(gradeCol);
+
+            // Rounded severity-count badges; hidden until the first scan fills in real numbers.
+            _pillRow = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, flexWrap = Wrap.Wrap, flexGrow = 1, minWidth = 0, display = DisplayStyle.None } };
+            _critPill = MakePill(SeverityColor(Severity.Critical));
+            _warnPill = MakePill(SeverityColor(Severity.Warning));
+            _infoPill = MakePill(SeverityColor(Severity.Info));
+            _pillRow.Add(_critPill);
+            _pillRow.Add(_warnPill);
+            _pillRow.Add(_infoPill);
+            header.Add(_pillRow);
+
+            _scoreRing = new ScoreRing { style = { flexShrink = 0, marginLeft = 8 } };
+            header.Add(_scoreRing);
+
             root.Add(header);
 
             // ── Deep script analysis (Roslyn) degradation notice + one-click enable ──────────────
@@ -262,6 +329,10 @@ namespace PerfLint.UI
 
             // After a domain reload / window reopen the in-memory results are empty → restore the last scan from disk, avoiding a blank report and an 86s forced full rescan.
             RestoreLastResultIfAny();
+
+            // If a one-click "Enable script analysis" is still in flight (this CreateGUI is very likely the rebuild after
+            // the recompile it triggered), re-show the busy overlay and resume polling — or finish it if it's already done.
+            ResumeRoslynEnablingIfPending();
         }
 
         /// <summary>
@@ -346,6 +417,10 @@ namespace PerfLint.UI
             search.RegisterValueChangedCallback(evt =>
             {
                 _search = evt.newValue ?? string.Empty;
+                // Navigating away from the focused script drops the "compute-bound hotspot" empty-state explanation (it's specific to that jump).
+                if (_search != _focusedScriptNoFindings) _focusedScriptNoFindings = null;
+                // Typing a real query means the user is filtering on their own → drop the rule-family focus (PERF.GC*/UPD*) from the RUN.GC001 jump.
+                if (!string.IsNullOrEmpty(_search)) { _ruleFocus = null; _ruleFocusLabel = null; }
                 placeholder.style.display = string.IsNullOrEmpty(_search) ? DisplayStyle.Flex : DisplayStyle.None;
                 RenderResults();
             });
@@ -379,6 +454,11 @@ namespace PerfLint.UI
 
         private void RunScan()
         {
+            // A full scan is a fresh start: drop any transient view focus (e.g. the RUN.GC001 → PERF.GC*/UPD* narrowing),
+            // otherwise the report stays stuck filtered to one rule family and the user can't get back to the whole list.
+            _ruleFocus = null;
+            _ruleFocusLabel = null;
+            _focusedScriptNoFindings = null;
             if (_staleBanner != null) _staleBanner.style.display = DisplayStyle.None; // Once refreshed, clear the stale prompt
             _scanButton.SetEnabled(false);
             _fixAllButton.SetEnabled(false);
@@ -455,7 +535,11 @@ namespace PerfLint.UI
             var (ok, msg, conflicts) = RoslynSetup.Install();
             if (ok)
             {
-                EditorUtility.DisplayDialog(L.Tr("Enabled", "已启用"), msg, "OK");
+                // Install kicked off a recompile + domain reload. Instead of a modal dialog the user clicks past
+                // (after which the panel looks idle but is mid-compile), lock the panel behind a busy overlay that
+                // clears itself once the module compiles in. Log the detail (e.g. skipped dependencies) for the record.
+                Debug.Log("[PerfLint] " + msg);
+                BeginRoslynEnabling();
             }
             else if (conflicts != null && conflicts.Length > 0)
             {
@@ -469,15 +553,161 @@ namespace PerfLint.UI
             }
         }
 
+        // ── "Enabling script analysis" busy state ────────────────────────────────────────────────
+        // Lifecycle: BeginRoslynEnabling (on click) → recompile + domain reload destroys the window →
+        // CreateGUI re-entry re-shows the overlay and resumes polling → PollEnabling detects the module
+        // compiled in (or a timeout) → FinishRoslynEnabling unlocks the panel.
+
+        private const double EnablingTimeoutSeconds = 120.0; // generous: copy + recompile + domain reload
+
+        private void BeginRoslynEnabling()
+        {
+            SessionState.SetBool(KRoslynEnabling, true);
+            SessionState.SetFloat(KRoslynEnablingDeadline, (float)(EditorApplication.timeSinceStartup + EnablingTimeoutSeconds));
+            ShowEnablingOverlay();
+            StartEnablingPoll();
+        }
+
+        /// <summary>Pure decision for "give up waiting": only fail once compilation has settled AND the deadline has passed AND the module still isn't available. Kept static + internal so the premature-failure regression can be unit-tested without a domain reload.</summary>
+        internal static bool RoslynEnablingTimedOut(bool deepAvailable, bool compiling, double now, double deadline) =>
+            !deepAvailable && !compiling && deadline > 0.0 && now > deadline;
+
+        private void PollEnabling()
+        {
+            // Success: the gated PerfLint.Scripting assembly compiled in. The availability probe is cached and reset on
+            // domain reload, so in practice this turns true right after CreateGUI re-runs in the post-reload domain.
+            if (ScanRunner.IsDeepScriptAnalysisAvailable())
+            {
+                FinishRoslynEnabling(success: true);
+                return;
+            }
+
+            double deadline = SessionState.GetFloat(KRoslynEnablingDeadline, 0f);
+            if (RoslynEnablingTimedOut(false, EditorApplication.isCompiling, EditorApplication.timeSinceStartup, deadline))
+            {
+                FinishRoslynEnabling(success: false);
+                return;
+            }
+
+            // Animate the trailing dots (~ every 0.5s of editor ticks) so the overlay reads as alive, not frozen.
+            if (_enablingLabel != null && (++_enablingTick % 30) == 0)
+            {
+                int dots = (_enablingTick / 30) % 4;
+                _enablingLabel.text = L.Tr("Enabling script analysis", "正在启用脚本分析") + new string('.', dots);
+            }
+        }
+
+        private void FinishRoslynEnabling(bool success)
+        {
+            SessionState.EraseBool(KRoslynEnabling);
+            SessionState.EraseFloat(KRoslynEnablingDeadline);
+            StopEnablingPoll();
+            HideEnablingOverlay();
+            UpdateRoslynNotice(); // success → the notice box hides itself; failure → it stays with the Enable button for a retry
+            if (!success)
+                EditorUtility.DisplayDialog(
+                    L.Tr("Enable script analysis", "启用脚本分析"),
+                    L.Tr("Enabling took longer than expected, or compilation failed. Check the Console for errors, then try again or follow the manual setup steps.",
+                         "启用耗时超出预期，或编译失败。请查看 Console 报错后重试，或按手动步骤启用。"),
+                    "OK");
+        }
+
+        private void StartEnablingPoll()
+        {
+            if (_pollingEnabling) return;
+            _pollingEnabling = true;
+            EditorApplication.update += PollEnabling;
+        }
+
+        private void StopEnablingPoll()
+        {
+            if (!_pollingEnabling) return;
+            _pollingEnabling = false;
+            EditorApplication.update -= PollEnabling;
+        }
+
+        private void ShowEnablingOverlay()
+        {
+            if (_enablingOverlay == null)
+            {
+                _enablingOverlay = new VisualElement
+                {
+                    // Absolute full-cover element: with default pickingMode it intercepts every pointer event, so the
+                    // panel beneath is effectively locked, and the translucent fill dims it to read as "busy".
+                    style =
+                    {
+                        position = Position.Absolute,
+                        top = 0, left = 0, right = 0, bottom = 0,
+                        backgroundColor = new Color(0f, 0f, 0f, 0.55f),
+                        alignItems = Align.Center,
+                        justifyContent = Justify.Center,
+                    }
+                };
+                var card = new VisualElement
+                {
+                    style =
+                    {
+                        maxWidth = 420,
+                        paddingTop = 16, paddingBottom = 16, paddingLeft = 20, paddingRight = 20,
+                        backgroundColor = new Color(0.16f, 0.16f, 0.16f, 0.98f),
+                        borderTopLeftRadius = 6, borderTopRightRadius = 6,
+                        borderBottomLeftRadius = 6, borderBottomRightRadius = 6,
+                        alignItems = Align.Center,
+                    }
+                };
+                _enablingLabel = new Label(L.Tr("Enabling script analysis", "正在启用脚本分析"))
+                {
+                    style = { whiteSpace = WhiteSpace.Normal, unityFontStyleAndWeight = FontStyle.Bold, fontSize = 13, color = Color.white }
+                };
+                var sub = new Label(L.Tr(
+                    "Copying the Roslyn analyzers and recompiling — the editor may reload. The panel unlocks automatically when it's done.",
+                    "正在拷入 Roslyn 分析器并重新编译——编辑器可能会重载。完成后面板会自动解锁。"))
+                {
+                    style = { whiteSpace = WhiteSpace.Normal, marginTop = 8, fontSize = 11, color = new Color(0.8f, 0.8f, 0.8f), unityTextAlign = TextAnchor.MiddleCenter }
+                };
+                card.Add(_enablingLabel);
+                card.Add(sub);
+                _enablingOverlay.Add(card);
+            }
+            if (_enablingOverlay.parent == null) rootVisualElement.Add(_enablingOverlay);
+            _enablingOverlay.style.display = DisplayStyle.Flex;
+            _enablingOverlay.BringToFront();
+        }
+
+        private void HideEnablingOverlay()
+        {
+            if (_enablingOverlay != null) _enablingOverlay.style.display = DisplayStyle.None;
+        }
+
+        /// <summary>After CreateGUI rebuilds the window (notably across the domain reload the enable triggers), resume the busy state if an enable is still in flight — or finish it immediately if the module already compiled in during the reload.</summary>
+        private void ResumeRoslynEnablingIfPending()
+        {
+            if (!SessionState.GetBool(KRoslynEnabling, false)) return;
+            if (ScanRunner.IsDeepScriptAnalysisAvailable()) { FinishRoslynEnabling(success: true); return; }
+            ShowEnablingOverlay();
+            StartEnablingPoll();
+        }
+
         private void RenderHeader(ScanResult result)
         {
             UpdateRoslynNotice();
-            _scoreLabel.text = $"{result.HealthScore()}";
-            _scoreLabel.style.color = ScoreColor(result.HealthScore());
-            _summaryLabel.text =
-                $"{L.Tr("Grade", "等级")} {result.HealthGrade()} · {result.CriticalCount} Critical · " +
-                $"{result.WarningCount} Warning · {result.InfoCount} Info · " +
+            int score = result.HealthScore();
+            var scoreColor = ScoreColor(score);
+            _scoreLabel.text = $"{score}";
+            _scoreLabel.style.color = scoreColor;
+
+            _gradeLabel.text = $"{L.Tr("Grade", "等级")} {result.HealthGrade()}";
+            _gradeLabel.style.color = scoreColor;
+            _fixableLabel.text =
                 $"{result.AutoFixableCount} {L.Tr("one-click-fixable", "项可一键修复")} · {result.Duration.TotalSeconds:0.0}s";
+
+            // A zero count is good news (e.g. "0 Critical"), so dim it to grey instead of flashing its severity color as if it were an alarm.
+            StylePill(_critPill, result.CriticalCount, "Critical", SeverityColor(Severity.Critical));
+            StylePill(_warnPill, result.WarningCount, "Warning", SeverityColor(Severity.Warning));
+            StylePill(_infoPill, result.InfoCount, "Info", SeverityColor(Severity.Info));
+            _pillRow.style.display = DisplayStyle.Flex;
+
+            _scoreRing.Set(score, result.HealthGrade(), scoreColor);
 
             _fixAllButton.text = result.AutoFixableCount > 0 ? $"Fix All ({result.AutoFixableCount})" : "Fix All";
             _fixAllButton.SetEnabled(result.AutoFixableCount > 0);
@@ -551,11 +781,19 @@ namespace PerfLint.UI
 
             var filtered = _lastResult.Findings.Where(PassesFilter).ToList();
             _filterStatus.text = $"{L.Tr("Showing", "显示")} {filtered.Count} / {_lastResult.Findings.Count}" +
-                                 (_showInfo ? "" : L.Tr(" · Info hidden", " · Info 已隐藏"));
+                                 (_showInfo ? "" : L.Tr(" · Info hidden", " · Info 已隐藏")) +
+                                 (_ruleFocus != null && !string.IsNullOrEmpty(_ruleFocusLabel)
+                                     ? L.Tr($" · focused: {_ruleFocusLabel} (type in search to clear)", $" · 已聚焦：{_ruleFocusLabel}（搜索框输入任意字符可取消）")
+                                     : "");
 
             if (filtered.Count == 0)
             {
-                _results.Add(new Label(L.Tr("No matches under the current filter.", "当前筛选下没有匹配项。")) { style = { marginTop = 8, opacity = 0.7f } });
+                if (!string.IsNullOrEmpty(_focusedScriptNoFindings) && _search == _focusedScriptNoFindings)
+                    _results.Add(BuildComputeBoundHotspotHelp());
+                else if (_ruleFocus != null)
+                    _results.Add(BuildNoAllocationFindingsHelp());
+                else
+                    _results.Add(new Label(L.Tr("No matches under the current filter.", "当前筛选下没有匹配项。")) { style = { marginTop = 8, opacity = 0.7f } });
                 return;
             }
 
@@ -568,8 +806,16 @@ namespace PerfLint.UI
                     text = $"{domainGroup.Key}  ({domainGroup.Count()})",
                     value = GetFoldout(dkey, true)
                 };
-                domainFoldout.style.marginTop = 6;
                 domainFoldout.Q<Toggle>()?.AddToClassList("perflint-domain");
+                // Give the domain header more presence than the default grey foldout text: bigger, bold, near-white —
+                // so the three section cards clearly read as the top level above the rule rows.
+                var domainTitle = domainFoldout.Q<Toggle>()?.Q<Label>();
+                if (domainTitle != null)
+                {
+                    domainTitle.style.fontSize = 13;
+                    domainTitle.style.unityFontStyleAndWeight = FontStyle.Bold;
+                    domainTitle.style.color = new Color(0.92f, 0.92f, 0.94f);
+                }
                 domainFoldout.RegisterValueChangedCallback(_ => { _foldoutExpanded[dkey] = domainFoldout.value; SaveFoldoutState(); });
 
                 var ruleGroups = domainGroup
@@ -580,7 +826,22 @@ namespace PerfLint.UI
                 foreach (var ruleGroup in ruleGroups)
                     domainFoldout.Add(BuildRuleFoldout(ruleGroup));
 
-                _results.Add(domainFoldout);
+                // Wrap each domain in a rounded card so the report reads as grouped panels rather than a flat tree.
+                var card = new VisualElement
+                {
+                    style =
+                    {
+                        marginTop = 8, marginBottom = 2,
+                        paddingTop = 4, paddingBottom = 6, paddingLeft = 8, paddingRight = 6,
+                        backgroundColor = new Color(1f, 1f, 1f, 0.022f),
+                        borderTopLeftRadius = 8, borderTopRightRadius = 8,
+                        borderBottomLeftRadius = 8, borderBottomRightRadius = 8,
+                        borderTopWidth = 1, borderBottomWidth = 1, borderLeftWidth = 1, borderRightWidth = 1,
+                    }
+                };
+                SetBorderColor(card, new Color(1f, 1f, 1f, 0.06f));
+                card.Add(domainFoldout);
+                _results.Add(card);
             }
         }
 
@@ -939,9 +1200,13 @@ namespace PerfLint.UI
             {
                 style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginTop = 6, display = DisplayStyle.None }
             };
-            var field = new TextField { style = { flexGrow = 1 } };
+            // flexGrow=1 alone isn't enough: a TextField won't shrink below its intrinsic content width, so a long
+            // value pushes the "Ask follow-up" button off the right edge (clipped to "As…"). minWidth=0 lets the field
+            // yield space; flexShrink=0 on the button keeps it fully visible. Same fix as the stale-banner "Rescan all" row.
+            var field = new TextField { style = { flexGrow = 1, flexShrink = 1, minWidth = 0 } };
             var ask = new Button { text = L.Tr("Ask follow-up", "追问") };
             ask.style.marginLeft = 4;
+            ask.style.flexShrink = 0;
             inputRow.Add(field);
             inputRow.Add(ask);
             box.Add(inputRow);
@@ -1429,6 +1694,7 @@ namespace PerfLint.UI
             };
             if (!sevOk) return false;
             if (_onlyFixable && !f.CanAutoFix) return false;
+            if (_ruleFocus != null && !_ruleFocus(f)) return false;
             if (!string.IsNullOrEmpty(_search))
             {
                 string q = _search.Trim();
@@ -1481,6 +1747,15 @@ namespace PerfLint.UI
             // Sync the UI controls (when already built): setting value triggers their respective callbacks → update state + RenderResults.
             if (_searchField != null) _searchField.value = scriptPath;
             if (_infoToggle != null) _infoToggle.value = true;
+
+            // Decide the empty-state story BEFORE rendering: did file-level analysis surface anything for this exact script?
+            // If not, the runtime CPU hotspot is compute-bound (not allocation), and the empty state should say so rather than read like a dead-end.
+            // (The _searchField callback above set _focusedScriptNoFindings = null; we set the real value here, then render.)
+            bool scriptHasFindings = _lastResult != null && _lastResult.Findings.Any(f =>
+                !string.IsNullOrEmpty(f.TargetPath) &&
+                f.TargetPath.IndexOf(scriptPath, StringComparison.OrdinalIgnoreCase) >= 0);
+            _focusedScriptNoFindings = (_lastResult != null && !scriptHasFindings) ? scriptPath : null;
+
             // Controls not ready, or the value above didn't change when set (no callback fired) → render once proactively.
             RenderResults();
 
@@ -1488,10 +1763,219 @@ namespace PerfLint.UI
                 ShowNotification(new GUIContent(L.Tr("No file-level analyzer claims this script (not a runtime script?)", "该脚本无文件级行分析器认领（非运行时脚本？）")));
         }
 
+        /// <summary>Switches to the static scan panel and narrows the report to the per-frame allocation rule family (PERF.GC* / PERF.UPD*).
+        /// Entry point for runtime RUN.GC001's "Locate": runtime confirmed GC pressure → land directly on the allocation sites + AI Fix. Does NOT trigger a full scan
+        /// (that's the user's "Scan Project" button); it filters whatever results exist (a restored last scan, typically).</summary>
+        public void FocusOnScriptGcRules()
+        {
+            _search = string.Empty;
+            _focusedScriptNoFindings = null;
+            if (_searchField != null) _searchField.value = string.Empty; // empty value won't clear _ruleFocus (callback only clears on a non-empty query)
+            if (_infoToggle != null) _infoToggle.value = true;           // some allocation rules (GC003/GC004) are Info
+            _showInfo = true;
+            // Set the focus AFTER syncing controls (the field callback above runs first; it leaves _ruleFocus untouched for an empty value).
+            _ruleFocus = f => f.RuleId != null &&
+                (f.RuleId.StartsWith("PERF.GC", StringComparison.Ordinal) || f.RuleId.StartsWith("PERF.UPD", StringComparison.Ordinal));
+            _ruleFocusLabel = L.Tr("Script GC / per-frame allocation", "脚本 GC / 每帧分配");
+            RenderResults();
+
+            if (_lastResult == null)
+                ShowNotification(new GUIContent(L.Tr("Click \"Scan Project\" first — the per-frame allocation findings will then show here", "请先点「Scan Project」扫描——每帧分配类问题会显示在这里")));
+        }
+
+        /// <summary>Empty state for the RUN.GC001 → allocation-rules jump when the scan surfaced no PERF.GC*/UPD* findings:
+        /// runtime confirms GC pressure but static syntax analysis found no allocation site, so point at the sources it can't see.</summary>
+        private VisualElement BuildNoAllocationFindingsHelp()
+        {
+            var box = new VisualElement
+            {
+                style =
+                {
+                    marginTop = 8, paddingTop = 8, paddingBottom = 8, paddingLeft = 10, paddingRight = 10,
+                    backgroundColor = new Color(1, 1, 1, 0.04f),
+                    borderLeftWidth = 3, borderLeftColor = new Color(0.45f, 0.65f, 0.95f)
+                }
+            };
+            bool scanned = _lastResult != null;
+            box.Add(new Label(scanned
+                ? L.Tr("No per-frame allocation patterns (PERF.GC* / PERF.UPD*) found in your scripts.", "你的脚本里未发现每帧分配类模式（PERF.GC* / PERF.UPD*）。")
+                : L.Tr("Run \"Scan Project\" first to surface per-frame allocation findings.", "请先点「Scan Project」扫描，才能列出每帧分配类问题。"))
+            { style = { unityFontStyleAndWeight = FontStyle.Bold, whiteSpace = WhiteSpace.Normal } });
+            if (scanned)
+                box.Add(new Label(
+                    L.Tr("Runtime confirmed GC pressure, but the static syntax analysis matched no allocation site. The allocations likely come from sources it can't see: value-type boxing, allocations inside third-party packages or engine callbacks, closures/lambdas captured per call, or collection growth not in an Update-family method. Record a GC.Alloc sample in the Unity Profiler (CPU module → \"GC Alloc\" column, or Memory Profiler) to pinpoint the exact call.",
+                         "运行时确认了 GC 压力，但静态语法分析没匹配到分配点。分配大概率来自它看不到的地方：值类型装箱、第三方包或引擎回调内部的分配、每次调用捕获的闭包/lambda、或不在 Update 系方法里的集合增长。用 Unity Profiler 录一段 GC.Alloc（CPU 模块的「GC Alloc」列，或 Memory Profiler）来定位到具体调用。"))
+                { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.85f, marginTop = 4, fontSize = 11 } });
+            return box;
+        }
+
+        /// <summary>Empty state shown when a runtime CPU-hotspot "Line-level analysis" jump finds no static issues in the script:
+        /// explains the hotspot is compute-bound (not allocation) and what to do, instead of a bare "no matches" that reads like a dead-end.</summary>
+        private static VisualElement BuildComputeBoundHotspotHelp()
+        {
+            var box = new VisualElement
+            {
+                style =
+                {
+                    marginTop = 8, paddingTop = 8, paddingBottom = 8, paddingLeft = 10, paddingRight = 10,
+                    backgroundColor = new Color(1, 1, 1, 0.04f),
+                    borderLeftWidth = 3, borderLeftColor = new Color(0.45f, 0.65f, 0.95f)
+                }
+            };
+            box.Add(new Label(L.Tr("No allocation / anti-pattern issues found in this script.", "此脚本未发现分配 / 反模式类问题。"))
+            { style = { unityFontStyleAndWeight = FontStyle.Bold, whiteSpace = WhiteSpace.Normal } });
+            box.Add(new Label(
+                L.Tr("PerfLint's line-level analysis flags per-frame allocation (GC) and known anti-patterns — it found none here. So this CPU hotspot is most likely **compute-bound**: heavy per-frame work (loops, math, logic) that allocation analysis can't surface and AI Fix can't auto-patch.",
+                     "PerfLint 的逐行分析查的是每帧分配（GC）和已知反模式——这里一个都没有。所以这个 CPU 热点大概率是**计算密集型**：每帧干了很重的活（循环、数学、逻辑），分配分析看不到、AI Fix 也无法自动修。"))
+            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.85f, marginTop = 4, fontSize = 11 } });
+            // Item 4 depends on whether Deep Profile is already on: if it is, the hotspot is already method-level — don't tell the user to enable
+            // something they've already enabled (which is what they'd just done to get a method-level marker in the first place).
+            bool deep = UnityEditorInternal.ProfilerDriver.deepProfiling;
+            string item4 = deep
+                ? L.Tr("4. Deep Profile is already on, so this hotspot is already pinned to the method. To go deeper, expand this method's call tree in the Unity Profiler's CPU \"Hierarchy\" view to see where the time goes. \"Explain\" can also reason about the method's logic for you.",
+                       "4. 你已开启 Deep Profile，所以热点已定位到方法级。要再往下拆，可在 Unity Profiler 的 CPU「Hierarchy」视图展开此方法的调用树看耗时分布。「Explain」也能帮你分析这个方法的逻辑。")
+                : L.Tr("4. For a sub-method breakdown, turn on the \"Deep Profile\" toggle at the top of the PerfLint Runtime panel and re-sample. \"Explain\" can also reason about the method's logic for you.",
+                       "4. 想看子方法级拆分，用 PerfLint Runtime 面板顶部的「Deep Profile」开关开启后重采样。「Explain」也能帮你分析这个方法的逻辑。");
+            box.Add(new Label(
+                L.Tr("How to optimize a compute-bound hotspot:\n1. Do less per frame — throttle, spread work across frames (coroutine/job), or make it event-driven instead of polling in Update;\n2. Cache and reuse results that don't change every frame;\n3. Reduce scale/precision — fewer iterations, a coarser data structure, early-outs;\n",
+                     "计算型热点怎么优化：\n1. 每帧少干活——加节流、把工作分摊到多帧（协程/Job），或改成事件驱动而非在 Update 里轮询；\n2. 缓存复用那些并非每帧都变的结果；\n3. 降低规模/精度——更少迭代、更粗的数据结构、提前退出；\n") + item4)
+            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.85f, marginTop = 4, fontSize = 11 } });
+            return box;
+        }
+
         private static VisualElement MakeDivider() => new VisualElement
         {
             style = { height = 1, backgroundColor = new Color(1, 1, 1, 0.1f), marginTop = 4, marginBottom = 4 }
         };
+
+        /// <summary>Set all four border-side colors at once (UIElements has no single 'borderColor' shorthand in inline style).</summary>
+        private static void SetBorderColor(VisualElement e, Color c)
+        {
+            e.style.borderTopColor = c;
+            e.style.borderBottomColor = c;
+            e.style.borderLeftColor = c;
+            e.style.borderRightColor = c;
+        }
+
+        /// <summary>A rounded "pill" badge (severity-count chip): colored text + a faint same-hue fill and border.</summary>
+        private static Label MakePill(Color c)
+        {
+            var l = new Label
+            {
+                style =
+                {
+                    paddingLeft = 9, paddingRight = 9, paddingTop = 2, paddingBottom = 2,
+                    marginRight = 6, marginTop = 2, marginBottom = 2,
+                    fontSize = 11, color = c, flexShrink = 0,
+                    backgroundColor = new Color(c.r, c.g, c.b, 0.12f),
+                    borderTopLeftRadius = 11, borderTopRightRadius = 11,
+                    borderBottomLeftRadius = 11, borderBottomRightRadius = 11,
+                    borderTopWidth = 1, borderBottomWidth = 1, borderLeftWidth = 1, borderRightWidth = 1,
+                }
+            };
+            SetBorderColor(l, new Color(c.r, c.g, c.b, 0.55f));
+            return l;
+        }
+
+        // Neutral grey for a zero-count pill: "0 Critical" is a good outcome, not an alarm — don't paint it red.
+        private static readonly Color PillZeroColor = new Color(0.55f, 0.55f, 0.55f);
+
+        /// <summary>Set a pill's text and recolor it: its severity hue when the count is non-zero, a muted grey when it's zero.</summary>
+        private static void StylePill(Label pill, int count, string label, Color activeColor)
+        {
+            bool zero = count == 0;
+            Color c = zero ? PillZeroColor : activeColor;
+            pill.text = $"{count} {label}";
+            pill.style.color = c;
+            pill.style.backgroundColor = new Color(c.r, c.g, c.b, zero ? 0.05f : 0.12f);
+            SetBorderColor(pill, new Color(c.r, c.g, c.b, zero ? 0.28f : 0.55f));
+        }
+
+        /// <summary>
+        /// Circular score gauge with the letter grade centered on top.
+        /// On Unity 2022.1+ the Painter2D vector API is available, so we draw a faint full-circle track plus a colored
+        /// progress arc proportional to the score. On older editors (no Painter2D / MeshGenerationContext.painter2D /
+        /// LineCap / Angle) we degrade to a plain colored ring via a rounded border — same "ring + grade" read, just no
+        /// proportional sweep. The whole arc path is version-gated so the package still compiles on pre-2022.1 projects.
+        /// </summary>
+        private sealed class ScoreRing : VisualElement
+        {
+            private const float Size = 84f;
+            private int _score = -1; // -1 = not scanned yet → only the track is drawn
+            private Color _color = new Color(0.5f, 0.5f, 0.5f);
+            private readonly Label _gradeLabel;
+
+            public ScoreRing()
+            {
+                style.width = Size;
+                style.height = Size;
+                _gradeLabel = new Label("—")
+                {
+                    pickingMode = PickingMode.Ignore,
+                    style =
+                    {
+                        position = Position.Absolute, left = 0, right = 0, top = 0, bottom = 0,
+                        unityTextAlign = TextAnchor.MiddleCenter,
+                        fontSize = 33, unityFontStyleAndWeight = FontStyle.Bold,
+                        color = _color,
+                    }
+                };
+                Add(_gradeLabel);
+#if UNITY_2022_1_OR_NEWER
+                generateVisualContent += OnGenerate;
+#else
+                // Fallback ring: a full rounded border acts as the colored ring (no proportional arc).
+                style.borderTopLeftRadius = Size / 2f; style.borderTopRightRadius = Size / 2f;
+                style.borderBottomLeftRadius = Size / 2f; style.borderBottomRightRadius = Size / 2f;
+                style.borderTopWidth = 6; style.borderBottomWidth = 6; style.borderLeftWidth = 6; style.borderRightWidth = 6;
+                SetBorderColor(this, new Color(1f, 1f, 1f, 0.16f));
+#endif
+            }
+
+            public void Set(int score, string grade, Color color)
+            {
+                _score = score;
+                _color = color;
+                _gradeLabel.text = grade;
+                _gradeLabel.style.color = color;
+#if UNITY_2022_1_OR_NEWER
+                MarkDirtyRepaint();
+#else
+                SetBorderColor(this, _score < 0 ? new Color(1f, 1f, 1f, 0.16f) : color);
+#endif
+            }
+
+#if UNITY_2022_1_OR_NEWER
+            private void OnGenerate(MeshGenerationContext mgc)
+            {
+                var r = contentRect;
+                if (r.width < 4f || r.height < 4f) return;
+
+                float lw = 8f;
+                var center = new Vector2(r.width / 2f, r.height / 2f);
+                float radius = Mathf.Min(r.width, r.height) / 2f - lw / 2f - 1f;
+                var p = mgc.painter2D;
+                p.lineWidth = lw;
+                p.lineCap = LineCap.Round;
+
+                // Track: a clearly-visible full circle so the colored arc reads as a proportion of a gauge, not a lone stroke.
+                p.strokeColor = new Color(1f, 1f, 1f, 0.16f);
+                p.BeginPath();
+                p.Arc(center, radius, Angle.Degrees(0f), Angle.Degrees(360f));
+                p.Stroke();
+
+                // Progress arc, starting at 12 o'clock (-90°) and sweeping clockwise.
+                float pct = Mathf.Clamp01((_score < 0 ? 0 : _score) / 100f);
+                if (pct > 0f)
+                {
+                    p.strokeColor = _color;
+                    p.BeginPath();
+                    p.Arc(center, radius, Angle.Degrees(-90f), Angle.Degrees(-90f + 360f * pct));
+                    p.Stroke();
+                }
+            }
+#endif
+        }
 
         private static Color SeverityColor(Severity s) => s switch
         {

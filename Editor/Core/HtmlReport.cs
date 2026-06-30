@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Text;
 using PerfLint.L10n;
@@ -43,18 +44,28 @@ namespace PerfLint.Core
 
             // ── Header: brand + project + score ──
             sb.Append("<div class=\"wrap\">");
-            sb.Append("<header><div class=\"brand\">PerfLint <span class=\"sub\">for Unity</span></div>")
+            sb.Append("<header><div class=\"brand\"><span class=\"mark\">P</span>PerfLint <span class=\"sub\">for Unity</span></div>")
               .Append("<div class=\"meta\">").Append(Esc(projectName));
             if (!string.IsNullOrEmpty(generatedAtLocal))
                 sb.Append(" · ").Append(Esc(generatedAtLocal));
+            // Scan duration: a quiet "this was fast & local" signal.
+            sb.Append("<br>").Append(L.Tr("scanned in ", "扫描耗时 "))
+              .Append(result.Duration.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture)).Append('s');
             sb.Append("</div></header>");
 
+            // Score block mirrors the site's sample-report head (site/src/pages/report.astro):
+            // a grade-coloured ring around the number, with "Project health: <grade>" beside it.
+            // Ring mirrors the editor's gauge: a grade-coloured progress arc (proportional to the score) over a faint
+            // track, with the score number in the centre. Pure CSS conic-gradient — still fully self-contained (no JS).
+            string ringColor = GradeColor(grade);
             sb.Append("<section class=\"score\">")
-              .Append("<div class=\"grade\">").Append(Esc(grade)).Append("</div>")
-              .Append("<div class=\"scoreinfo\"><div class=\"num\">").Append(score)
-              .Append("<span class=\"den\">/100</span></div>")
-              .Append("<div class=\"label\">").Append(L.Tr("Project health score", "项目健康度评分")).Append("</div></div>")
-              .Append("</section>");
+              .Append("<div class=\"ring\" style=\"background:conic-gradient(").Append(ringColor).Append(" 0 ").Append(score)
+              .Append("%,#2f3742 ").Append(score).Append("% 100%)\"><span class=\"g\">").Append(score).Append("</span></div>")
+              .Append("<div class=\"scorehead\">")
+              .Append("<div class=\"health\">").Append(L.Tr("Project health", "项目健康"))
+              .Append(": <span class=\"grade\">").Append(Esc(grade)).Append("</span></div>")
+              .Append("<div class=\"label\">").Append(score).Append(" / 100</div>")
+              .Append("</div></section>");
 
             // ── Count badges ──
             sb.Append("<section class=\"counts\">");
@@ -83,11 +94,22 @@ namespace PerfLint.Core
                     string sevClass = sev == Severity.Critical ? "crit" : sev == Severity.Warning ? "warn" : "info";
                     // Group header title: prefer GroupTitleOrTitle (which excludes quantities unique to a single instance).
                     string title = items[0].GroupTitleOrTitle;
+                    bool fixable = items.Any(f => f.CanAutoFix || f.WasAutoFixable);
 
-                    sb.Append("<div class=\"rule\"><div class=\"rulehead\"><span class=\"dot ").Append(sevClass).Append("\"></span>")
-                      .Append("<span class=\"rid\">").Append(Esc(rule.Key)).Append("</span> ")
+                    sb.Append("<details class=\"rule\"><summary class=\"rulehead\"><span class=\"dot ").Append(sevClass).Append("\"></span>")
                       .Append("<span class=\"rtitle\">").Append(Esc(title)).Append("</span>")
-                      .Append("<span class=\"rcount\">").Append(items.Count).Append("</span></div>");
+                      .Append("<span class=\"pill sev-").Append(sevClass).Append("\">").Append(Esc(SevLabel(sev))).Append("</span>")
+                      .Append("<span class=\"pill\">").Append(Esc(domainGroup.Key.ToString())).Append("</span>")
+                      .Append("<span class=\"pill mono\">").Append(Esc(rule.Key)).Append("</span>");
+                    if (fixable)
+                        sb.Append("<span class=\"pill fix\">").Append(L.Tr("One-click fix", "可一键修复")).Append("</span>");
+                    sb.Append("<span class=\"rcount\">").Append(items.Count).Append("</span>")
+                      .Append("<span class=\"chev\">▸</span></summary>");
+
+                    // Rule-level impact / fix advice — the "why + how to fix" content, shared across instances.
+                    string detail = items[0].Detail;
+                    if (!string.IsNullOrEmpty(detail))
+                        sb.Append("<div class=\"detail\">").Append(Esc(detail)).Append("</div>");
 
                     int shown = Math.Min(items.Count, MaxRowsPerRule);
                     sb.Append("<ul>");
@@ -95,7 +117,14 @@ namespace PerfLint.Core
                     {
                         var f = items[i];
                         string loc = f.TargetPath ?? f.CodeFile;
-                        sb.Append("<li><span class=\"li-title\">").Append(Esc(f.Title)).Append("</span>");
+                        // Only repeat the instance title when it carries something the group header doesn't
+                        // (e.g. a per-file quantity). Avoids "Oversized texture / Oversized texture" noise.
+                        bool showTitle = !string.Equals(f.Title, title, StringComparison.Ordinal);
+                        // A single project-wide finding (no path, title == header) would otherwise emit an empty row.
+                        if (!showTitle && string.IsNullOrEmpty(loc)) continue;
+                        sb.Append("<li>");
+                        if (showTitle)
+                            sb.Append("<span class=\"li-title\">").Append(Esc(f.Title)).Append("</span>");
                         if (!string.IsNullOrEmpty(loc))
                             sb.Append("<span class=\"li-path\">").Append(Esc(loc)).Append("</span>");
                         sb.Append("</li>");
@@ -103,7 +132,7 @@ namespace PerfLint.Core
                     if (items.Count > shown)
                         sb.Append("<li class=\"more\">… ").Append(items.Count - shown).Append(' ')
                           .Append(L.Tr("more", "条更多")).Append("</li>");
-                    sb.Append("</ul></div>");
+                    sb.Append("</ul></details>");
                 }
             }
 
@@ -120,6 +149,11 @@ namespace PerfLint.Core
             sb.Append("</div></body></html>");
             return sb.ToString();
         }
+
+        private static string SevLabel(Severity sev) =>
+            sev == Severity.Critical ? L.Tr("Critical", "严重")
+            : sev == Severity.Warning ? L.Tr("Warning", "警告")
+            : L.Tr("Info", "提示");
 
         private static void Badge(StringBuilder sb, string cls, int n, string label)
         {
@@ -160,31 +194,47 @@ namespace PerfLint.Core
 
         private static string Css(string grade) =>
             "*{box-sizing:border-box}" +
-            "body{margin:0;background:#0d1117;color:#c9d1d9;font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}" +
+            "body{margin:0;background:#0d1117;color:#e6edf3;font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}" +
             ".wrap{max-width:900px;margin:0 auto;padding:32px 20px 64px}" +
-            "header{display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid #21262d;padding-bottom:12px}" +
-            ".brand{font-size:20px;font-weight:700;color:#f0f6fc}.brand .sub{font-weight:400;color:#8b949e;font-size:14px}" +
-            ".meta{color:#8b949e;font-size:12px}" +
-            ".score{display:flex;align-items:center;gap:20px;margin:28px 0}" +
-            ".grade{width:84px;height:84px;border-radius:50%;display:flex;align-items:center;justify-content:center;" +
-            "font-size:44px;font-weight:800;color:#fff;background:" + GradeColor(grade) + "}" +
-            ".scoreinfo .num{font-size:34px;font-weight:700;color:#f0f6fc}.scoreinfo .den{font-size:16px;color:#8b949e;font-weight:400}" +
-            ".scoreinfo .label{color:#8b949e;font-size:13px}" +
-            ".counts{display:flex;gap:12px;flex-wrap:wrap;margin:8px 0 24px}" +
-            ".badge{flex:1;min-width:110px;background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 14px}" +
-            ".badge .bn{font-size:24px;font-weight:700;color:#f0f6fc}.badge .bl{font-size:12px;color:#8b949e}" +
-            ".badge.crit .bn{color:#f85149}.badge.warn .bn{color:#d29922}.badge.fix .bn{color:#3fb950}" +
-            "h2{margin:28px 0 10px;font-size:16px;color:#f0f6fc;font-weight:600}.dimcount{color:#8b949e;font-weight:400;font-size:13px}" +
-            ".rule{background:#161b22;border:1px solid #21262d;border-radius:8px;margin:8px 0;overflow:hidden}" +
-            ".rulehead{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#1c2128}" +
-            ".dot{width:9px;height:9px;border-radius:50%;flex:none}.dot.crit{background:#f85149}.dot.warn{background:#d29922}.dot.info{background:#58a6ff}" +
-            ".rid{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#8b949e}" +
-            ".rtitle{flex:1;color:#f0f6fc}.rcount{background:#30363d;color:#c9d1d9;border-radius:10px;padding:1px 8px;font-size:12px}" +
-            ".rule ul{list-style:none;margin:0;padding:4px 0}" +
-            ".rule li{padding:5px 12px 5px 29px;border-top:1px solid #21262d;display:flex;flex-direction:column}" +
-            ".li-title{color:#c9d1d9}.li-path{color:#6e7681;font-size:12px;word-break:break-all}" +
-            ".rule li.more{color:#6e7681;font-style:italic}" +
-            ".empty{color:#3fb950;font-size:16px;text-align:center;padding:40px}" +
-            "footer{margin-top:36px;padding-top:16px;border-top:1px solid #21262d;color:#6e7681;font-size:12px}";
+            "header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #2a313c;padding-bottom:14px;gap:16px}" +
+            ".brand{display:flex;align-items:center;gap:9px;font-size:19px;font-weight:700;color:#e6edf3}" +
+            ".brand .mark{width:24px;height:24px;border-radius:7px;background:#4cc38a;color:#04140d;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:800}" +
+            ".brand .sub{font-weight:400;color:#9aa7b4;font-size:14px}" +
+            ".meta{color:#9aa7b4;font-size:12px;text-align:right;line-height:1.5}" +
+            ".score{display:flex;align-items:center;gap:24px;margin:30px 0 8px;flex-wrap:wrap}" +
+            ".ring{width:96px;height:96px;border-radius:50%;position:relative;display:flex;align-items:center;justify-content:center;flex:none}" +
+            ".ring::before{content:'';position:absolute;inset:9px;border-radius:50%;background:#0d1117}" +
+            ".ring .g{position:relative;font-size:30px;font-weight:700;color:" + GradeColor(grade) + "}" +
+            ".scorehead .health{font-size:24px;font-weight:700;color:#e6edf3}" +
+            ".scorehead .health .grade{color:" + GradeColor(grade) + "}" +
+            ".scorehead .label{color:#9aa7b4;font-size:13px;margin-top:3px}" +
+            ".counts{display:flex;gap:12px;flex-wrap:wrap;margin:18px 0 26px}" +
+            ".badge{flex:1;min-width:120px;background:#161b22;border:1px solid #2a313c;border-radius:12px;padding:14px 16px}" +
+            ".badge .bn{font-size:26px;font-weight:700;color:#e6edf3}.badge .bl{font-size:12px;color:#9aa7b4}" +
+            ".badge.crit .bn{color:#ef5350}.badge.warn .bn{color:#f0b429}.badge.fix .bn{color:#4cc38a}" +
+            "h2{margin:30px 0 12px;font-size:16px;color:#e6edf3;font-weight:600}.dimcount{color:#9aa7b4;font-weight:400;font-size:13px}" +
+            ".rule{border:1px solid #2a313c;border-radius:10px;margin:10px 0;overflow:hidden}" +
+            ".rulehead{display:flex;align-items:center;gap:9px;padding:12px 16px;background:#1a2029;flex-wrap:wrap}" +
+            ".rule>summary{cursor:pointer;list-style:none}.rule>summary::-webkit-details-marker{display:none}" +
+            ".rule>summary:hover{background:#1f2630}" +
+            ".chev{color:#7d8896;font-size:12px;display:inline-block;transition:transform .15s}" +
+            ".rule[open]>summary .chev{transform:rotate(90deg)}" +
+            ".dot{width:10px;height:10px;border-radius:50%;flex:none}.dot.crit{background:#ef5350}.dot.warn{background:#f0b429}.dot.info{background:#5b9dff}" +
+            ".rtitle{font-weight:600;color:#e6edf3}" +
+            ".pill{font-size:11px;border:1px solid #2a313c;border-radius:999px;padding:2px 8px;color:#9aa7b4;white-space:nowrap}" +
+            ".pill.mono{font-family:ui-monospace,Consolas,monospace}" +
+            ".pill.sev-crit{color:#ef5350;border-color:rgba(239,83,80,.4)}" +
+            ".pill.sev-warn{color:#f0b429;border-color:rgba(240,180,41,.4)}" +
+            ".pill.sev-info{color:#5b9dff;border-color:rgba(91,157,255,.4)}" +
+            ".pill.fix{color:#4cc38a;border-color:rgba(76,195,138,.4)}" +
+            ".rcount{margin-left:auto;background:#2a313c;color:#e6edf3;border-radius:999px;padding:1px 9px;font-size:12px}" +
+            ".detail{padding:11px 16px;color:#9aa7b4;border-top:1px solid #2a313c;font-size:13px}" +
+            ".rule ul{list-style:none;margin:0;padding:4px 0;border-top:1px solid #2a313c}.detail+ul{border-top:none}.rule ul:empty{display:none}" +
+            ".rule li{padding:6px 16px;display:flex;flex-direction:column;gap:1px}" +
+            ".rule li+li{border-top:1px solid rgba(42,49,60,.55)}" +
+            ".li-title{color:#e6edf3}.li-path{color:#7d8896;font-size:12px;font-family:ui-monospace,Consolas,monospace;word-break:break-all}" +
+            ".rule li.more{color:#7d8896;font-style:italic}" +
+            ".empty{color:#4cc38a;font-size:16px;text-align:center;padding:40px}" +
+            "footer{margin-top:40px;padding-top:16px;border-top:1px solid #2a313c;color:#7d8896;font-size:12px}";
     }
 }

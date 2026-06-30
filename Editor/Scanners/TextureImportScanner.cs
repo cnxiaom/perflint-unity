@@ -24,6 +24,11 @@ namespace PerfLint.Scanners
         private const int UncompressedSizeThreshold = 256;
         private const int OversizedThreshold = 4096; // Conservative threshold: only report truly enormous textures to keep false-positive rate low.
 
+        // TEX005 must load the texture to read its real imported format. Skip sources whose imported size exceeds this many
+        // pixels: loading a single multi-hundred-MB texture can itself fail to allocate. 8192² is generous (most Max Size
+        // settings cap well below it) while still bounding the worst-case single load.
+        private const long Tex005MaxLoadPixels = 8192L * 8192L;
+
         public IEnumerable<Finding> Scan(ScanContext context)
         {
             // The compression format can be overridden by the "current build platform": once a platform's
@@ -36,6 +41,9 @@ namespace PerfLint.Scanners
                 : ScannerUtil.ActivePlatformName();
 
             var guids = AssetDatabase.FindAssets("t:Texture2D", new[] { "Assets" });
+            // TEX005 alone needs the actually-imported runtime format (only a loaded texture exposes it). Resolve the active
+            // build target once here; below we load only the compression-requested subset — never every texture.
+            string activePlatform = ScannerUtil.ActivePlatformName();
             for (int i = 0; i < guids.Length; i++)
             {
                 context.CancellationToken.ThrowIfCancellationRequested();
@@ -44,9 +52,11 @@ namespace PerfLint.Scanners
                 string path = AssetDatabase.GUIDToAssetPath(guids[i]);
                 if (AssetImporter.GetAtPath(path) is not TextureImporter importer) continue;
 
-                var tex = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
-                int w = tex != null ? tex.width : 0;
-                int h = tex != null ? tex.height : 0;
+                // Read dimensions from importer metadata instead of LoadAssetAtPath<Texture2D>. Loading a texture
+                // materializes its (often uncompressed) pixel payload into native memory; doing that for EVERY texture in a
+                // large project accumulates until the native heap is exhausted and the editor hard-crashes (SIGSEGV in
+                // Texture2D::CreatePixelDataWhenReading — exactly the museum-scale crash this replaces). No pixels load here.
+                GetImportedSize(importer, platform, out int w, out int h);
                 int maxDim = Mathf.Max(w, h);
                 string file = Path.GetFileName(path);
 
@@ -122,26 +132,62 @@ namespace PerfLint.Scanners
 
                 // PERF.TEX005 — Compression requested but the imported texture is actually uncompressed (silent fallback).
                 // Judged against the ACTIVE build target's real imported format (Texture2D.format) — the engine's own verdict,
-                // so there are no false positives. The intent is read for the active platform too (so the two sides match);
-                // this rule therefore ignores context.TargetPlatform (which is about hypothetical other platforms, not what was actually built).
-                string activePlatform = ScannerUtil.ActivePlatformName();
-                if (tex != null
-                    && IsSilentCompressionFallback(!IsEffectivelyUncompressed(importer, activePlatform), tex.format))
+                // so there are no false positives. This is the ONLY rule that needs the loaded texture, so we load it only when
+                // compression was requested (a small subset), skip pathologically huge ones (loading them would risk the very
+                // OOM we're avoiding — they're still surfaced by TEX003), and unload it immediately so peak memory stays at
+                // ~one texture. The intent is read for the active platform too (so the two sides match); this rule ignores
+                // context.TargetPlatform (hypothetical other platforms, not what was actually built).
+                if (!IsEffectivelyUncompressed(importer, activePlatform) && maxDim > 0 && (long)w * h <= Tex005MaxLoadPixels)
                 {
-                    yield return new Finding(
-                        ruleId: "PERF.TEX005",
-                        domain: Domain.Performance,
-                        severity: Severity.Warning,
-                        title: L.Tr("Texture compression silently failed", "纹理压缩静默失败"),
-                        detail: L.Tr($"'{file}' ({w}x{h}) is set to Compressed, but the importer fell back to an uncompressed format ({tex.format}), " +
-                                "multiplying its VRAM and memory use. The usual cause is dimensions a block format can't compress: ETC/ETC2 require both sides to be multiples of 4, " +
-                                "and PVRTC requires square power-of-two. Resize to a compatible size (a multiple of 4, ideally power-of-two), or switch to a format that allows these dimensions (e.g. ASTC).",
-                                $"'{file}' ({w}x{h}) 设为 Compressed，但导入器回退成了未压缩格式（{tex.format}），显存与内存占用翻数倍。" +
-                                "常见原因是尺寸不满足块压缩要求：ETC/ETC2 要求宽高均为 4 的倍数，PVRTC 要求正方形且为 2 的幂。" +
-                                "请改为兼容尺寸（4 的倍数，最好是 2 的幂），或改用允许该尺寸的格式（如 ASTC）。"),
-                        targetPath: path,
-                        ping: () => ScannerUtil.PingAsset(path));
+                    var tex = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+                    bool fellBack = tex != null && IsSilentCompressionFallback(true, tex.format);
+                    TextureFormat actualFormat = tex != null ? tex.format : default;
+                    if (tex != null) Resources.UnloadAsset(tex); // free the native pixel buffer before we move on / yield
+                    if (fellBack)
+                    {
+                        yield return new Finding(
+                            ruleId: "PERF.TEX005",
+                            domain: Domain.Performance,
+                            severity: Severity.Warning,
+                            title: L.Tr("Texture compression silently failed", "纹理压缩静默失败"),
+                            detail: L.Tr($"'{file}' ({w}x{h}) is set to Compressed, but the importer fell back to an uncompressed format ({actualFormat}), " +
+                                    "multiplying its VRAM and memory use. The usual cause is dimensions a block format can't compress: ETC/ETC2 require both sides to be multiples of 4, " +
+                                    "and PVRTC requires square power-of-two. Resize to a compatible size (a multiple of 4, ideally power-of-two), or switch to a format that allows these dimensions (e.g. ASTC).",
+                                    $"'{file}' ({w}x{h}) 设为 Compressed，但导入器回退成了未压缩格式（{actualFormat}），显存与内存占用翻数倍。" +
+                                    "常见原因是尺寸不满足块压缩要求：ETC/ETC2 要求宽高均为 4 的倍数，PVRTC 要求正方形且为 2 的幂。" +
+                                    "请改为兼容尺寸（4 的倍数，最好是 2 的幂），或改用允许该尺寸的格式（如 ASTC）。"),
+                            targetPath: path,
+                            ping: () => ScannerUtil.PingAsset(path));
+                    }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Imported texture dimensions WITHOUT loading the texture asset (which would materialize its pixel data into native
+        /// memory and, across a large project, crash the editor). Reads the source size from the importer and applies the
+        /// effective Max Size clamp (the platform override if present, else the importer default), preserving aspect ratio.
+        /// An unimported / sizeless source yields (0,0) — same neutral result the old <c>tex == null</c> path produced.
+        /// </summary>
+        private static void GetImportedSize(TextureImporter importer, string platform, out int w, out int h)
+        {
+            importer.GetSourceTextureWidthAndHeight(out int sw, out int sh);
+
+            int maxSize = importer.maxTextureSize;
+            var ps = importer.GetPlatformTextureSettings(platform);
+            if (ps != null && ps.overridden && ps.maxTextureSize > 0) maxSize = ps.maxTextureSize;
+
+            int srcMax = Mathf.Max(sw, sh);
+            if (maxSize > 0 && srcMax > maxSize)
+            {
+                float scale = (float)maxSize / srcMax; // Max Size clamps the longer edge, preserving aspect.
+                w = Mathf.Max(1, Mathf.RoundToInt(sw * scale));
+                h = Mathf.Max(1, Mathf.RoundToInt(sh * scale));
+            }
+            else
+            {
+                w = sw;
+                h = sh;
             }
         }
 
@@ -168,20 +214,27 @@ namespace PerfLint.Scanners
         }
 
         /// <summary>
-        /// Whether this texture is "uncompressed" when imported for the current build platform. If the platform's
-        /// Override is enabled: when format==Automatic, look at that platform's textureCompression; otherwise look
-        /// at whether the specific format belongs to the uncompressed family. If not overridden, use Default's textureCompression.
+        /// Whether this texture is "uncompressed" when imported for the current build platform. Reads the platform
+        /// override when one is enabled, otherwise the Default platform settings — and in **both** cases resolves the
+        /// explicit Format first (Automatic → the compression quality enum; an explicit format → its family).
+        /// Reading only <c>importer.textureCompression</c> for the Default case was wrong: when the user picks an
+        /// explicit uncompressed Default format (e.g. "RGB 16 bit"/RGB16), the quality enum still reads "Compressed",
+        /// which made TEX005 false-fire ("compression silently failed") and TEX002 miss the genuinely-uncompressed texture.
         /// </summary>
         private static bool IsEffectivelyUncompressed(TextureImporter importer, string platform)
         {
             var ps = importer.GetPlatformTextureSettings(platform);
-            if (ps != null && ps.overridden)
-            {
-                return ps.format == TextureImporterFormat.Automatic
-                    ? ps.textureCompression == TextureImporterCompression.Uncompressed
-                    : IsUncompressedFormat(ps.format);
-            }
-            return importer.textureCompression == TextureImporterCompression.Uncompressed;
+            if (ps != null && ps.overridden) return SettingsAreUncompressed(ps);
+            return SettingsAreUncompressed(importer.GetDefaultPlatformTextureSettings());
+        }
+
+        /// <summary>Whether a resolved platform-settings block imports as uncompressed: Automatic → its compression-quality enum; an explicit format → the format's family.</summary>
+        internal static bool SettingsAreUncompressed(TextureImporterPlatformSettings ps)
+        {
+            if (ps == null) return false;
+            return ps.format == TextureImporterFormat.Automatic
+                ? ps.textureCompression == TextureImporterCompression.Uncompressed
+                : IsUncompressedFormat(ps.format);
         }
 
         /// <summary>
@@ -275,10 +328,20 @@ namespace PerfLint.Scanners
                         changed = true;
                     }
                 }
-                else if (importer.textureCompression != _compression.Value)
+                else
                 {
-                    importer.textureCompression = _compression.Value;
-                    changed = true;
+                    // No override → fix the Default settings. Must clear any explicit Default format too: if the user set
+                    // an explicit uncompressed format ("RGB 16 bit"/RGBA32), setting only textureCompression (the quality
+                    // enum, ignored while a format is explicit) does nothing and the fix is a silent no-op. Reset to
+                    // Automatic + the target compression so the platform actually auto-selects a compressed format.
+                    var def = importer.GetDefaultPlatformTextureSettings();
+                    if (def.textureCompression != _compression.Value || def.format != TextureImporterFormat.Automatic)
+                    {
+                        def.format = TextureImporterFormat.Automatic;
+                        def.textureCompression = _compression.Value;
+                        importer.SetPlatformTextureSettings(def);
+                        changed = true;
+                    }
                 }
             }
 

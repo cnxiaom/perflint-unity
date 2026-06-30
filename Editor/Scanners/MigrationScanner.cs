@@ -150,9 +150,14 @@ namespace PerfLint.Scanners
                 yield return f;
         }
 
-        /// <summary>The migration script rules cover all .cs files (including the Editor directory: Editor scripts can equally be broken at compile time by removed APIs).</summary>
+        /// <summary>
+        /// The migration script rules cover all .cs files (including the Editor directory: Editor scripts can equally be broken at compile time by removed APIs).
+        /// PerfLint's own shipped scripts are excluded — in the Asset Store install form they live under Assets/, so otherwise we'd diagnose ourselves
+        /// (e.g. SceneBatchingAnalyzer's deliberate FindObjectsOfType 2021.3-compat call), which is noise the user can't act on.
+        /// </summary>
         public bool Handles(string assetPath) =>
-            !string.IsNullOrEmpty(assetPath) && assetPath.EndsWith(".cs");
+            !string.IsNullOrEmpty(assetPath) && assetPath.EndsWith(".cs")
+            && !ScannerUtil.IsPerfLintOwnAsset(assetPath);
 
         /// <summary>
         /// Single-file incremental: only recompute this script's deprecated-API / legacy-input-API findings (project-level rules such as manifest and input backend are excluded).

@@ -192,5 +192,57 @@ namespace PerfLint.Scanners
             if (bytes >= 1024) return $"{bytes / 1024f:0.0} KB";
             return $"{bytes} B";
         }
+
+        // ── Self-exclusion: never diagnose PerfLint's own shipped files ──────────────────────────
+        // In the Asset Store install form the whole package lives under Assets/<PerfLint>/, so any scanner
+        // that walks Assets/ would otherwise flag PerfLint's own code — e.g. MigrationScanner reporting
+        // SceneBatchingAnalyzer's deliberate FindObjectsOfType (kept for 2021.3 compat, #pragma-suppressed).
+        // We resolve our install root once from the main asmdef's location and skip anything under it.
+        private static string _selfRoot;
+        private static bool _selfRootResolved;
+
+        /// <summary>True when <paramref name="assetPath"/> lives inside PerfLint's own install tree (UPM or Asset Store form), so scanners must skip it.</summary>
+        public static bool IsPerfLintOwnAsset(string assetPath) => IsUnderRoot(assetPath, SelfRoot());
+
+        /// <summary>
+        /// PerfLint's own install root ("Assets/&lt;PerfLint&gt;" in Asset Store form, "Packages/com.perflint.unity" in UPM form),
+        /// resolved from the main PerfLint.Editor.asmdef (which sits at &lt;root&gt;/Editor/). Cached; null when it can't be
+        /// resolved (then nothing is excluded — same behaviour as before this guard existed).
+        /// </summary>
+        private static string SelfRoot()
+        {
+            if (_selfRootResolved) return _selfRoot;
+            _selfRootResolved = true;
+            try
+            {
+                foreach (var guid in AssetDatabase.FindAssets("t:AssemblyDefinitionAsset"))
+                {
+                    string p = AssetDatabase.GUIDToAssetPath(guid)?.Replace('\\', '/');
+                    if (p != null && p.EndsWith("/PerfLint.Editor.asmdef", StringComparison.Ordinal))
+                    {
+                        string editorDir = Path.GetDirectoryName(p)?.Replace('\\', '/');   // <root>/Editor
+                        string root = Path.GetDirectoryName(editorDir)?.Replace('\\', '/'); // <root>
+                        _selfRoot = string.IsNullOrEmpty(root) ? null : root;
+                        return _selfRoot;
+                    }
+                }
+            }
+            catch { _selfRoot = null; }
+            return _selfRoot;
+        }
+
+        /// <summary>
+        /// Pure logic: is <paramref name="assetPath"/> equal to, or nested under, <paramref name="root"/>? Path-separator and
+        /// boundary aware ("Assets/PerfLint" does NOT contain "Assets/PerfLintExtras/x.cs"). Empty root → false (exclude nothing).
+        /// </summary>
+        internal static bool IsUnderRoot(string assetPath, string root)
+        {
+            if (string.IsNullOrEmpty(assetPath) || string.IsNullOrEmpty(root)) return false;
+            string p = assetPath.Replace('\\', '/');
+            string r = root.Replace('\\', '/').TrimEnd('/');
+            if (r.Length == 0) return false;
+            return p.Equals(r, StringComparison.Ordinal)
+                || p.StartsWith(r + "/", StringComparison.Ordinal);
+        }
     }
 }

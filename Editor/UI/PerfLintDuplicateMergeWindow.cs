@@ -86,9 +86,12 @@ namespace PerfLint.UI
 
         private VisualElement BuildRow(string path, int refCount)
         {
+            // Column wrapper: the selectable row on top, an expandable "which files reference this copy" list below.
+            var wrapper = new VisualElement { style = { marginBottom = 3 } };
+
             var row = new VisualElement
             {
-                style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginBottom = 3,
+                style = { flexDirection = FlexDirection.Row, alignItems = Align.Center,
                           paddingTop = 3, paddingBottom = 3, paddingLeft = 6, paddingRight = 6,
                           backgroundColor = new Color(1, 1, 1, 0.04f) }
             };
@@ -125,10 +128,85 @@ namespace PerfLint.UI
             string refText = refCount == 1
                 ? L.Tr("1 reference", "1 处引用")
                 : L.Tr($"{refCount} references", $"{refCount} 处引用");
-            row.Add(new Label(refText) { style = { opacity = 0.7f, fontSize = 11, marginLeft = 8, unityTextAlign = TextAnchor.MiddleRight } });
+            row.Add(new Label(refText)
+            {
+                tooltip = L.Tr("Counts GUID occurrences across serialized files (Assets + ProjectSettings, incl. importer .meta). Expand below to see the files.",
+                               "统计 GUID 在序列化文件中出现的次数（Assets + ProjectSettings，含导入 .meta）。展开下方可看具体文件。"),
+                style = { opacity = 0.7f, fontSize = 11, marginLeft = 8, unityTextAlign = TextAnchor.MiddleRight }
+            });
+
+            wrapper.Add(row);
+
+            // Expandable list of the actual files that reference this copy (the same set the merge would rewrite).
+            // Answers "where are my N references?" without leaving the dialog. Lazily populated on first expand.
+            if (refCount > 0)
+                wrapper.Add(BuildReferencesFoldout(path));
 
             _rows.Add((path, toggle));
-            return row;
+            return wrapper;
+        }
+
+        /// <summary>A collapsed foldout that, on first expand, lists the project files referencing this copy's GUID
+        /// (Assets paths are clickable → ping in Project; ProjectSettings paths shown as plain text). Same files the merge rewrites.</summary>
+        private VisualElement BuildReferencesFoldout(string path)
+        {
+            string guid = _index?.GuidOf(path);
+            var files = guid != null ? _index.FilesReferencing(guid) : (IReadOnlyList<string>)Array.Empty<string>();
+
+            var foldout = new Foldout
+            {
+                value = false,
+                text = files.Count == 1
+                    ? L.Tr("1 referencing file", "1 个引用文件")
+                    : L.Tr($"{files.Count} referencing files", $"{files.Count} 个引用文件")
+            };
+            foldout.style.marginLeft = 24;
+            foldout.style.fontSize = 11;
+
+            bool built = false;
+            foldout.RegisterValueChangedCallback(evt =>
+            {
+                if (!evt.newValue || built) return;
+                built = true;
+                if (files.Count == 0)
+                {
+                    foldout.Add(new Label(L.Tr("(no files — references may be in binary assets the text scan skips)", "（无文件——引用可能在文本扫描跳过的二进制资源里）"))
+                    { style = { opacity = 0.6f, fontSize = 11 } });
+                    return;
+                }
+                foreach (var physical in files)
+                {
+                    string disp = ToProjectRelative(physical);
+                    bool inAssets = disp.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase);
+                    var item = new Label("• " + disp)
+                    {
+                        style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginLeft = 2, marginTop = 1,
+                                  opacity = inAssets ? 1f : 0.6f,
+                                  color = inAssets ? new Color(0.55f, 0.78f, 1f) : (StyleColor)StyleKeyword.Null }
+                    };
+                    if (inAssets)
+                    {
+                        // A .meta reference belongs to its asset (strip the suffix so Ping can resolve it).
+                        string pingPath = disp.EndsWith(".meta", StringComparison.OrdinalIgnoreCase) ? disp.Substring(0, disp.Length - 5) : disp;
+                        item.tooltip = L.Tr("Click to locate in the Project window", "点击在 Project 窗口中定位");
+                        item.RegisterCallback<ClickEvent>(_ => ScannerUtil.PingAsset(pingPath));
+                    }
+                    foldout.Add(item);
+                }
+            });
+            return foldout;
+        }
+
+        /// <summary>Absolute physical path → project-relative ("Assets/…" or "ProjectSettings/…") for display/Ping. Prefers the deepest match.</summary>
+        private static string ToProjectRelative(string physical)
+        {
+            if (string.IsNullOrEmpty(physical)) return physical;
+            string n = physical.Replace('\\', '/');
+            int i = n.LastIndexOf("/Assets/", StringComparison.OrdinalIgnoreCase);
+            if (i >= 0) return n.Substring(i + 1);
+            i = n.LastIndexOf("/ProjectSettings/", StringComparison.OrdinalIgnoreCase);
+            if (i >= 0) return n.Substring(i + 1);
+            return n;
         }
 
         private void Select(string path)
