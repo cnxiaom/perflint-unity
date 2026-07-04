@@ -11,9 +11,10 @@ namespace PerfLint.Scanners
     /// <summary>
     /// P0 material diagnostics. Deliberately avoids reporting "GPU Instancing missing" —
     /// that would be bad advice under an SRP (enabling Instancing actually kicks the material
-    /// out of the SRP Batcher). Instead, two genuinely low-false-positive, high-value rules:
+    /// out of the SRP Batcher). Instead, genuinely low-false-positive, high-value rules:
     ///   MAT001 — Pipeline/Shader mismatch (URP/HDRP using a Built-in shader or vice versa → pink, not batched).
     ///   MAT002 — Material has GPU Instancing enabled under an SRP (exits the SRP Batcher; slower in most scenes). Info, handle with care.
+    ///   MAT003 — Material's shader reference is missing/None (deleted asset, uninstalled package) → renders magenta.
     /// </summary>
     public sealed class MaterialScanner : IScanner
     {
@@ -39,10 +40,37 @@ namespace PerfLint.Scanners
 
                 string path = AssetDatabase.GUIDToAssetPath(guids[i]);
                 var mat = AssetDatabase.LoadAssetAtPath<Material>(path);
-                if (mat == null || mat.shader == null) continue;
+                if (mat == null) continue;
+
+                string file = Path.GetFileName(path);
+
+                // MAT003 — shader reference missing/None → magenta. Depending on the Unity version a dangling
+                // reference reads back as null OR as the built-in error-shader placeholder; treat both as missing.
+                // Distinct from MAT001 (shader exists, wrong pipeline family) and from a shader that exists but fails
+                // to compile (mat.shader stays non-null there — that is a shader-level problem, not this material's).
+                if (mat.shader == null || mat.shader.name == "Hidden/InternalErrorShader")
+                {
+                    string cap = path;
+                    yield return new Finding(
+                        ruleId: "MAT003",
+                        domain: Domain.Performance,
+                        severity: Severity.Warning,
+                        title: L.Tr($"Material has a missing shader: '{file}'", $"材质缺少着色器：'{file}'"),
+                        groupTitle: L.Tr("Materials with a missing shader (render magenta)", "材质缺少着色器（渲染为洋红）"),
+                        detail: L.Tr(
+                            $"'{file}' has no shader assigned — its shader reference is None or points to an asset that no longer exists " +
+                            "(deleted, or its source package/asset isn't installed in this project). Everything using this material renders magenta. " +
+                            "Reassign a shader in the material's Inspector; if the original shader came from a package or store asset, install/restore " +
+                            "that source first. No automatic fix on purpose — which shader belongs here is a project decision.",
+                            $"'{file}' 未指定着色器——其引用为 None 或指向已不存在的资产（被删除，或其来源包/资产未安装到本工程）。" +
+                            "使用该材质的所有物体都会渲染为洋红。在材质的 Inspector 里重新指定着色器；若原着色器来自某个包或商店资产，" +
+                            "先恢复其来源。刻意不提供自动修复——该用哪个着色器是项目决策。"),
+                        targetPath: path,
+                        ping: () => ScannerUtil.PingAsset(cap));
+                    continue;
+                }
 
                 string sh = mat.shader.name;
-                string file = Path.GetFileName(path);
 
                 // MAT001 — Pipeline/Shader mismatch
                 if (isSrp && IsBuiltinLitShader(sh))

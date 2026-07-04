@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Profiling;
 using UnityEngine.Rendering;
 
 namespace PerfLint.Runtime
@@ -32,6 +33,32 @@ namespace PerfLint.Runtime
             }
         }
 
+        /// <summary>A loaded graphics asset and its runtime memory (VRAM) size — used by RUN.MEM004 to name the biggest textures / render targets / meshes in memory.</summary>
+        public readonly struct AssetMemStat
+        {
+            public readonly string Name;
+            public readonly string Kind;   // "Texture" / "RenderTexture" / "Mesh"
+            public readonly long Bytes;    // Profiler.GetRuntimeMemorySizeLong
+            public readonly Object Asset;  // for Locate (project asset → pings import settings; runtime object → selects it); null-filtered at ping time
+            public AssetMemStat(string name, string kind, long bytes, Object asset)
+            {
+                Name = name; Kind = kind; Bytes = bytes; Asset = asset;
+            }
+        }
+
+        /// <summary>A group of identical runtime RenderTextures alive at once (same W×H + format, not project assets) — a strong "created repeatedly without Release()" leak signal. Used by RUN.MEM005.</summary>
+        public sealed class RtLeakGroup
+        {
+            public readonly int Width, Height, Count;
+            public readonly string Format;
+            public readonly long TotalBytes;
+            public readonly IReadOnlyList<Object> Examples; // for Locate (select the leaked RTs); null-filtered at ping time
+            public RtLeakGroup(int width, int height, string format, int count, long totalBytes, IReadOnlyList<Object> examples)
+            {
+                Width = width; Height = height; Format = format; Count = count; TotalBytes = totalBytes; Examples = examples ?? new List<Object>();
+            }
+        }
+
         public bool HasData { get; }
         public bool IsSrp { get; }
 
@@ -56,12 +83,21 @@ namespace PerfLint.Runtime
         /// <summary>GameObjects using the single heaviest mesh (for Locate, up to 12). Valid only within Play Mode; stale references filtered at Ping time.</summary>
         public IReadOnlyList<GameObject> TopMeshExamples { get; }
 
+        /// <summary>Largest loaded graphics assets by runtime memory (textures / render targets / meshes), descending. For RUN.MEM004 VRAM localization.</summary>
+        public IReadOnlyList<AssetMemStat> TopMemoryAssets { get; }
+
+        /// <summary>The biggest group of identical runtime RenderTextures alive at once (leak-suspect), or null. For RUN.MEM005.</summary>
+        public RtLeakGroup SuspectRtLeak { get; }
+
         private SceneBatchingSnapshot(
             bool hasData, bool isSrp, int rendererCount, int uniqueMaterialCount,
             int instancedRendererCount, IReadOnlyList<GameObject> instancedExamples,
             IReadOnlyList<MeshTriangleStat> topTriangleMeshes, long totalSceneTriangles,
-            IReadOnlyList<GameObject> topMeshExamples)
+            IReadOnlyList<GameObject> topMeshExamples,
+            IReadOnlyList<AssetMemStat> topMemoryAssets,
+            RtLeakGroup suspectRtLeak)
         {
+            SuspectRtLeak = suspectRtLeak;
             HasData = hasData;
             IsSrp = isSrp;
             RendererCount = rendererCount;
@@ -71,16 +107,18 @@ namespace PerfLint.Runtime
             TopTriangleMeshes = topTriangleMeshes ?? new List<MeshTriangleStat>();
             TotalSceneTriangles = totalSceneTriangles;
             TopMeshExamples = topMeshExamples ?? new List<GameObject>();
+            TopMemoryAssets = topMemoryAssets ?? new List<AssetMemStat>();
         }
 
         public static readonly SceneBatchingSnapshot Empty =
-            new SceneBatchingSnapshot(false, false, 0, 0, 0, null, null, 0, null);
+            new SceneBatchingSnapshot(false, false, 0, 0, 0, null, null, 0, null, null, null);
 
         /// <summary>Test-only factory: the real constructor is private and <see cref="Capture"/> needs Play Mode, so this lets unit tests
         /// feed explicit topology (pipeline / renderer + material counts / instancing / top meshes) into RuntimeAnalyzer's logic headlessly.</summary>
         internal static SceneBatchingSnapshot ForTests(bool isSrp, int rendererCount, int uniqueMaterialCount, int instancedRendererCount,
-            IReadOnlyList<MeshTriangleStat> topTriangleMeshes = null, long totalSceneTriangles = 0) =>
-            new SceneBatchingSnapshot(true, isSrp, rendererCount, uniqueMaterialCount, instancedRendererCount, null, topTriangleMeshes, totalSceneTriangles, null);
+            IReadOnlyList<MeshTriangleStat> topTriangleMeshes = null, long totalSceneTriangles = 0,
+            IReadOnlyList<AssetMemStat> topMemoryAssets = null, RtLeakGroup suspectRtLeak = null) =>
+            new SceneBatchingSnapshot(true, isSrp, rendererCount, uniqueMaterialCount, instancedRendererCount, null, topTriangleMeshes, totalSceneTriangles, null, topMemoryAssets, suspectRtLeak);
 
         /// <summary>True when there's at least one GameObject to Locate for the heaviest mesh.</summary>
         public bool HasTopMeshExamples => TopMeshExamples != null && TopMeshExamples.Count > 0;
@@ -184,7 +222,79 @@ namespace PerfLint.Runtime
                 instancedExamples: instancedExamples,
                 topTriangleMeshes: topMeshes,
                 totalSceneTriangles: totalSceneTris,
-                topMeshExamples: topMeshExamples);
+                topMeshExamples: topMeshExamples,
+                topMemoryAssets: CaptureTopMemoryAssets(),
+                suspectRtLeak: CaptureRtLeak());
+        }
+
+        /// <summary>
+        /// Detect a likely RenderTexture leak: the biggest group of IDENTICAL runtime RenderTextures (same W×H + format, NOT project assets) alive at once.
+        /// Engine/editor RTs (camera attachments, Game/Scene view) are unique or few, so the "≥8 identical, ≥8 MB total" threshold naturally excludes them.
+        /// Signature: repeated new RenderTexture(...) without Release(). Returns null if no group crosses the threshold.
+        /// </summary>
+        private static SceneBatchingSnapshot.RtLeakGroup CaptureRtLeak()
+        {
+            try
+            {
+                var groups = new Dictionary<(int w, int h, int fmt), RtGroupAcc>();
+                foreach (var rt in Resources.FindObjectsOfTypeAll<RenderTexture>())
+                {
+                    if (rt == null) continue;
+                    if (!string.IsNullOrEmpty(AssetDatabase.GetAssetPath(rt))) continue; // imported RT asset — not a runtime leak
+                    if (IsEditorInternalGfxName(rt.name)) continue; // editor window / view / gizmo render targets — not a game leak
+                    var key = (rt.width, rt.height, (int)rt.format);
+                    if (!groups.TryGetValue(key, out var g))
+                    {
+                        g = new RtGroupAcc { Width = rt.width, Height = rt.height, Format = rt.format.ToString(), Examples = new List<Object>() };
+                        groups[key] = g;
+                    }
+                    g.Count++;
+                    g.TotalBytes += Profiler.GetRuntimeMemorySizeLong(rt);
+                    if (g.Examples.Count < 12) g.Examples.Add(rt);
+                }
+
+                RtGroupAcc best = null;
+                foreach (var g in groups.Values)
+                    if (g.Count >= 8 && g.TotalBytes >= 8L * 1024 * 1024 && (best == null || g.TotalBytes > best.TotalBytes))
+                        best = g;
+                return best == null ? null
+                    : new SceneBatchingSnapshot.RtLeakGroup(best.Width, best.Height, best.Format, best.Count, best.TotalBytes, best.Examples);
+            }
+            catch { return null; }
+        }
+
+        private sealed class RtGroupAcc { public int Width, Height, Count; public string Format; public long TotalBytes; public List<Object> Examples; }
+
+        /// <summary>
+        /// Largest loaded graphics assets by runtime memory (textures incl. RenderTextures, and meshes) — for RUN.MEM004 VRAM localization.
+        /// FindObjectsOfTypeAll includes editor/hidden objects, but sorting by GetRuntimeMemorySizeLong surfaces the real big consumers (editor UI textures are tiny).
+        /// O(loaded assets), a few ms; called once from Capture(). Any failure degrades to an empty list.
+        /// </summary>
+        private static List<AssetMemStat> CaptureTopMemoryAssets()
+        {
+            var list = new List<AssetMemStat>();
+            try
+            {
+                foreach (var t in Resources.FindObjectsOfTypeAll<Texture>())
+                {
+                    if (t == null) continue;
+                    if (IsEditorInternalGfxName(t.name)) continue; // editor window / view / gizmo render targets — editor-only, not the game's assets
+                    long bytes = Profiler.GetRuntimeMemorySizeLong(t);
+                    if (bytes <= 0) continue;
+                    list.Add(new AssetMemStat(string.IsNullOrEmpty(t.name) ? "(unnamed)" : t.name, t is RenderTexture ? "RenderTexture" : "Texture", bytes, t));
+                }
+                foreach (var m in Resources.FindObjectsOfTypeAll<Mesh>())
+                {
+                    if (m == null) continue;
+                    long bytes = Profiler.GetRuntimeMemorySizeLong(m);
+                    if (bytes <= 0) continue;
+                    list.Add(new AssetMemStat(string.IsNullOrEmpty(m.name) ? "(unnamed)" : m.name, "Mesh", bytes, m));
+                }
+                list.Sort((a, b) => b.Bytes.CompareTo(a.Bytes));
+                if (list.Count > 6) list.RemoveRange(6, list.Count - 6); // keep top 6 — matches the count RUN.MEM004 lists, so Locate selects exactly the shown assets
+            }
+            catch { list.Clear(); }
+            return list;
         }
 
         private sealed class MeshAcc
@@ -193,6 +303,18 @@ namespace PerfLint.Runtime
             public long PerInstanceTris;
             public int Count;
             public List<GameObject> Examples;
+        }
+
+        /// <summary>Whether a graphics object's name marks it as an editor-only render target/texture (Game/Scene view, editor windows, gizmos, handles) — these consume VRAM in the editor but are never shipped, so they shouldn't be attributed to the game.</summary>
+        private static bool IsEditorInternalGfxName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            return name.IndexOf("GUIView", System.StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("GameView", System.StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("SceneView", System.StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("Scene RenderTexture", System.StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("Gizmo", System.StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("Handles", System.StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         /// <summary>The shared mesh a renderer draws (MeshFilter for MeshRenderer, sharedMesh for SkinnedMeshRenderer). Null if none.</summary>
@@ -232,6 +354,45 @@ namespace PerfLint.Runtime
             var alive = new List<Object>();
             foreach (var go in TopMeshExamples)
                 if (go != null) alive.Add(go);
+            if (alive.Count > 0) Selection.objects = alive.ToArray();
+        }
+
+        /// <summary>True when there's at least one biggest-memory asset with a live object to Locate.</summary>
+        public bool HasTopMemoryAssets
+        {
+            get
+            {
+                foreach (var a in TopMemoryAssets) if (a.Asset != null) return true;
+                return false;
+            }
+        }
+
+        /// <summary>Selects the biggest-memory graphics assets (filtering out destroyed ones). Project assets ping their import settings; runtime objects are selected. Intended for RUN.MEM004's Locate.</summary>
+        public void SelectTopMemoryAssets()
+        {
+            var alive = new List<Object>();
+            foreach (var a in TopMemoryAssets)
+                if (a.Asset != null) alive.Add(a.Asset);
+            if (alive.Count > 0) Selection.objects = alive.ToArray();
+        }
+
+        /// <summary>True when the suspected RT-leak group has at least one live RenderTexture to Locate.</summary>
+        public bool HasRtLeakExamples
+        {
+            get
+            {
+                if (SuspectRtLeak == null) return false;
+                foreach (var o in SuspectRtLeak.Examples) if (o != null) return true;
+                return false;
+            }
+        }
+
+        /// <summary>Selects the leaked RenderTextures (filtering out destroyed ones). Intended for RUN.MEM005's Locate.</summary>
+        public void SelectRtLeakExamples()
+        {
+            if (SuspectRtLeak == null) return;
+            var alive = new List<Object>();
+            foreach (var o in SuspectRtLeak.Examples) if (o != null) alive.Add(o);
             if (alive.Count > 0) Selection.objects = alive.ToArray();
         }
     }

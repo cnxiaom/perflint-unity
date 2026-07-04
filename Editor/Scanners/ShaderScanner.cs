@@ -16,15 +16,27 @@ namespace PerfLint.Scanners
     /// build size double-win). This slice is the deterministic, low-risk "A layer":
     ///   SHDR001 — Shaders that compile a very large number of variants (diagnosis; the per-shader build-cost number).
     ///   SHDR002 — Built-in pipeline: Instancing shader-variant stripping set to "Keep All" (one-click → Strip Unused).
+    ///   SHDR004 — Shader source fails to compile (Migration domain: the "everything went magenta after upgrading" case).
     ///
     /// Out of scope here (later slices): URP/HDRP Global-Settings strip toggles; the evidence-based "record actually-used
     /// variants → strip the rest at build time" workflow (the Pro killer). Variant counting goes through the internal
     /// ShaderUtil API (see <see cref="ShaderVariantUtil"/>); when it's unavailable the count rule simply produces nothing.
     /// </summary>
-    public sealed class ShaderScanner : IScanner
+    public sealed class ShaderScanner : IScanner, IFileScanner
     {
         public string Name => "Shaders";
         public Domain Domain => Domain.Performance;
+
+        /// <summary>Single-file incremental (IFileScanner): only SHDR004 is per-file; the settings/variant rules are project-level. Lets the UI clear a fixed shader's finding right after AI Migrate instead of waiting for a full scan.</summary>
+        public bool Handles(string assetPath) =>
+            !string.IsNullOrEmpty(assetPath) && assetPath.EndsWith(".shader", System.StringComparison.OrdinalIgnoreCase)
+            && !ScannerUtil.IsPerfLintOwnAsset(assetPath);
+
+        public IEnumerable<Finding> ScanFile(string assetPath, ScanContext context)
+        {
+            if (!Handles(assetPath)) yield break;
+            foreach (var f in ShaderErrorFindingsAt(assetPath)) yield return f;
+        }
 
         // Flag shaders whose total variant count is at or above this — the build compiles and ships every one of them.
         // Conservative so we only surface genuinely heavy shaders (a trivial custom shader is in the hundreds; ShaderGraph /
@@ -34,9 +46,98 @@ namespace PerfLint.Scanners
 
         public IEnumerable<Finding> Scan(ScanContext context)
         {
+            foreach (var f in ScanShaderErrors(context)) yield return f;
             foreach (var f in ScanStrippingSettings()) yield return f;
             foreach (var f in ScanUrpStripUnusedVariants()) yield return f;
             foreach (var f in ScanVariantCounts(context)) yield return f;
+        }
+
+        // ── SHDR004 — Shader source fails to compile (Migration domain) ──────────────────────────────────
+        // The most visible symptom of an upgrade gone wrong: shaders written for an older Unity / pipeline version stop
+        // compiling and every material using them renders magenta. This complements MAT001, which covers the OTHER
+        // magenta cause (right pipeline, wrong shader family) — here the shader itself is broken. Detection reads
+        // Unity's own recorded compile state (ShaderUtil.ShaderHasError): ShaderLab parse errors are recorded at import;
+        // HLSL body errors are recorded when Unity first compiles the shader (Inspector, scene use, build). A broken
+        // shader nobody has ever touched can therefore go unreported until then — acceptable, because in the real
+        // "everything went magenta after upgrading" scenario the errors are already cached by the time the user scans.
+        // Assets/ only: a broken shader under Packages/ can't be fixed in place (the fix is a package up/downgrade), and
+        // pipeline packages legitimately contain target-gated shaders. Report-only on purpose: shader repair is
+        // structural (include paths, macros and syntax all shift between pipeline versions), so no AI Fix — Locate plus
+        // the quoted compiler error feed Explain instead.
+        private static IEnumerable<Finding> ScanShaderErrors(ScanContext context)
+        {
+            var guids = AssetDatabase.FindAssets("t:Shader", new[] { "Assets" });
+            for (int i = 0; i < guids.Length; i++)
+            {
+                context.CancellationToken.ThrowIfCancellationRequested();
+                string path = AssetDatabase.GUIDToAssetPath(guids[i]);
+                if (string.IsNullOrEmpty(path) || ScannerUtil.IsPerfLintOwnAsset(path)) continue;
+                foreach (var f in ShaderErrorFindingsAt(path))
+                    yield return f;
+            }
+        }
+
+        /// <summary>SHDR004 for a single shader asset — shared by the full scan and the single-file rescan so both paths produce identical findings.</summary>
+        private static IEnumerable<Finding> ShaderErrorFindingsAt(string path)
+        {
+                var sh = AssetDatabase.LoadAssetAtPath<Shader>(path);
+                if (sh == null) yield break;
+
+                bool hasError;
+                try { hasError = ShaderUtil.ShaderHasError(sh); }
+                catch { yield break; }
+                if (!hasError) yield break;
+
+                var (errorCount, firstMessage, firstLine) = FirstShaderError(sh);
+                string file = Path.GetFileName(path);
+                string cap = path;
+
+                string countEn = errorCount > 0 ? $"{errorCount} compile error(s)" : "compile errors";
+                string countCn = errorCount > 0 ? $"{errorCount} 个编译错误" : "编译错误";
+                string quotedEn = firstMessage == null ? "" :
+                    $" First error: \"{firstMessage}\"" + (firstLine > 0 ? $" (line {firstLine})." : ".");
+                string quotedCn = firstMessage == null ? "" :
+                    $"首个错误：「{firstMessage}」" + (firstLine > 0 ? $"（第 {firstLine} 行）。" : "。");
+
+                yield return new Finding(
+                    ruleId: "SHDR004",
+                    domain: Domain.Migration,
+                    severity: Severity.Critical, // an engine-recorded shader compile ERROR: everything using it renders magenta
+                    title: L.Tr($"Shader fails to compile: '{file}'", $"着色器编译失败：'{file}'"),
+                    groupTitle: L.Tr("Shaders fail to compile (materials render magenta)", "着色器编译失败（材质渲染为洋红）"),
+                    detail: L.Tr(
+                        $"'{sh.name}' has {countEn} — every material using it renders magenta (or not at all).{quotedEn} " +
+                        "Shaders written for an older Unity or render-pipeline version commonly break after an upgrade: include paths, " +
+                        "macros and syntax shift between versions. Click Locate and check the shader's Inspector for the full error list; " +
+                        "fix the source, or get an updated version from the asset's publisher. If the asset is no longer maintained, " +
+                        "consider switching the affected materials to a shader that ships with your current pipeline.",
+                        $"'{sh.name}' 有{countCn}——所有使用它的材质都会渲染为洋红（或干脆不渲染）。{quotedCn}" +
+                        "为旧版 Unity / 渲染管线编写的着色器在升级后很容易失效：include 路径、宏与语法随版本变化。" +
+                        "点 Locate 后在该着色器的 Inspector 查看完整错误列表；修复源码，或向资产发布者获取更新版本。" +
+                        "若该资产已停止维护，考虑把受影响的材质换成当前管线自带的着色器。"),
+                    targetPath: path,
+                    ping: () => ScannerUtil.PingAsset(cap));
+        }
+
+        /// <summary>
+        /// First compiler ERROR (message, line) plus the total error count from Unity's import-time compile result.
+        /// Returns (0, null, 0) when messages can't be read — the finding still reports, just without a quoted message.
+        /// </summary>
+        private static (int errorCount, string message, int line) FirstShaderError(Shader sh)
+        {
+            try
+            {
+                var msgs = ShaderUtil.GetShaderMessages(sh);
+                int count = 0; string first = null; int line = 0;
+                foreach (var m in msgs)
+                {
+                    if (m.severity != UnityEditor.Rendering.ShaderCompilerMessageSeverity.Error) continue;
+                    count++;
+                    if (first == null) { first = m.message; line = m.line; }
+                }
+                return (count, first, line);
+            }
+            catch { return (0, null, 0); }
         }
 
         // ── SHDR003 — URP: "Strip Unused Variants" disabled (advisory only) ──────────────────────────────

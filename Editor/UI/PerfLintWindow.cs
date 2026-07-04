@@ -99,11 +99,36 @@ namespace PerfLint.UI
             return win;
         }
 
-        private void OnEnable() => LicenseService.Changed += RefreshLicenseButton;
+        private void OnEnable()
+        {
+            LicenseService.Changed += RefreshLicenseButton;
+            PerfLintScriptFixVerifier.FixRolledBack += OnAiChangeRolledBack;
+        }
+
         private void OnDisable()
         {
             LicenseService.Changed -= RefreshLicenseButton;
+            PerfLintScriptFixVerifier.FixRolledBack -= OnAiChangeRolledBack;
             StopEnablingPoll(); // don't leak the EditorApplication.update subscription if the window is closed mid-enable
+        }
+
+        /// <summary>
+        /// An AI change (fix or whole-file migration) failed compile verification and its file was rolled back.
+        /// The rollback happens WITHOUT a domain reload (compilation failed), so this open window must un-show the
+        /// "already fixed/migrated" state itself — in a compile-broken project no successful reload will ever come
+        /// to reconcile it via RescanFlag (real case: Viking Village AI Migrate rollback left the finding hidden
+        /// while the error was back on disk).
+        /// </summary>
+        private void OnAiChangeRolledBack(string assetPath, string errorSummary)
+        {
+            ShowNotification(new GUIContent(L.Tr("AI change rolled back (compile failed — see Console)", "AI 修改编译未通过，已回滚（详见 Console）")));
+            if (_lastResult == null || string.IsNullOrEmpty(assetPath) || _results == null) return;
+            Vector2 scroll = _results.scrollOffset;
+            _lastResult = ScanRunner.RescanFile(assetPath, _lastResult);
+            ScanResultStore.Save(_lastResult);
+            RenderHeader(_lastResult);
+            RenderResults();
+            RestoreScrollAfterLayout(scroll);
         }
 
         private void RefreshLicenseButton()
@@ -1026,6 +1051,45 @@ namespace PerfLint.UI
                 text.Add(new Label(finding.TargetPath) { style = { opacity = 0.5f, fontSize = 10, whiteSpace = WhiteSpace.Normal } });
             row.Add(text);
 
+            // Outer column wrapper, created on demand: hosts the expandable Detail and/or the AI-fix panel below the row.
+            VisualElement col = null;
+            VisualElement Col()
+            {
+                if (col == null) { col = new VisualElement(); col.Add(row); }
+                return col;
+            }
+
+            // Expandable Detail. The main panel previously never rendered Finding.Detail AT ALL (it only reached
+            // CSV/HTML export and Explain context) — fine for rules whose title carries the substance, but findings
+            // like AAGRAN001 keep all their content (counts, guidance) in Detail and looked empty. Click the row text
+            // or the caret to toggle. Project-level findings (no target path — usually a single row whose substance
+            // IS the detail) start EXPANDED: a collapsed caret proved too easy to miss in smoke testing.
+            if (!string.IsNullOrEmpty(finding.Detail))
+            {
+                bool startOpen = string.IsNullOrEmpty(finding.TargetPath);
+                var caret = new Label(startOpen ? "▾" : "▸") { style = { marginRight = 3, opacity = 0.55f, flexShrink = 0 } };
+                row.Insert(0, caret);
+                var detailLabel = new Label(finding.Detail)
+                {
+                    style =
+                    {
+                        display = startOpen ? DisplayStyle.Flex : DisplayStyle.None, whiteSpace = WhiteSpace.Normal,
+                        opacity = 0.8f, fontSize = 11,
+                        marginLeft = 36, marginTop = 2, marginBottom = 4, paddingLeft = 8,
+                        borderLeftWidth = 2, borderLeftColor = new Color(1f, 1f, 1f, 0.15f)
+                    }
+                };
+                Col().Add(detailLabel);
+                void ToggleDetail()
+                {
+                    bool show = detailLabel.style.display == DisplayStyle.None;
+                    detailLabel.style.display = show ? DisplayStyle.Flex : DisplayStyle.None;
+                    caret.text = show ? "▾" : "▸";
+                }
+                caret.RegisterCallback<ClickEvent>(_ => ToggleDetail());
+                text.RegisterCallback<ClickEvent>(_ => ToggleDetail());
+            }
+
             // When multiple assets are involved (e.g. a duplicate group), offer "select all" — a single Locate isn't enough.
             if (finding.HasGroup)
             {
@@ -1059,24 +1123,36 @@ namespace PerfLint.UI
             // Script-level AI fix: only for findings that "point at code with no deterministic fix" (one by one, each at a different location).
             if (finding.AiFixable && LlmSettings.IsConfigured)
             {
-                var col = new VisualElement { style = { marginLeft = 18 } };
-                row.style.marginLeft = 0;
-
                 VisualElement panel = null;
                 var aifix = new Button { text = "AI Fix" };
                 aifix.style.marginLeft = 4;
                 aifix.clicked += () =>
                 {
-                    if (panel == null) { panel = BuildAiFixPanel(finding); col.Add(panel); }
+                    if (panel == null) { panel = BuildAiFixPanel(finding); panel.style.marginLeft = 18; Col().Add(panel); }
                     else panel.style.display = panel.style.display == DisplayStyle.None ? DisplayStyle.Flex : DisplayStyle.None;
                 };
                 row.Add(aifix);
-
-                col.Add(row);
-                return col;
             }
 
-            return row;
+            // Whole-file AI migration: structural findings a fragment-level AI Fix can't handle (recipe-bound, Pro).
+            // These findings deliberately carry no CodeFile (that would light up AI Fix); the target comes from the
+            // recipe's resolver (default: the .cs in TargetPath; shader recipes: the file the compiler error points at).
+            var migrateRecipe = MigrateRecipes.ForRule(finding.RuleId);
+            var migrateTarget = migrateRecipe != null ? MigrateRecipes.Resolve(migrateRecipe, finding.TargetPath) : null;
+            if (migrateTarget != null && LlmSettings.IsConfigured)
+            {
+                VisualElement mpanel = null;
+                var migrate = new Button { text = "AI Migrate" };
+                migrate.style.marginLeft = 4;
+                migrate.clicked += () =>
+                {
+                    if (mpanel == null) { mpanel = BuildAiMigratePanel(migrateRecipe, migrateTarget); mpanel.style.marginLeft = 18; Col().Add(mpanel); }
+                    else mpanel.style.display = mpanel.style.display == DisplayStyle.None ? DisplayStyle.Flex : DisplayStyle.None;
+                };
+                row.Add(migrate);
+            }
+
+            return col ?? (VisualElement)row;
         }
 
         /// <summary>Script-level AI fix panel: clearly state how much code will be sent → generate → review diff → apply (undo relies on version control).</summary>
@@ -1084,6 +1160,8 @@ namespace PerfLint.UI
         {
             string provider = LlmSettings.ProviderDisplayName;
             int n = ScriptFixService.WindowLineCount(finding);
+            // Deterministic rename rules never call the LLM — the privacy line must say so, not claim a send.
+            bool deterministic = ScriptFixService.IsDeterministic(finding.RuleId);
 
             var box = new VisualElement
             {
@@ -1096,7 +1174,10 @@ namespace PerfLint.UI
                 }
             };
 
-            var status = new Label(L.Tr(
+            var status = new Label(deterministic
+                ? L.Tr("This fix is a deterministic rename — computed locally, nothing is sent anywhere.",
+                       "此修复为确定性改名——本地计算，不向任何地方发送任何内容。")
+                : L.Tr(
                 $"AI Fix will send ~{n} lines around the flagged code to {provider} (only this snippet, not the whole file/project).",
                 $"AI 修复会把被标记代码附近约 {n} 行发送给 {provider}（仅这一段，不发整文件/项目）。"))
             {
@@ -1106,11 +1187,13 @@ namespace PerfLint.UI
 
             var diffArea = new VisualElement();
 
-            var gen = new Button { text = L.Tr($"Generate fix (send ~{n} lines to {provider})", $"生成修复（发送约 {n} 行给 {provider}）") };
+            var gen = new Button { text = deterministic
+                ? L.Tr("Generate fix (deterministic, nothing sent)", "生成修复（确定性改名，不发送）")
+                : L.Tr($"Generate fix (send ~{n} lines to {provider})", $"生成修复（发送约 {n} 行给 {provider}）") };
             gen.style.marginTop = 4;
             gen.clicked += () =>
             {
-                if (!Entitlements.RequireAiCredit(L.Tr("AI Fix", "AI 修复"))) return;
+                if (!deterministic && !Entitlements.RequireAiCredit(L.Tr("AI Fix", "AI 修复"))) return;
                 gen.SetEnabled(false);
                 status.text = L.Tr("Generating…", "生成中…");
                 diffArea.Clear();
@@ -1133,6 +1216,192 @@ namespace PerfLint.UI
             box.Add(gen);
             box.Add(diffArea);
             return box;
+        }
+
+        /// <summary>
+        /// Whole-file AI migration panel (AI Migrate). Two things distinguish it from the AI Fix panel and both are
+        /// deliberate: ① the privacy disclosure says the ENTIRE file is sent (AI Fix promises snippet-only — this is
+        /// the explicit, per-click exception the user consents to); ② the gate is RequirePro (Migration Assistant is
+        /// a Pro entitlement) on top of the usual AI credit.
+        /// </summary>
+        private VisualElement BuildAiMigratePanel(MigrateRecipe recipe, MigrateTarget target)
+        {
+            string provider = LlmSettings.ProviderDisplayName;
+            string filePath = target.FilePath;
+            int n = MigrateService.FileLineCount(filePath);
+
+            var box = new VisualElement
+            {
+                style =
+                {
+                    marginTop = 4, marginBottom = 6,
+                    paddingTop = 6, paddingBottom = 6, paddingLeft = 8, paddingRight = 8,
+                    backgroundColor = new Color(1, 1, 1, 0.04f),
+                    borderLeftWidth = 2, borderLeftColor = new Color(0.55f, 0.65f, 0.95f)
+                }
+            };
+
+            box.Add(new Label(recipe.Summary()) { style = { whiteSpace = WhiteSpace.Normal } });
+
+            // Routing hint: this file matches a deeper per-API recipe elsewhere in the list — steer the user there.
+            if (!string.IsNullOrEmpty(target.UserNotice))
+            {
+                box.Add(new Label("⚠ " + target.UserNotice)
+                { style = { whiteSpace = WhiteSpace.Normal, marginTop = 2, color = new Color(0.95f, 0.80f, 0.35f) } });
+            }
+
+            // Shader recipes may target an INCLUDED file rather than the finding's asset — say which file, explicitly.
+            if (!string.IsNullOrEmpty(target.VerifyAssetPath) &&
+                !string.Equals(target.VerifyAssetPath, filePath, StringComparison.OrdinalIgnoreCase))
+            {
+                box.Add(new Label(L.Tr(
+                    $"Target file: {filePath} (where the compiler error lives — not the .shader itself).",
+                    $"目标文件：{filePath}（编译错误所在的文件——不是 .shader 主文件本身）。"))
+                { style = { whiteSpace = WhiteSpace.Normal, marginTop = 2, color = new Color(0.75f, 0.75f, 0.75f) } });
+            }
+
+            var status = new Label(L.Tr(
+                $"AI Migrate sends the ENTIRE file ({n} lines) to {provider} — unlike AI Fix, which sends only a snippet. " +
+                "The file is rewritten as a whole; a compile failure auto-rolls back. Commit to version control first.",
+                $"AI 迁移会把整个文件（{n} 行）发送给 {provider}——与 AI 修复只发片段不同。" +
+                "文件将被整体重写；编译失败会自动回滚。建议先提交版本控制。"))
+            {
+                style = { whiteSpace = WhiteSpace.Normal, marginTop = 4 }
+            };
+            box.Add(status);
+
+            // Credits transparency: on the hosted proxy, each request costs 1 credit — INCLUDING every automatic
+            // compile-error retry (up to 2 per Apply). A whole-file migration can therefore spend more than one.
+            // BYO-key users pay their own tokens and are never counted, so this note only applies to hosted mode.
+            if (LlmSettings.Mode == LlmMode.Hosted)
+            {
+                box.Add(new Label(L.Tr(
+                    "Credits: 1 per AI request — and each automatic retry after a failed compile counts too (up to 2 per Apply), so a migration may use a few.",
+                    "Credits：每次 AI 请求计 1 个——编译失败后的每次自动重试同样计入（每次应用最多 2 轮），因此一次迁移可能消耗数个。"))
+                { style = { whiteSpace = WhiteSpace.Normal, marginTop = 2, color = new Color(0.70f, 0.70f, 0.70f) } });
+            }
+
+            var diffArea = new VisualElement();
+
+            if (n > recipe.MaxLines)
+            {
+                status.text = L.Tr(
+                    $"This file has {n} lines — above the current whole-file migration cap ({recipe.MaxLines}). Migrate it manually (see Explain for the playbook).",
+                    $"该文件有 {n} 行，超过当前整文件迁移上限（{recipe.MaxLines} 行）。请手动迁移（迁移路径见 Explain）。");
+                return box;
+            }
+
+            var gen = new Button { text = L.Tr($"Generate migration (send whole file, {n} lines, to {provider})", $"生成迁移（发送整个文件 {n} 行给 {provider}）") };
+            gen.style.marginTop = 4;
+            gen.clicked += () =>
+            {
+                if (!Entitlements.RequirePro(L.Tr("Migration Assistant", "迁移助手"))) return;
+                if (!Entitlements.RequireAiCredit(L.Tr("AI Migrate", "AI 迁移"))) return;
+                gen.SetEnabled(false);
+                status.text = L.Tr("Generating (whole-file rewrites take longer than snippet fixes)…", "生成中（整文件重写比片段修复耗时更久）…");
+                diffArea.Clear();
+                MigrateService.Propose(recipe, target, p =>
+                {
+                    gen.SetEnabled(true);
+                    if (!p.Ok) { status.text = L.Tr("Failed: ", "失败：") + p.Error; return; }
+                    if (p.NoChange)
+                    {
+                        status.text = L.Tr("AI judged this file needs no migration — possibly already migrated.", "AI 判断此文件无需迁移——可能已完成迁移。");
+                        return;
+                    }
+                    status.text = L.Tr("Migration generated and validated. Review the changed section, then apply:", "迁移已生成并通过校验。请审阅变更段后应用：");
+                    RenderAiMigrateDiff(diffArea, p);
+                });
+            };
+            box.Add(gen);
+            box.Add(diffArea);
+            return box;
+        }
+
+        private void RenderAiMigrateDiff(VisualElement area, MigrateProposal p)
+        {
+            area.Clear();
+            AiFixDiffView.BuildFileDiffBlocks(area, p.Original, p.Migrated);
+
+            var apply = new Button { text = L.Tr("Apply migration (rewrites the whole file; commit to version control first)", "应用迁移（整体重写该文件，建议先提交版本控制）") };
+            apply.style.marginTop = 6;
+            apply.clicked += () =>
+            {
+                // Shader targets verify synchronously (re-import + active compile, retries inline) — async only
+                // because retry rounds call the LLM. C# targets keep the compile-scheduler path (domain reload).
+                if (p.Recipe != null && p.Recipe.Kind == MigrateKind.Shader)
+                {
+                    apply.SetEnabled(false);
+                    apply.text = L.Tr("Applying & verifying (compiling the shader; retries feed errors back automatically)…",
+                                      "应用并验证中（正在编译该 shader；失败会自动喂回错误重试）…");
+                    ShaderMigrateService.ApplyWithVerify(p, (ok2, msg2) => OnMigrateApplied(area, p, ok2, msg2,
+                        rescanPath: p.VerifyAssetPath ?? p.FilePath));
+                    return;
+                }
+
+                bool ok = MigrateService.Apply(p, out string msg);
+                if (!ok) { EditorUtility.DisplayDialog(L.Tr("Apply failed", "应用失败"), msg, "OK"); return; }
+                OnMigrateApplied(area, p, true, msg, rescanPath: p.FilePath);
+            };
+            area.Add(apply);
+        }
+
+        /// <summary>Shared post-apply UI for both migrate paths: success note + single-file rescan, or the failure dialog.</summary>
+        private void OnMigrateApplied(VisualElement area, MigrateProposal p, bool ok, string msg, string rescanPath)
+        {
+            if (!ok)
+            {
+                EditorUtility.DisplayDialog(L.Tr("Apply failed", "应用失败"), msg, "OK");
+                // Rebuild the apply button state by re-rendering the diff (the file was rolled back — the proposal is still valid to retry manually).
+                RenderAiMigrateDiff(area, p);
+                return;
+            }
+
+            ShowNotification(new GUIContent(L.Tr("AI migration applied", "AI 迁移已应用")));
+            area.Clear();
+            area.Add(new Label("✓ " + msg) { style = { color = new Color(0.45f, 0.80f, 0.50f), whiteSpace = WhiteSpace.Normal } });
+
+            // Shader hot-reload leaves runtime-fed state behind (C#-driven water systems, ambient bindings…) —
+            // parts of the scene can render black until the scene reloads. Make the fix one click, with the
+            // standard save prompt guarding unsaved changes (real case: Boat Attack water goes black after repair).
+            if (p.Recipe != null && p.Recipe.Kind == MigrateKind.Shader)
+            {
+                var scene = UnityEditor.SceneManagement.EditorSceneManager.GetActiveScene();
+                if (!string.IsNullOrEmpty(scene.path))
+                {
+                    var reload = new Button
+                    {
+                        text = L.Tr("Reload scene (restores lighting & shader-driven state, e.g. water)",
+                                    "重新加载场景（恢复光照与 shader 关联状态，如水面）")
+                    };
+                    reload.style.marginTop = 4;
+                    reload.clicked += () =>
+                    {
+                        // Prompts to save when dirty; returns false on cancel — never drop user changes silently.
+                        if (UnityEditor.SceneManagement.EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo())
+                            UnityEditor.SceneManagement.EditorSceneManager.OpenScene(scene.path);
+                    };
+                    area.Add(reload);
+                }
+            }
+
+            // Same in-place refresh as AI Fix: rescan only the affected assets, keep the scroll position.
+            // Shader migrations rescan EVERY currently-flagged SHDR004 shader, not just the clicked one — a
+            // shared-include fix heals siblings too (Water + WaterTessellated in the smoke test), and their
+            // findings would otherwise sit stale until a full rescan.
+            if (_lastResult != null && !string.IsNullOrEmpty(rescanPath))
+            {
+                Vector2 scroll = _results.scrollOffset;
+                var rescanPaths = p.Recipe != null && p.Recipe.Kind == MigrateKind.Shader
+                    ? ShaderMigrateService.AffectedShaderPaths(_lastResult.Findings, rescanPath)
+                    : new System.Collections.Generic.List<string> { rescanPath };
+                foreach (var path in rescanPaths)
+                    _lastResult = ScanRunner.RescanFile(path, _lastResult);
+                ScanResultStore.Save(_lastResult);
+                RenderHeader(_lastResult);
+                RenderResults();
+                RestoreScrollAfterLayout(scroll);
+            }
         }
 
         private void RenderAiFixDiff(VisualElement area, ScriptFixProposal p)
@@ -1329,29 +1598,62 @@ namespace PerfLint.UI
             if (first == null) return;
             if (first.RequiresPro && !Entitlements.RequirePro(first.Label)) return;
 
+            // Batch-specific confirm body when provided: the per-finding ConfirmMessage names ONE asset (misleading for
+            // a 331-item run) and can overflow Unity's dialog length limit (which truncates mid-sentence and appends
+            // "see the editor log file"). Fallback keeps the old composition for actions without a batch message.
+            string body = !string.IsNullOrEmpty(first.BatchConfirmMessage)
+                ? first.BatchConfirmMessage
+                : L.Tr($"{first.ConfirmMessage}\n\n(The undo note above applies to each item.)",
+                       $"{first.ConfirmMessage}\n\n（以上撤销说明适用于每一项。）");
             bool confirm = EditorUtility.DisplayDialog(
                 L.Tr("PerfLint — Batch Run", "PerfLint — 批量执行"),
-                L.Tr($"Will run '{first.Label}' on {findings.Count} items.\n\n{first.ConfirmMessage}\n\n(The undo note above applies to each item.)",
-                     $"将对 {findings.Count} 个项执行「{first.Label}」。\n\n{first.ConfirmMessage}\n\n（以上撤销说明适用于每一项。）"),
+                L.Tr($"Will run '{first.Label}' on {findings.Count} items.\n\n{body}",
+                     $"将对 {findings.Count} 个项执行「{first.Label}」。\n\n{body}"),
                 $"{L.Tr("Run all", "执行全部")} ({findings.Count})", L.Tr("Cancel", "取消"));
             if (!confirm) return;
 
-            // Don't use Start/StopAssetEditing: extraction doesn't involve asset reimport, and it would defer Addressables' SaveAssets,
-            // instead causing entries not to persist. Run each independently (each internally does postEvent=true + SaveAssets).
+            // A) The action provides a whole-batch entry point (e.g. Addressables extract: one SaveAssets for the
+            //    whole set instead of N, plus a before/after dedup self-check). Hand it every target path in one call.
+            if (first.SupportsBatchRun)
+            {
+                var paths = findings.Select(f => f.TargetPath).Where(p => !string.IsNullOrEmpty(p)).Distinct().ToList();
+                var br = first.BatchRun(paths);
+                // Always a modal dialog (success too): the previous fading toast meant a successful batch looked like
+                // "nothing happened" — the report is the whole point of a 300-item run.
+                EditorUtility.DisplayDialog(
+                    br.Success ? L.Tr("Batch complete", "批量完成") : L.Tr("Batch finished with issues", "批量执行完成（有问题）"),
+                    br.Message ?? "", "OK");
+                RescanRules(findings.Select(f => f.RuleId));
+                return;
+            }
+
+            // B) Generic per-item path. Don't use Start/StopAssetEditing: extraction doesn't involve asset reimport, and
+            //    it would defer Addressables' SaveAssets, causing entries not to persist. A progress bar keeps a long run
+            //    from looking frozen; the completion dialog always shows (success included).
             int ok = 0, fail = 0;
             string lastErr = null;
-            foreach (var f in findings)
+            try
             {
-                if (f.Action == null) continue;
-                var r = f.Action.Run();
-                if (r.Success) ok++;
-                else { fail++; lastErr = r.Message; }
+                for (int i = 0; i < findings.Count; i++)
+                {
+                    var f = findings[i];
+                    if (f.Action == null) continue;
+                    if (EditorUtility.DisplayCancelableProgressBar(first.Label, $"{i + 1}/{findings.Count}", (float)i / findings.Count))
+                        break;
+                    var r = f.Action.Run();
+                    if (r.Success) ok++;
+                    else { fail++; lastErr = r.Message; }
+                }
+                AssetDatabase.SaveAssets();
             }
-            AssetDatabase.SaveAssets();
+            finally { EditorUtility.ClearProgressBar(); }
 
-            ShowNotification(new GUIContent(L.Tr($"Ran {ok}, failed {fail}", $"已执行 {ok}，失败 {fail}")));
-            if (fail > 0 && lastErr != null)
-                EditorUtility.DisplayDialog(L.Tr("Some failed", "部分失败"), L.Tr($"{fail} items failed. Last error: {lastErr}", $"{fail} 项失败，最后错误：{lastErr}"), "OK");
+            EditorUtility.DisplayDialog(
+                fail == 0 ? L.Tr("Batch complete", "批量完成") : L.Tr("Batch finished with issues", "批量执行完成（有问题）"),
+                fail == 0
+                    ? L.Tr($"Ran {ok} item(s) successfully.", $"成功执行 {ok} 项。")
+                    : L.Tr($"Ran {ok}, failed {fail}.\nFirst error: {lastErr}", $"成功 {ok} 项，失败 {fail} 项。\n首个错误：{lastErr}"),
+                "OK");
             RescanRules(findings.Select(f => f.RuleId));
         }
 

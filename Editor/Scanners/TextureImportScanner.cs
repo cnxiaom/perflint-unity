@@ -169,7 +169,7 @@ namespace PerfLint.Scanners
         /// effective Max Size clamp (the platform override if present, else the importer default), preserving aspect ratio.
         /// An unimported / sizeless source yields (0,0) — same neutral result the old <c>tex == null</c> path produced.
         /// </summary>
-        private static void GetImportedSize(TextureImporter importer, string platform, out int w, out int h)
+        internal static void GetImportedSize(TextureImporter importer, string platform, out int w, out int h)
         {
             importer.GetSourceTextureWidthAndHeight(out int sw, out int sh);
 
@@ -221,7 +221,7 @@ namespace PerfLint.Scanners
         /// explicit uncompressed Default format (e.g. "RGB 16 bit"/RGB16), the quality enum still reads "Compressed",
         /// which made TEX005 false-fire ("compression silently failed") and TEX002 miss the genuinely-uncompressed texture.
         /// </summary>
-        private static bool IsEffectivelyUncompressed(TextureImporter importer, string platform)
+        internal static bool IsEffectivelyUncompressed(TextureImporter importer, string platform)
         {
             var ps = importer.GetPlatformTextureSettings(platform);
             if (ps != null && ps.overridden) return SettingsAreUncompressed(ps);

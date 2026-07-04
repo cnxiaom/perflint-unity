@@ -80,6 +80,15 @@ namespace PerfLint.Core
         /// <summary>Whether this finding is eligible for script-level AI Fix (has a precise code location and no deterministic automatic fix).</summary>
         public bool AiFixable => !string.IsNullOrEmpty(CodeFile) && CodeLine > 0 && !CanAutoFix;
 
+        /// <summary>
+        /// When true, this finding bypasses the ignore-path filter (IgnoreSettings). For duplication/build-bloat rules
+        /// (AADUP/ABDUP/AARES): users ignore third-party folders to silence "fix this asset's import settings" advice,
+        /// but a third-party asset duplicated into N bundles bloats THEIR build and the fix (extract / move out of
+        /// Resources) never modifies the third-party asset — hiding those findings guts the report (real case: TMP
+        /// fonts 74× ≈ 1.16GB invisible because "Dependencies/" was ignored). Default false.
+        /// </summary>
+        public bool IgnoreExempt { get; }
+
         public Finding(
             string ruleId,
             Domain domain,
@@ -95,7 +104,8 @@ namespace PerfLint.Core
             FindingAction action = null,
             string groupTitle = null,
             bool wasAutoFixable = false,
-            bool wasActionable = false)
+            bool wasActionable = false,
+            bool ignoreExempt = false)
         {
             if (string.IsNullOrEmpty(ruleId)) throw new ArgumentException("ruleId is required", nameof(ruleId));
             if (string.IsNullOrEmpty(title)) throw new ArgumentException("title is required", nameof(title));
@@ -115,6 +125,7 @@ namespace PerfLint.Core
             Action = action;
             WasAutoFixable = wasAutoFixable;
             WasActionable = wasActionable;
+            IgnoreExempt = ignoreExempt;
         }
     }
 }

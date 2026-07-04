@@ -39,6 +39,14 @@ namespace PerfLint.Llm
         /// <summary>SessionState flag: set after pending-verification fixes survive a domain reload; the window uses this to trigger one full rescan for reconciliation.</summary>
         public const string RescanFlag = "PerfLint.Fix.RescanAfterFix";
 
+        /// <summary>
+        /// Fired on the main thread when an AI change (fix or whole-file migration) fails compile verification and is
+        /// rolled back: (assetPath, errorSummary). Crucial in a compile-broken project: the rollback happens WITHOUT a
+        /// domain reload, and no successful reload will ever come to reconcile the window via RescanFlag — so the open
+        /// window must listen and un-show the "already fixed" state itself.
+        /// </summary>
+        public static event System.Action<string, string> FixRolledBack;
+
         static PerfLintScriptFixVerifier()
         {
             CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompilationFinished;
@@ -90,8 +98,15 @@ namespace PerfLint.Llm
                 }
                 catch { /* rollback is best-effort */ }
                 rolledBack = true;
-                Debug.LogWarning("[PerfLint] " + L.Tr($"The AI fix caused a compile error and was auto-rolled back: {asset}", $"AI 修复导致编译错误，已自动回滚：{asset}"));
+                // Include the actual compiler errors: without them the user (and we) can't tell WHAT the AI got
+                // wrong — the difference between "regenerate", "fix one line by hand" and "give up".
+                string summary = SummarizeErrors(messages, asset);
+                Debug.LogWarning("[PerfLint] " + L.Tr(
+                    $"The AI change caused compile errors and was auto-rolled back: {asset}\n{summary}",
+                    $"AI 修改导致编译错误，已自动回滚：{asset}\n{summary}"));
                 AssetDatabase.ImportAsset(asset);
+                try { FixRolledBack?.Invoke(asset, summary); }
+                catch { /* a subscriber error must never break verification */ }
             }
 
             Save(remaining);
@@ -153,6 +168,32 @@ namespace PerfLint.Llm
             foreach (var (asset, backup) in list)
                 sb.Append(asset).Append('\t').Append(backup).Append('\n');
             SessionState.SetString(KPending, sb.ToString());
+        }
+
+        /// <summary>
+        /// The compiler errors belonging to <paramref name="assetPath"/> as a short indented list ("(line) message"),
+        /// capped at <paramref name="max"/> entries with a "+N more" tail. Pure logic (unit-tested) — this string is
+        /// what tells the user why their AI change was rolled back.
+        /// </summary>
+        // Default cap 8, not 3: for whole-file migrations the rollback summary is the primary diagnostic, and
+        // hiding errors behind "+N more" cost a smoke-test round (the visible 3 were fixable, the hidden 3 unknown).
+        internal static string SummarizeErrors(CompilerMessage[] messages, string assetPath, int max = 8)
+        {
+            if (messages == null) return "";
+            string target = NormFull(assetPath);
+            var sb = new System.Text.StringBuilder();
+            int total = 0, shown = 0;
+            foreach (var m in messages)
+            {
+                if (m.type != CompilerMessageType.Error || NormFull(m.file) != target) continue;
+                total++;
+                if (shown >= max) continue;
+                if (shown > 0) sb.Append('\n');
+                sb.Append("  (").Append(m.line).Append(") ").Append(m.message);
+                shown++;
+            }
+            if (total > shown) sb.Append('\n').Append("  … +").Append(total - shown).Append(" more");
+            return sb.ToString();
         }
 
         private static string NormFull(string p)

@@ -32,6 +32,13 @@ namespace PerfLint.Runtime
         // Ring buffer capacity: ≈33 s at 60 fps. Sufficient to cover one manual sampling session; memory overhead is negligible (≈32 KB per counter).
         private const int Capacity = 2000;
 
+        // Per-object-category counters (Memory category) for RUN.MEM003 — "which category of objects/assets is growing" (leak attribution without heap snapshots).
+        // Availability varies by platform/Unity version; ProfilerRecorder.Valid degrades safely (that entry simply has no data and MEM003 skips it).
+        private static readonly string[] CategoryCounterNames =
+        {
+            "GameObject Count", "Object Count", "Texture Count", "Texture Memory", "Mesh Count", "Mesh Memory", "Material Count",
+        };
+
         private struct Channel
         {
             public string Key;
@@ -74,6 +81,30 @@ namespace PerfLint.Runtime
         private List<double> _gpuFrameMs;          // Per-frame GPU times measured by FrameTimingManager (ms); more reliable than the ProfilerRecorder counter
         private FrameTiming[] _frameTimingBuf;     // Reusable buffer for GetLatestTimings (capacity 1, fetches the most recent frame)
 
+        // ── Live spike capture (root fix for FPS003 attribution) ──
+        // The counter ring buffer (2000 frames) far outlives the Profiler backend's Hierarchy frame retention (only a few hundred frames), so a spike the
+        // counter reports often can't be re-read from frame data at Stop() time — already evicted. The deferred worst-frame merge then lands on a normal
+        // frame, producing a self-contradictory FPS003 ("370 ms frame mostly spent in 0.1 ms markers"). Fix: while sampling, watch each new frame's
+        // main-thread time; the moment one spikes, snapshot its Hierarchy right then (the newest frame is guaranteed still retained). This live worst frame
+        // wins over the deferred merge and is reconciled against the counter max in RuntimeAnalyzer (wfIsSpikeFrame).
+        private int _lastSpikeFrameSeen;         // Highest ProfilerDriver frame index already evaluated for spikes this session (avoids re-processing)
+        private double _spikeBaselineMs;          // EMA of main-thread ms — the "normal" baseline a candidate spike must exceed
+        // Best-SCORING spike frame per distinct culprit (script+method). A level-gen freeze is a cluster of heavy frames across several phases, so we keep
+        // one per culprit (deduped) rather than a single worst — RUN.FPS003 then reports each with its own Locate. Score (magnitude × attribution weight)
+        // means an attributable spike beats a larger but unmappable one (e.g. an EditorLoop/Deep-Profile artifact frame).
+        private readonly Dictionary<string, WorstFrameInfo> _liveSpikesByCulprit = new Dictionary<string, WorstFrameInfo>(16);
+        private GcAllocSite _lastGcSite; // top steady-state per-frame GC allocator from the last hotspot merge (RUN.GC001 runtime attribution); null when none dominant
+        /// <summary>Top steady-state per-frame GC allocator found by the last BeginHotspots merge (or null). Read by the window right after onComplete.</summary>
+        public GcAllocSite LastGcSite => _lastGcSite;
+        // A detected spike whose Hierarchy isn't replayable yet: the just-ended freeze frame's frame-data commonly lags 1-2 frames behind, so we
+        // remember the frame hint + magnitude and retry the snapshot on later ticks until it becomes valid (or scrolls out of the retained window).
+        // Detected spikes awaiting capture. A level-gen freeze produces SEVERAL spiking frames (different phases) in quick succession, so we track a small
+        // queue — not one — and retry each until its Hierarchy becomes replayable (or it scrolls out), so no distinct culprit is dropped.
+        private struct PendingSpike { public int Frame; public double Ms; public int Attempts; }
+        private readonly List<PendingSpike> _pendingSpikes = new List<PendingSpike>(16);
+        private const int MaxPendingSpikes = 12;  // cap concurrent pending spikes (drop the smallest to make room) to bound per-tick frame-tree builds
+        private List<ProfilerRecorderSample> _spikeScanBuf; // reused buffer for scanning recent Main Thread samples (freeze-recovery may add several frames per tick)
+
         // GPU-time column index for HierarchyFrameDataView — the column constant was added only in newer Unity (2022+)
         // and is absent from the public API of 2021.3; referencing it directly would cause a compile error, and the
         // name may differ across versions. Therefore we reflect over all public static int column constants, pick the one
@@ -102,6 +133,27 @@ namespace PerfLint.Runtime
             catch { return -1; }
         }
 
+        // GC-allocated-memory column (bytes) for HierarchyFrameDataView — used to attribute a spike's allocations to the culprit method (e.g. "PlaceObstaclesAsync ~2.0 MB").
+        // Resolved by reflection like the GPU column (constant name/availability varies by Unity version); -1 = unavailable → GC is simply omitted from the spike text.
+        private static readonly int _gcColumn = ResolveGcColumn();
+        private static int ResolveGcColumn()
+        {
+            try
+            {
+                foreach (var f in typeof(HierarchyFrameDataView).GetFields(BindingFlags.Public | BindingFlags.Static))
+                {
+                    if (f.FieldType != typeof(int)) continue;
+                    string n = f.Name;
+                    if (n.IndexOf("column", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (n.IndexOf("Gc", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (n.IndexOf("Memory", StringComparison.OrdinalIgnoreCase) >= 0 || n.IndexOf("Alloc", StringComparison.OrdinalIgnoreCase) >= 0)
+                        return (int)f.GetValue(null); // columnGcMemory
+                }
+            }
+            catch { /* fall through */ }
+            return -1;
+        }
+
         // Reusable buffers for HierarchyFrameDataView traversal (main thread, avoids per-frame allocations). See AccumulateHierarchySelfTime.
         private static readonly Stack<int> _itemStack = new Stack<int>(2048);
         private static readonly List<int>  _childBuf  = new List<int>(64);
@@ -123,6 +175,8 @@ namespace PerfLint.Runtime
             Add("Total Reserved Memory", ProfilerCategory.Memory, "Total Reserved Memory");
             Add("GC Used Memory", ProfilerCategory.Memory, "GC Used Memory");
             Add("Gfx Used Memory", ProfilerCategory.Memory, "Gfx Used Memory");
+            // Object/asset category counters — feed RUN.MEM003 (which category of objects is accumulating). Invalid counters degrade to no-data.
+            foreach (var n in CategoryCounterNames) Add(n, ProfilerCategory.Memory, n);
             Add("Draw Calls Count", ProfilerCategory.Render, "Draw Calls Count");
             Add("SetPass Calls Count", ProfilerCategory.Render, "SetPass Calls Count");
             Add("Batches Count", ProfilerCategory.Render, "Batches Count");
@@ -144,17 +198,32 @@ namespace PerfLint.Runtime
             _gpuFrameMs = new List<double>(Capacity);
             if (_frameTimingBuf == null) _frameTimingBuf = new FrameTiming[1];
             FrameTimingManager.CaptureFrameTimings();
-            EditorApplication.update += GpuTick;
+
+            _lastSpikeFrameSeen = ProfilerDriver.lastFrameIndex; // only evaluate frames produced after Start (skip pre-sampling scene-load spikes)
+            _spikeBaselineMs = 0;
+            _liveSpikesByCulprit.Clear();
+            _pendingSpikes.Clear();
+            _lastGcSite = null;
+            EditorApplication.update += EditorFrameTick;
 
             _startTime = EditorApplication.timeSinceStartup;
             _startFrameIndex = ProfilerDriver.lastFrameIndex;
             _running = true;
         }
 
-        // Called once per editor frame (≈ once per game frame in Play Mode) to capture GPU time. CaptureFrameTimings must be called every frame to advance the timing window.
-        private void GpuTick()
+        // Called once per editor frame (≈ once per game frame in Play Mode): capture GPU time (every frame, to advance the timing window) and,
+        // when a frame has spiked, snapshot its call stack live before the Profiler evicts it.
+        private void EditorFrameTick()
         {
             if (!_running) return;
+            CaptureGpuTiming();
+            try { CaptureSpikeFrame(); }
+            catch { /* Live spike capture is best-effort; on failure BeginHotspots' deferred worst-frame merge still runs. */ }
+        }
+
+        // CaptureFrameTimings must be called every frame to advance the timing window.
+        private void CaptureGpuTiming()
+        {
             try
             {
                 FrameTimingManager.CaptureFrameTimings();
@@ -166,6 +235,158 @@ namespace PerfLint.Runtime
                 }
             }
             catch { /* Platform does not support FrameTimingManager → leave empty; Stop() falls back to the ProfilerRecorder counter */ }
+        }
+
+        // Absolute freeze floor (ms): any frame at/above this is a candidate spike regardless of baseline (matches FPS003's 100 ms perceptible-freeze floor).
+        private const double SpikeFloorMs = 100.0;
+        // Relative trigger: a frame must also be this many times the running baseline to count as a spike (separates an outlier from "generally slow").
+        private const double SpikeBaselineMult = 3.0;
+
+        /// <summary>
+        /// While sampling, detect a spiked frame and snapshot its Hierarchy immediately (the newest frame is still retained by the Profiler backend).
+        /// Cheap gate first: the "Main Thread" counter's last value drives an EMA baseline, so the expensive frame-tree build happens only on real spikes.
+        /// On a trigger, snapshot the heavier of the two newest frames — this absorbs a possible 1-frame lag between the counter's LastValue and
+        /// lastFrameIndex, and the newest frame may not yet be replayable (frame.valid == false), in which case the second-newest one covers it.
+        /// The stored magnitude comes from the snapshotted frame's own self-time total, not the (possibly lagged) trigger reading.
+        /// </summary>
+        // Retry window (ticks) to wait for a detected spike's frame data to become replayable before giving up.
+        private const int PendingSpikeMaxAttempts = 12;
+
+        // Per-spike capture diagnostics are silent by default (would spam the Console). Set env PERFLINT_SPIKE_LOG=1 to re-enable them for troubleshooting.
+        private static readonly bool SpikeDebugLog = Environment.GetEnvironmentVariable("PERFLINT_SPIKE_LOG") == "1";
+
+        private void CaptureSpikeFrame()
+        {
+            // 1) Fulfil previously detected spikes whose frame data may only now have become replayable (the freeze frame typically lags 1-2 frames).
+            ResolvePendingSpikes();
+
+            int cur = ProfilerDriver.lastFrameIndex;
+            if (cur < 0 || cur <= _lastSpikeFrameSeen) return; // no new finalized frame(s) since last tick
+            int newFrames = cur - _lastSpikeFrameSeen;
+            _lastSpikeFrameSeen = cur;
+
+            // 2) Find the worst frame among ALL frames added since the last tick — NOT just LastValue. A long freeze runs on this very (editor-update)
+            //    thread, so when the tick resumes lastFrameIndex has already advanced past the spike and LastValue reflects a later, normal frame.
+            FindRecentSpikeFrame(cur, newFrames, out int spikeFrame, out double spikeMs);
+
+            // Baseline EMA from the latest (typically normal) frame reading.
+            double latest = LastValue("Main Thread") / 1_000_000.0;
+            if (latest > 0)
+            {
+                if (_spikeBaselineMs <= 0) _spikeBaselineMs = latest;
+                else _spikeBaselineMs = _spikeBaselineMs * 0.95 + latest * 0.05;
+            }
+
+            bool isSpike = spikeMs >= SpikeFloorMs || (spikeMs >= 33.0 && _spikeBaselineMs > 0 && spikeMs >= _spikeBaselineMs * SpikeBaselineMult);
+            if (!isSpike) return;
+
+            // Pursue EVERY genuine spike (no relative-to-max gate — that would drop smaller-but-real culprits, e.g. a 358ms phase, once a big spike is seen).
+            // Per-culprit aggregation keeps only the worst frame per cause, so tracking many spikes doesn't bloat the result.
+            foreach (var p in _pendingSpikes)
+                if (Math.Abs(p.Frame - spikeFrame) <= 2) return; // already tracking this spike (freeze recovery reports it across a couple ticks)
+
+            if (_pendingSpikes.Count >= MaxPendingSpikes)
+            {
+                int minIdx = 0;
+                for (int i = 1; i < _pendingSpikes.Count; i++) if (_pendingSpikes[i].Ms < _pendingSpikes[minIdx].Ms) minIdx = i;
+                if (_pendingSpikes[minIdx].Ms >= spikeMs) return; // queue full and this isn't bigger than the smallest → skip
+                _pendingSpikes.RemoveAt(minIdx);
+            }
+            _pendingSpikes.Add(new PendingSpike { Frame = spikeFrame, Ms = spikeMs, Attempts = PendingSpikeMaxAttempts });
+            if (SpikeDebugLog) Debug.Log("[PerfLint] " + L.Tr($"Runtime spike detected (~{spikeMs:0} ms at frame {spikeFrame}); will snapshot its call stack once the Profiler makes it replayable.", $"检测到运行时尖刺（约 {spikeMs:0} ms，帧 {spikeFrame}），将在 Profiler 使其可回放后抓取其调用栈。"));
+            ResolvePendingSpikes(); // try immediately in case it's already replayable
+        }
+
+        // Scan the Main Thread counter samples added since the last tick to find the worst frame (value + approximate frame index, end-aligned to cur).
+        private void FindRecentSpikeFrame(int cur, int newFrames, out int spikeFrame, out double spikeMs)
+        {
+            spikeMs = LastValue("Main Thread") / 1_000_000.0;
+            spikeFrame = cur;
+            if (newFrames <= 1) return; // common case: only one new frame → LastValue already is it
+
+            foreach (var c in _channels)
+            {
+                if (c.Key != "Main Thread" || !c.Valid || c.Recorder.Count == 0) continue;
+                if (_spikeScanBuf == null) _spikeScanBuf = new List<ProfilerRecorderSample>(Capacity);
+                _spikeScanBuf.Clear();
+                c.Recorder.CopyTo(_spikeScanBuf); // old→new
+                int count = _spikeScanBuf.Count;
+                int scan = Math.Min(newFrames, count);
+                for (int i = count - scan; i < count; i++)
+                {
+                    double m = _spikeScanBuf[i].Value / 1_000_000.0;
+                    if (m > spikeMs)
+                    {
+                        spikeMs = m;
+                        spikeFrame = cur - (count - 1 - i); // end-align: newest sample ↔ cur
+                    }
+                }
+                break;
+            }
+        }
+
+        // Retry snapshotting each pending spike frame. The just-ended frame's Hierarchy is often not yet replayable, so we search a small window around
+        // the hint (absorbing counter/frame-index misalignment), confirm by matching the captured self-total against the detected magnitude, then
+        // aggregate it into _liveSpikesByCulprit (one entry per distinct culprit). Runs on every tick after the freeze — the game has resumed, so building
+        // a few frame trees here doesn't stall play.
+        private void ResolvePendingSpikes()
+        {
+            if (_pendingSpikes.Count == 0) return;
+            int first = ProfilerDriver.firstFrameIndex;
+            int last  = ProfilerDriver.lastFrameIndex;
+
+            for (int idx = _pendingSpikes.Count - 1; idx >= 0; idx--)
+            {
+                var p = _pendingSpikes[idx];
+                if (p.Frame < first || p.Attempts <= 0)
+                {
+                    if (SpikeDebugLog) Debug.Log("[PerfLint] " + L.Tr($"Gave up capturing the ~{p.Ms:0} ms spike's call stack (its frame data was evicted or never became replayable in time).", $"放弃抓取约 {p.Ms:0} ms 尖刺的调用栈（其帧数据已被淘汰或始终未变为可回放）。"));
+                    _pendingSpikes.RemoveAt(idx);
+                    continue;
+                }
+                p.Attempts--;
+                _pendingSpikes[idx] = p; // persist the decremented attempt count
+
+                double bestSelf = 0; WorstFrameInfo bestSnap = null; string bestRawTop = "";
+                for (int fi = p.Frame - 2; fi <= p.Frame + 2; fi++)
+                {
+                    if (fi < first || fi > last) continue;
+                    var frame = ProfilerDriver.GetHierarchyFrameDataView(
+                        fi, 0, HierarchyFrameDataView.ViewModes.MergeSamplesWithTheSameName,
+                        HierarchyFrameDataView.columnSelfTime, false);
+                    try
+                    {
+                        if (frame == null || !frame.valid) continue;
+                        double selfTotal = FillFrameDict(frame); // fills _frameDict, returns this frame's total self-time (ms)
+                        if (selfTotal > bestSelf)
+                        {
+                            bestSnap = SnapshotWorstFrame(frame, selfTotal); // reads _frameDict, which still holds this frame
+                            bestRawTop = SpikeDebugLog ? RawTopSelfLeaders(5) : ""; // diagnostic only: raw self incl. wait/GC/engine (which SnapshotWorstFrame filters out)
+                            bestSelf = selfTotal;
+                        }
+                    }
+                    finally { frame?.Dispose(); }
+                }
+
+                // Confirm we found the actual spike frame (self-total within range of the detected magnitude), not just a normal neighbour that's ready first.
+                if (bestSnap != null && bestSelf >= p.Ms * 0.5)
+                {
+                    // Aggregate by culprit: keep the highest-SCORING spike frame PER distinct culprit (script+method) so each level-gen phase is its own finding.
+                    string culpritKey = CulpritKey(bestSnap);
+                    if (!_liveSpikesByCulprit.TryGetValue(culpritKey, out var existing) ||
+                        SpikeFrameScore(bestSnap) > SpikeFrameScore(existing))
+                        _liveSpikesByCulprit[culpritKey] = bestSnap;
+                    if (SpikeDebugLog)
+                    {
+                        string culpritDbg = (bestSnap.UserCallPath != null && bestSnap.UserCallPath.Count > 0)
+                            ? bestSnap.UserCallPath[bestSnap.UserCallPath.Count - 1].Marker
+                            : "(no script mapped on heaviest path)";
+                        Debug.Log("[PerfLint] " + L.Tr($"Captured the spike frame's call stack: {bestSelf:0} ms self-time total (frame ~{p.Frame}); heaviest-path script: {culpritDbg}; raw top self (incl. wait/GC/engine): {bestRawTop}.", $"已抓取尖刺帧调用栈：self-time 合计 {bestSelf:0} ms（帧约 {p.Frame}）；最重路径脚本：{culpritDbg}；原始 top self（含 wait/GC/引擎）：{bestRawTop}。"));
+                    }
+                    _pendingSpikes.RemoveAt(idx);
+                }
+                // else: not replayable yet (or only normal neighbours ready) → keep pending and retry next tick.
+            }
         }
 
         private void Add(string key, ProfilerCategory category, string statName)
@@ -199,7 +420,7 @@ namespace PerfLint.Runtime
         {
             if (!_running) return null;
             _running = false;
-            EditorApplication.update -= GpuTick;
+            EditorApplication.update -= EditorFrameTick;
 
             double duration = EditorApplication.timeSinceStartup - _startTime;
 
@@ -240,6 +461,9 @@ namespace PerfLint.Runtime
             DisposeChannels();
             ProfilerDriver.enabled = _prevProfilerEnabled;
 
+            var categoryCounters = new Dictionary<string, MetricStats>(CategoryCounterNames.Length);
+            foreach (var n in CategoryCounterNames) categoryCounters[n] = Stat(n);
+
             return new RuntimeProfileResult(
                 durationSeconds: duration,
                 frameCount: frameCount,
@@ -258,7 +482,8 @@ namespace PerfLint.Runtime
                 hotspots: null,
                 hotspotsAvailable: false,
                 wasDeepProfile: _wasDeepProfile,
-                sceneBatching: sceneBatching);
+                sceneBatching: sceneBatching,
+                categoryCounters: categoryCounters);
         }
 
         /// <summary>
@@ -268,7 +493,7 @@ namespace PerfLint.Runtime
         /// gpuFrameTimeNs is the GPU frame-time statistic read from frame data (same source as the Profiler "GPU ms" column, may be null — falls back to the sampling-period source when there is no GPU data).
         /// </summary>
         public void BeginHotspots(
-            Action<List<Hotspot>, WorstFrameInfo, MetricStats, bool> onComplete,
+            Action<List<Hotspot>, IReadOnlyList<WorstFrameInfo>, MetricStats, bool> onComplete,
             Action<int, int> onProgress = null)
         {
             // Cancel any previous merge that has not yet finished (should not exist in theory; defensive handling).
@@ -279,13 +504,17 @@ namespace PerfLint.Runtime
 
             if (last < first)
             {
-                onComplete(new List<Hotspot>(), null, null, true);
+                // No replayable frames, but spikes may still have been captured live during sampling.
+                onComplete(new List<Hotspot>(), BuildWorstFrames(null), null, true);
                 return;
             }
 
             var acc = new Dictionary<string, double>();
             var peak = new Dictionary<string, PeakPair>();
             var gpuMsList = new List<double>(); // GPU time per sampled frame (ms, read from columnTotalGpuTime of the HierarchyFrameDataView root node)
+            var gcByScript = new Dictionary<string, double>();    // steady-state GC-alloc bytes accumulated per user script (RUN.GC001 runtime attribution)
+            var gcMethodByScript = new Dictionary<string, string>();
+            _lastGcSite = null;
             _scriptPathCache.Clear(); // Reset the script-resolution cache each sampling run (avoids stale mappings from scripts added/removed/renamed across sessions)
             int framesSeen        = 0; // Total sampled frames (uniform + spike) — feeds peaks, used for logging
             int uniformFramesSeen = 0; // Uniform (representative) frames only — the denominator for per-frame average/share, prevents spike frames from contaminating the average
@@ -333,6 +562,7 @@ namespace PerfLint.Runtime
                             framesSeen++;
                             bool isUniform = uniformFrames.Contains(framesToProcess[idx]);
                             if (isUniform) uniformFramesSeen++;
+                            AccumulateGcByScript(frame, gcByScript, gcMethodByScript); // GC attribution across ALL frames (steady + spike) → RUN.GC001's runtime allocator
                             // GPU frame time: read the root node's GPU time column (same source as the Profiler Hierarchy "GPU ms" column).
                             // The column constant exists only in 2022+; on older versions _gpuColumn==-1 is skipped and FrameTimingManager serves as the fallback.
                             if (_gpuColumn >= 0)
@@ -375,12 +605,14 @@ namespace PerfLint.Runtime
                         }
                         if (framesSeen > 0)
                             Debug.Log("[PerfLint] " + L.Tr($"CPU hotspot merge complete: sampled {framesSeen} frames ({uniformFramesSeen} representative frames counted into the average), {acc.Count} markers, took {mergeWatch.ElapsedMilliseconds} ms.", $"CPU 热点归并完成：抽样 {framesSeen} 帧（其中 {uniformFramesSeen} 代表帧计入均值）、{acc.Count} 个 marker、用时 {mergeWatch.ElapsedMilliseconds} ms。"));
-                        onComplete(hotspots, worstFrame, gpuFromFrames, true);
+                        _lastGcSite = BuildTopGcSite(gcByScript, gcMethodByScript); // heaviest per-frame GC allocator measured (RUN.GC001 Locate target)
+                        // The live-captured spikes (per culprit) plus the deferred merge's worst frame, deduped and ranked — RUN.FPS003 reports one per culprit.
+                        onComplete(hotspots, BuildWorstFrames(worstFrame), gpuFromFrames, true);
                     }
                     catch (Exception ex)
                     {
                         Debug.LogWarning("[PerfLint] " + L.Tr($"Hotspot merge failed: {ex.Message}", $"热点归并失败：{ex.Message}"));
-                        onComplete(new List<Hotspot>(), null, null, false);
+                        onComplete(new List<Hotspot>(), BuildWorstFrames(null), null, false);
                     }
                 }
             };
@@ -438,6 +670,72 @@ namespace PerfLint.Runtime
 
             return new List<int>(selected);
         }
+
+        /// <summary>Culprit identity of a spike frame: deepest USER method on the heaviest path; else deepest PACKAGE method; else "unmapped". Aggregates spike frames by cause.</summary>
+        private static string CulpritKey(WorstFrameInfo wf)
+        {
+            var path = wf?.UserCallPath;
+            if (path != null)
+            {
+                for (int i = path.Count - 1; i >= 0; i--)
+                    if (!IsPackagePath(path[i].ScriptPath)) return "U:" + path[i].Marker;
+                if (path.Count > 0) return "P:" + path[path.Count - 1].Marker;
+            }
+            return "unmapped";
+        }
+
+        /// <summary>Ranked per-culprit worst-frame list for the result: the live-captured spikes (already one-per-culprit) plus the deferred merge's worst frame, deduped by culprit and sorted by score (desc).</summary>
+        private List<WorstFrameInfo> BuildWorstFrames(WorstFrameInfo deferred)
+        {
+            var byKey = new Dictionary<string, WorstFrameInfo>(_liveSpikesByCulprit);
+            if (deferred != null && deferred.HasData)
+            {
+                string k = CulpritKey(deferred);
+                if (!byKey.TryGetValue(k, out var e) || SpikeFrameScore(deferred) > SpikeFrameScore(e))
+                    byKey[k] = deferred;
+            }
+            var list = new List<WorstFrameInfo>(byKey.Values);
+            list.Sort((a, b) => SpikeFrameScore(b).CompareTo(SpikeFrameScore(a)));
+            return list;
+        }
+
+        /// <summary>
+        /// Ranking score for choosing the "worst" spike frame to report. Magnitude alone picks the largest frame — but the largest is often an
+        /// unmappable artifact (main-thread self dominated by EditorLoop / Deep-Profile overhead, or work in compiler-generated closures with no
+        /// resolvable type). Weighting by whether the heaviest path maps to your code (×4) or a third-party package (×3) lets a slightly-smaller but
+        /// actionable spike win, so FPS003 can name a real culprit instead of falling back to "couldn't be captured".
+        /// </summary>
+        private static double SpikeFrameScore(WorstFrameInfo wf)
+        {
+            if (wf == null) return 0;
+            var path = wf.UserCallPath;
+            bool anyMapped = path != null && path.Count > 0;
+            bool anyUser = false;
+            if (path != null)
+                foreach (var p in path)
+                    if (!IsPackagePath(p.ScriptPath)) { anyUser = true; break; }
+            double weight = anyUser ? 4.0 : anyMapped ? 3.0 : 1.0;
+            // Rank by the culprit's own inclusive Total (game-relevant), NOT the raw frame self-total — the latter is inflated by EditorLoop/Deep-Profile
+            // overhead, which would let a tiny real culprit on a heavy-overhead frame (e.g. a 50ms MLog.Info) outrank a genuine 363ms phase.
+            return CulpritMagnitude(wf) * weight;
+        }
+
+        /// <summary>The culprit's game-relevant magnitude (ms): deepest USER method's inclusive Total; else deepest PACKAGE method's Total; else the frame self-total. Mirrors RuntimeAnalyzer.SpikeDisplayMs.</summary>
+        private static double CulpritMagnitude(WorstFrameInfo wf)
+        {
+            if (wf == null) return 0;
+            var path = wf.UserCallPath;
+            if (path != null)
+            {
+                for (int i = path.Count - 1; i >= 0; i--)
+                    if (!IsPackagePath(path[i].ScriptPath)) return path[i].TotalMs > 0 ? path[i].TotalMs : wf.TotalSelfMs;
+                if (path.Count > 0) return path[path.Count - 1].TotalMs > 0 ? path[path.Count - 1].TotalMs : wf.TotalSelfMs;
+            }
+            return wf.TotalSelfMs;
+        }
+
+        private static bool IsPackagePath(string p) =>
+            !string.IsNullOrEmpty(p) && p.Replace('\\', '/').StartsWith("Packages/", StringComparison.Ordinal);
 
         private static List<double> ReadSamples(ProfilerRecorder rec)
         {
@@ -498,9 +796,32 @@ namespace PerfLint.Runtime
             HierarchyFrameDataView frame, Dictionary<string, double> acc, Dictionary<string, PeakPair> peak,
             bool contributeToAverage)
         {
-            // First aggregate each marker's self-time for "this frame" into frameDict (the same marker may be scattered across multiple call stacks), then merge into the global:
+            // First aggregate each marker's self-time for "this frame" into _frameDict (via FillFrameDict), then merge into the global:
             // - peak always maintains the highest + second-highest across frames (the second-highest excludes a single extreme frame, see PeakPair) — spike frames are also counted.
             // - acc accumulates only when contributeToAverage (uniform/representative frame) — spike frames are excluded, to avoid load/JIT super-frames contaminating the per-frame average.
+            double frameTotal = FillFrameDict(frame);
+            foreach (var kv in _frameDict)
+            {
+                if (contributeToAverage)
+                {
+                    acc.TryGetValue(kv.Key, out var a);
+                    acc[kv.Key] = a + kv.Value;
+                }
+                peak.TryGetValue(kv.Key, out var p);
+                p.Add(kv.Value);
+                peak[kv.Key] = p;
+            }
+            return frameTotal;
+        }
+
+        /// <summary>
+        /// Walk the whole Hierarchy tree with an explicit stack and aggregate each marker's self-time for THIS frame into the shared _frameDict
+        /// (the same marker is scattered across call stacks). Returns the frame's total self-time (ms): since every ms of the frame is "self" to exactly
+        /// one node, this sum equals the whole main-thread frame time. Leaves _frameDict populated so the caller can snapshot the frame from it
+        /// (shared with the live spike capture, which needs the per-marker self map without touching the merge's acc/peak).
+        /// </summary>
+        private static double FillFrameDict(HierarchyFrameDataView frame)
+        {
             var frameDict = _frameDict; frameDict.Clear();
 
             int root = frame.GetRootItemID();
@@ -533,18 +854,7 @@ namespace PerfLint.Runtime
             }
 
             double frameTotal = 0;
-            foreach (var kv in frameDict)
-            {
-                frameTotal += kv.Value;
-                if (contributeToAverage)
-                {
-                    acc.TryGetValue(kv.Key, out var a);
-                    acc[kv.Key] = a + kv.Value;
-                }
-                peak.TryGetValue(kv.Key, out var p);
-                p.Add(kv.Value);
-                peak[kv.Key] = p;
-            }
+            foreach (var kv in frameDict) frameTotal += kv.Value;
             return frameTotal;
         }
 
@@ -556,6 +866,18 @@ namespace PerfLint.Runtime
         ///     so looking at self alone would attribute the spike to library internals and never point to user code. This step automates the Profiler's "Hierarchy sorted by Total".
         /// totalSelfMs is this frame's total self-time.
         /// </summary>
+        // Diagnostic: top-N self-time markers of the current _frameDict WITHOUT the framework-noise filter — reveals whether a spike's main-thread
+        // time is actually in wait/GC/engine markers (which SnapshotWorstFrame drops), explaining "no user hotspot" attributions.
+        private static string RawTopSelfLeaders(int n)
+        {
+            var ranked = new List<KeyValuePair<string, double>>(_frameDict);
+            ranked.Sort((a, b) => b.Value.CompareTo(a.Value));
+            var parts = new List<string>();
+            for (int i = 0; i < ranked.Count && i < n; i++)
+                parts.Add($"{CleanMarkerName(ranked[i].Key)} {ranked[i].Value:0.0}ms");
+            return string.Join(" · ", parts);
+        }
+
         private static WorstFrameInfo SnapshotWorstFrame(HierarchyFrameDataView frame, double totalSelfMs)
         {
             const int TopN = 4;
@@ -589,41 +911,114 @@ namespace PerfLint.Runtime
             var path = new List<CallPathFrame>();
             if (frame == null || !frame.valid) return path;
 
-            double threshold = frameTotalMs * 0.20; // Follow only the trunk that "carries the bulk of this frame"
+            double threshold = frameTotalMs * 0.10; // Follow the trunk that carries the bulk of this frame — 10% (not 20%) so the drill reaches deeper mappable methods (e.g. A* / user helpers) when a spike's work splits across children instead of dead-ending at an async/BCL node
             var childBuf = new List<int>(64);
             int node = frame.GetRootItemID();
             int guard = 0;
 
             while (node != -1 && guard++ < 1024)
             {
-                double total = frame.GetItemColumnDataAsFloat(node, HierarchyFrameDataView.columnTotalTime);
-                if (total < threshold) break; // The trunk has thinned to insignificance, stop
-
+                // Record this node if it's a heavy, mappable method. Crucially, do NOT break on the CURRENT node's total: the synthetic
+                // root (GetRootItemID) and container nodes (PlayerLoop / thread group) commonly report Total == 0, so a "break when
+                // total < threshold" here aborted the drill on the very first iteration — which is why attribution never surfaced a
+                // script. We descend regardless and only stop when the heaviest CHILD falls below the threshold (the real trunk end).
                 string name = frame.GetItemName(node);
                 if (!string.IsNullOrEmpty(name))
                 {
-                    string display = CleanMarkerName(name);
-                    if (!IsFrameworkNoise(display))
+                    double total = frame.GetItemColumnDataAsFloat(node, HierarchyFrameDataView.columnTotalTime);
+                    if (total >= threshold)
                     {
-                        string script = ResolveScriptPathCached(name);
-                        if (!string.IsNullOrEmpty(script))
-                            path.Add(new CallPathFrame(display, total, script));
+                        string display = CleanMarkerName(name);
+                        if (!IsFrameworkNoise(display))
+                        {
+                            string script = ResolveScriptPathCached(name);
+                            if (!string.IsNullOrEmpty(script))
+                            {
+                                double gc = _gcColumn >= 0 ? frame.GetItemColumnDataAsFloat(node, _gcColumn) : 0; // bytes allocated in this method's subtree
+                                path.Add(new CallPathFrame(display, total, script, gc));
+                            }
+                        }
                     }
                 }
 
-                // Drill down to the child with the largest Total
+                // Drill down to the child with the largest Total; stop once the trunk thins below the threshold.
                 if (!frame.HasItemChildren(node)) break;
                 childBuf.Clear();
                 frame.GetItemChildren(node, childBuf);
                 int best = -1; double bestTotal = -1;
                 for (int i = 0; i < childBuf.Count; i++)
                 {
+                    // EditorLoop is the editor's own per-frame overhead (huge under Deep Profile) — never game code. Skipping it as a drill target keeps the
+                    // trunk on PlayerLoop (the game); otherwise, on a spike frame whose EditorLoop dwarfs PlayerLoop, the drill dead-ends in editor internals.
+                    if (frame.GetItemName(childBuf[i]) == "EditorLoop") continue;
                     double t = frame.GetItemColumnDataAsFloat(childBuf[i], HierarchyFrameDataView.columnTotalTime);
                     if (t > bestTotal) { bestTotal = t; best = childBuf[i]; }
                 }
+                if (best == -1 || bestTotal < threshold) break;
                 node = best;
             }
             return path;
+        }
+
+        // Attribute this frame's GC allocation to a user script: drill the heaviest-GC trunk (skip EditorLoop) and record the deepest USER (non-package)
+        // method whose subtree GC carries the bulk of the frame's allocation. Called on ALL merged frames (steady + spike) — RUN.GC001 then points to the
+        // heaviest per-frame allocator the session actually measured (typically the level-gen methods that allocate MBs), which is what users want to open.
+        private const double GcAttributeFloor = 4096; // ignore trivial per-frame allocations when attributing; also the drill's stop threshold
+        private static void AccumulateGcByScript(HierarchyFrameDataView frame, Dictionary<string, double> gcByScript, Dictionary<string, string> gcMethodByScript)
+        {
+            if (_gcColumn < 0) return;
+            // Drill by heaviest-GC child (skip EditorLoop), recording the deepest USER (non-package) method with meaningful GC. NOTE: do NOT gate on the
+            // root node's GC — the synthetic root (like its Total time) reports 0, which previously made this return immediately and left GC001 unattributed.
+            int node = frame.GetRootItemID();
+            var childBuf = new List<int>(64);
+            int guard = 0;
+            string deepScript = null, deepMethod = null; double deepGc = 0;
+            while (node != -1 && guard++ < 1024)
+            {
+                string name = frame.GetItemName(node);
+                if (!string.IsNullOrEmpty(name))
+                {
+                    double gc = frame.GetItemColumnDataAsFloat(node, _gcColumn);
+                    if (gc >= GcAttributeFloor)
+                    {
+                        string display = CleanMarkerName(name);
+                        if (!IsFrameworkNoise(display))
+                        {
+                            string script = ResolveScriptPathCached(name);
+                            if (!string.IsNullOrEmpty(script) && !IsPackagePath(script)) { deepScript = script; deepMethod = display; deepGc = gc; }
+                        }
+                    }
+                }
+                if (!frame.HasItemChildren(node)) break;
+                childBuf.Clear();
+                frame.GetItemChildren(node, childBuf);
+                int best = -1; double bestGc = -1;
+                for (int i = 0; i < childBuf.Count; i++)
+                {
+                    if (frame.GetItemName(childBuf[i]) == "EditorLoop") continue; // editor/Deep-Profile overhead, not game allocation
+                    double g = frame.GetItemColumnDataAsFloat(childBuf[i], _gcColumn);
+                    if (g > bestGc) { bestGc = g; best = childBuf[i]; }
+                }
+                if (best == -1 || bestGc < GcAttributeFloor) break;
+                node = best;
+            }
+            if (deepScript != null)
+            {
+                // Keep the PEAK single-frame allocation per script (not a sum) — reporting "up to ~X in a frame" is honest whether the allocation is steady or bursty.
+                gcByScript.TryGetValue(deepScript, out var prevPeak);
+                if (deepGc > prevPeak) { gcByScript[deepScript] = deepGc; gcMethodByScript[deepScript] = deepMethod; }
+            }
+        }
+
+        /// <summary>Pick the heaviest per-frame GC allocator measured (peak single-frame bytes). Returns null if none reaches a meaningful amount / GC column unavailable.</summary>
+        private static GcAllocSite BuildTopGcSite(Dictionary<string, double> gcByScript, Dictionary<string, string> gcMethodByScript)
+        {
+            if (gcByScript.Count == 0) return null;
+            string topScript = null; double topPeak = 0;
+            foreach (var kv in gcByScript) if (kv.Value > topPeak) { topPeak = kv.Value; topScript = kv.Key; }
+            if (topScript == null || topPeak < 4096) return null; // not a meaningful allocator → GC001 falls back to the static Script GC panel
+            gcMethodByScript.TryGetValue(topScript, out var method);
+            return new GcAllocSite(topScript, method, topPeak); // BytesPerFrame carries the PEAK single-frame allocation
         }
 
         private static string ResolveScriptPathCached(string marker)
@@ -737,7 +1132,7 @@ namespace PerfLint.Runtime
 
         public void Dispose()
         {
-            EditorApplication.update -= GpuTick; // Defensive: the callback must also be removed when Dispose is called directly without Stop
+            EditorApplication.update -= EditorFrameTick; // Defensive: the callback must also be removed when Dispose is called directly without Stop
             DisposeChannels();
             if (_running)
             {

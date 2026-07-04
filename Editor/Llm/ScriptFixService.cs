@@ -43,6 +43,57 @@ namespace PerfLint.Llm
     {
         private const int Context = 24;
 
+        // ── Deterministic rename fast path ─────────────────────────────────────────────────────────
+        // Pure rename migrations (same arguments, same call shape) don't need an LLM at all: the model may not
+        // even KNOW the replacement API when it's newer than its training data (real case: deepseek-flash had no
+        // knowledge of GetEntityId — Unity 6.5's GetInstanceID replacement — and produced nothing applicable).
+        // For rules registered here, Propose skips the LLM and builds the proposal locally: zero tokens, zero
+        // hallucination risk, instant, nothing ever sent — then reuses the exact same diff/apply/verify/rollback
+        // pipeline. Kept here (not on the scanner's rule table) so it works even when findings are restored from
+        // disk before any scanner type initializes.
+        //
+        // ADMISSION BAR (learned the hard way): "rename-only" must hold for the RETURN VALUE'S CONSUMERS too,
+        // not just the call shape. GetInstanceID→GetEntityId was admitted and then evicted: on Unity 6000.5 the
+        // EntityId→int implicit operator is itself error-level obsolete, so every call site that stores the
+        // result in an int fails CS0619 after the swap — the receiving types must migrate with it (structural).
+        // The compile-verify + rollback net caught it; the entry bar now includes tracing where the value flows.
+        internal static readonly Dictionary<string, (string from, string to)> DeterministicRenames =
+            new Dictionary<string, (string, string)>
+            {
+                // (empty for now — GetInstanceID was evicted, see above; add only true renames whose value flow is unchanged)
+            };
+
+        /// <summary>Whether this rule's fix is a deterministic local rename (no LLM call, nothing sent).</summary>
+        public static bool IsDeterministic(string ruleId) =>
+            ruleId != null && DeterministicRenames.ContainsKey(ruleId);
+
+        /// <summary>
+        /// Build a rename proposal locally: replace the token (word-bounded) on the flagged line only.
+        /// Returns a NoChange proposal when the token isn't on that line (stale finding) — honest, not a guess.
+        /// </summary>
+        internal static ScriptFixProposal ProposeRename(Finding f, string from, string to)
+        {
+            var lines = ReadLines(f.CodeFile);
+            if (lines == null)
+                return new ScriptFixProposal { Ok = false, Error = L.Tr("Failed to read the source file.", "读取源文件失败。"), FilePath = f.CodeFile };
+
+            int idx = Clamp(f.CodeLine - 1, 0, lines.Length - 1);
+            string flagged = lines[idx];
+            string fixedLine = Regex.Replace(flagged, @"\b" + Regex.Escape(from) + @"\b", to);
+
+            var p = new ScriptFixProposal
+            {
+                Ok = true,
+                Original = flagged,
+                Fixed = fixedLine,
+                FilePath = f.CodeFile,
+                ExpectedLine = f.CodeLine,
+                NoChange = fixedLine == flagged
+            };
+            p.Locatable = !p.NoChange; // original IS the current file line, so it always locates
+            return p;
+        }
+
         private const string SystemPrompt =
             "你是资深 Unity 工程师。用户给你一段 C# 代码窗口、被标记的行与【规则说明】。请严格按规则说明，" +
             "对被标记处做最小改动的修复（可能是性能优化，也可能是 API 迁移/改名，如 FindObjectOfType→FindAnyObjectByType），" +
@@ -100,6 +151,13 @@ namespace PerfLint.Llm
 
         public static void Propose(Finding f, Action<ScriptFixProposal> onDone)
         {
+            // Deterministic rename rules: build locally, never call the LLM (see DeterministicRenames).
+            if (f.RuleId != null && DeterministicRenames.TryGetValue(f.RuleId, out var rename))
+            {
+                onDone(ProposeRename(f, rename.from, rename.to));
+                return;
+            }
+
             var lines = ReadLines(f.CodeFile);
             if (lines == null)
             {
@@ -700,8 +758,8 @@ namespace PerfLint.Llm
             return -1;
         }
 
-        /// <summary>In code with comments/strings already masked out, whether ()[]{} are balanced.</summary>
-        private static bool BracketsBalanced(string maskedCode)
+        /// <summary>In code with comments/strings already masked out, whether ()[]{} are balanced. (Shared with MigrateService's whole-file guards.)</summary>
+        internal static bool BracketsBalanced(string maskedCode)
         {
             int paren = 0, brack = 0, brace = 0;
             foreach (char c in maskedCode)
@@ -767,8 +825,9 @@ namespace PerfLint.Llm
         /// Return a copy of equal length to text, replacing the contents (including delimiters) of comments, strings, and character literals with spaces (newlines preserved).
         /// Covers: line/block comments, regular strings (\ escapes), verbatim strings @"…" ("" escapes), interpolated strings $"…" (their internally balanced {} are masked too, so they don't affect class-body brace matching).
         /// This way the masked text retains only the "code" braces and class keywords, with indices mapping 1:1 to the original.
+        /// (Shared with MigrateService's whole-file guards.)
         /// </summary>
-        private static string MaskNonCode(string text)
+        internal static string MaskNonCode(string text)
         {
             var a = text.ToCharArray();
             int n = a.Length, i = 0;

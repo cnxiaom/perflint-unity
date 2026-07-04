@@ -32,6 +32,10 @@ namespace PerfLint.UI
         private ScrollView _results;
         private RuntimeProfileResult _lastResult;
         private List<Finding> _lastFindings;
+        // Files whose LAST static scan has a line-level allocation/GC finding (PERF.GC* / PERF.UPD*). The runtime "Line-level analysis" button only appears
+        // for a finding whose script is in this set — otherwise the jump would land on the static panel and surface unrelated findings (e.g. a Debug.Log) or
+        // an empty view. Rebuilt from the persisted scan at each RenderResults.
+        private HashSet<string> _gcRelevantFiles;
         private IVisualElementScheduledItem _poll;
 
         [MenuItem("Tools/PerfLint/Runtime Profiler %#k")] // Ctrl/Cmd + Shift + K
@@ -129,6 +133,10 @@ namespace PerfLint.UI
             headerCard.Add(_liveLabel);
             root.Add(headerCard);
 
+            // Mipmap Streaming tuning deck (collapsed by default): live "saving ~X MB" readout + the streaming
+            // parameters SRP gives you no debug view for. Companion to the static PERF.TEXSTR001 advisor.
+            root.Add(TextureStreamingSection.Build());
+
             _results = new ScrollView(ScrollViewMode.Vertical) { style = { flexGrow = 1 } };
             root.Add(_results);
 
@@ -187,9 +195,9 @@ namespace PerfLint.UI
             _results.Clear();
 
             _sampler.BeginHotspots(
-                onComplete: (hotspots, worstFrame, gpuFrameTimeNs, ok) =>
+                onComplete: (hotspots, worstFrames, gpuFrameTimeNs, ok) =>
                 {
-                    _lastResult   = _lastResult.WithHotspots(hotspots, ok, worstFrame, gpuFrameTimeNs);
+                    _lastResult   = _lastResult.WithHotspots(hotspots, ok, worstFrames, gpuFrameTimeNs, _sampler.LastGcSite);
                     _lastFindings = RuntimeAnalyzer.Analyze(_lastResult);
                     _toggleButton.SetEnabled(true);
                     RefreshState();
@@ -309,6 +317,8 @@ namespace PerfLint.UI
                 return;
             }
 
+            _gcRelevantFiles = LoadGcRelevantFiles(); // gate the "Line-level analysis" button to files that actually have allocation/GC static findings
+
             // Render in descending order of severity.
             var ordered = _lastFindings
                 .OrderByDescending(f => f.Severity)
@@ -395,14 +405,19 @@ namespace PerfLint.UI
                 style = { unityFontStyleAndWeight = FontStyle.Bold, flexGrow = 1, whiteSpace = WhiteSpace.Normal, fontSize = 12 }
             });
 
-            if (f.Ping != null)
+            // GC001's fallback Locate (no runtime function attributed → jumps to the static Script GC panel) is only useful when that scan actually has
+            // allocation findings. When it doesn't, suppress the button — the detail already guides to the scan panel / Unity Profiler instead of a dead-end.
+            bool suppressLocate = f.RuleId == "RUN.GC001" && string.IsNullOrEmpty(f.TargetPath) &&
+                                  (_gcRelevantFiles == null || _gcRelevantFiles.Count == 0);
+            if (f.Ping != null && !suppressLocate)
             {
                 var locate = new Button(() => f.Ping()) { text = "Locate" };
                 locate.style.marginLeft = 4;
                 titleRow.Add(locate);
             }
-            // Map hotspot to script: run line-level GC/Roslyn analysis + AI Fix in the static panel (runtime → static fix chain).
-            if (!string.IsNullOrEmpty(f.CodeFile))
+            // Map hotspot to script: run line-level GC/Roslyn analysis + AI Fix in the static panel (runtime → static fix chain). Only offered when the last
+            // static scan actually found an allocation/GC line issue in that file — otherwise the jump would surface unrelated findings (e.g. a Debug.Log).
+            if (!string.IsNullOrEmpty(f.CodeFile) && _gcRelevantFiles != null && _gcRelevantFiles.Contains(f.CodeFile.Replace('\\', '/')))
             {
                 var analyze = new Button(() => OpenScriptInMainPanel(f.CodeFile)) { text = L.Tr("Line-level analysis", "逐行分析") };
                 analyze.style.marginLeft = 4;
@@ -593,6 +608,43 @@ namespace PerfLint.UI
         {
             var win = PerfLintWindow.OpenWindow();
             win.FocusOnScript(scriptPath);
+        }
+
+        // Build the set of scripts that the LAST static scan flagged with a line-level allocation/GC finding (PERF.GC* / PERF.UPD* — the same family the
+        // static "Script GC / per-frame allocation" view targets). Best-effort from the persisted scan; on any failure the set is empty and the button hides.
+        private static HashSet<string> LoadGcRelevantFiles()
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                var restored = PerfLint.Core.ScanResultStore.Load();
+                var findings = restored?.Result?.Findings;
+                if (findings != null)
+                    foreach (var f in findings)
+                    {
+                        if (!IsAllocationRule(f.RuleId)) continue;
+                        string file = FileOfFinding(f);
+                        if (!string.IsNullOrEmpty(file)) set.Add(file);
+                    }
+            }
+            catch { /* best-effort — no button rather than a wrong one */ }
+            return set;
+        }
+
+        private static bool IsAllocationRule(string ruleId) =>
+            !string.IsNullOrEmpty(ruleId) &&
+            (ruleId.StartsWith("PERF.GC", StringComparison.Ordinal) || ruleId.StartsWith("PERF.UPD", StringComparison.Ordinal));
+
+        // A static finding's .cs file, from CodeFile or a "Assets/X.cs:line" TargetPath (report-style rules like PERF.GC004 carry the location in TargetPath, not CodeFile).
+        private static string FileOfFinding(Finding f)
+        {
+            if (!string.IsNullOrEmpty(f.CodeFile)) return f.CodeFile.Replace('\\', '/');
+            string tp = f.TargetPath;
+            if (string.IsNullOrEmpty(tp)) return null;
+            tp = tp.Replace('\\', '/');
+            int colon = tp.LastIndexOf(':');
+            if (colon > 1 && tp.Substring(0, colon).EndsWith(".cs", StringComparison.Ordinal)) return tp.Substring(0, colon);
+            return tp.EndsWith(".cs", StringComparison.Ordinal) ? tp : null;
         }
 
         /// <summary>Set all four border-side colors at once (UIElements inline style has no single 'borderColor' shorthand).</summary>

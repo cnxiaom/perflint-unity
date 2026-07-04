@@ -15,6 +15,7 @@ namespace PerfLint.Runtime
         public double Min { get; }
         public double Max { get; }
         public double P95 { get; }
+        public double Median { get; }  // P50 — the robust "sustained" value; a one-off freeze inflates Avg/P95 but barely moves the median
         public double First { get; }   // Value at the first frame of the window (used for trend/leak detection)
         public double Last { get; }    // Value at the last frame of the window
         public double FirstHalfAvg { get; }  // Average of the first half
@@ -74,6 +75,7 @@ namespace PerfLint.Runtime
             int idx = (int)Math.Ceiling(0.95 * sorted.Count) - 1;
             idx = Math.Min(Math.Max(idx, 0), sorted.Count - 1);
             P95 = sorted[idx];
+            Median = sorted[sorted.Count / 2];
         }
     }
 
@@ -122,9 +124,10 @@ namespace PerfLint.Runtime
         public readonly string Marker;     // Clean display name (module prefix already stripped)
         public readonly double TotalMs;    // Total cost including children (ms)
         public readonly string ScriptPath; // The .cs this maps to (may be a user script or a third-party package script)
-        public CallPathFrame(string marker, double totalMs, string scriptPath)
+        public readonly double GcBytes;    // GC allocated within this node's subtree (bytes) — attributes a spike's allocations to the method; 0 if unavailable
+        public CallPathFrame(string marker, double totalMs, string scriptPath, double gcBytes = 0)
         {
-            Marker = marker; TotalMs = totalMs; ScriptPath = scriptPath;
+            Marker = marker; TotalMs = totalMs; ScriptPath = scriptPath; GcBytes = gcBytes;
         }
     }
 
@@ -153,6 +156,18 @@ namespace PerfLint.Runtime
             TotalSelfMs = totalSelfMs;
             TopMarkers = topMarkers ?? Array.Empty<MarkerCost>();
             UserCallPath = userCallPath ?? Array.Empty<CallPathFrame>();
+        }
+    }
+
+    /// <summary>The runtime script that allocated the most managed memory per steady-state frame — attributes RUN.GC001 to a real runtime function (e.g. its Locate target), instead of the static "Script GC" panel. May be null.</summary>
+    public sealed class GcAllocSite
+    {
+        public string ScriptPath { get; }
+        public string Method { get; }
+        public double BytesPerFrame { get; }
+        public GcAllocSite(string scriptPath, string method, double bytesPerFrame)
+        {
+            ScriptPath = scriptPath; Method = method; BytesPerFrame = bytesPerFrame;
         }
     }
 
@@ -191,8 +206,21 @@ namespace PerfLint.Runtime
         /// <summary>Batching snapshot of the active scene at sampling time (material topology / runtime instantiation). Used for root-cause analysis of batching issues.</summary>
         public SceneBatchingSnapshot SceneBatching { get; }
 
-        /// <summary>Attribution for the single slowest frame (computed asynchronously alongside Hotspots). May be null/no-data. Used by RUN.FPS003 to locate the root cause of single-frame spikes.</summary>
-        public WorstFrameInfo WorstFrame { get; }
+        /// <summary>
+        /// Attribution for the worst spike frames — ONE per distinct culprit (script+method), ranked by cost. A level-generation freeze is a cluster of
+        /// heavy frames across several phases (PlaceObstaclesAsync / AllVehiclesHavePaths / …), not a single frame; RUN.FPS003 emits one finding per entry.
+        /// May be null/empty (computed asynchronously alongside Hotspots).
+        /// </summary>
+        public IReadOnlyList<WorstFrameInfo> WorstFrames { get; }
+
+        /// <summary>The single worst spike frame (highest-ranked culprit), or null. Convenience over WorstFrames[0].</summary>
+        public WorstFrameInfo WorstFrame => WorstFrames != null && WorstFrames.Count > 0 ? WorstFrames[0] : null;
+
+        /// <summary>Top steady-state per-frame GC allocator (runtime attribution for RUN.GC001), or null when none dominant / GC column unavailable.</summary>
+        public GcAllocSite TopGcSite { get; }
+
+        /// <summary>Per-object-category counters over the sampling window (e.g. "GameObject Count", "Texture Memory") — used by RUN.MEM003 to name which category of objects/assets grew (leak-suspect: not destroyed). May be null; individual entries may have no data on unsupported platforms.</summary>
+        public IReadOnlyDictionary<string, MetricStats> CategoryCounters { get; }
 
         public RuntimeProfileResult(
             double durationSeconds,
@@ -213,7 +241,9 @@ namespace PerfLint.Runtime
             bool hotspotsAvailable,
             bool wasDeepProfile = false,
             SceneBatchingSnapshot sceneBatching = null,
-            WorstFrameInfo worstFrame = null)
+            IReadOnlyList<WorstFrameInfo> worstFrames = null,
+            GcAllocSite topGcSite = null,
+            IReadOnlyDictionary<string, MetricStats> categoryCounters = null)
         {
             DurationSeconds = durationSeconds;
             FrameCount = frameCount;
@@ -233,7 +263,9 @@ namespace PerfLint.Runtime
             HotspotsAvailable = hotspotsAvailable;
             WasDeepProfile = wasDeepProfile;
             SceneBatching = sceneBatching ?? SceneBatchingSnapshot.Empty;
-            WorstFrame = worstFrame;
+            WorstFrames = worstFrames;
+            TopGcSite = topGcSite;
+            CategoryCounters = categoryCounters;
         }
 
         /// <summary>
@@ -242,14 +274,20 @@ namespace PerfLint.Runtime
         /// (same source as the Profiler "GPU ms" column) is more reliable than what ProfilerRecorder/FrameTimingManager captured during sampling, so it takes priority.
         /// </summary>
         public RuntimeProfileResult WithHotspots(
-            IReadOnlyList<Hotspot> hotspots, bool hotspotsAvailable, WorstFrameInfo worstFrame = null,
-            MetricStats gpuOverride = null) =>
+            IReadOnlyList<Hotspot> hotspots, bool hotspotsAvailable, IReadOnlyList<WorstFrameInfo> worstFrames = null,
+            MetricStats gpuOverride = null, GcAllocSite topGcSite = null) =>
             new RuntimeProfileResult(
                 DurationSeconds, FrameCount, FrameTimeNs, GcPerFrameBytes, TotalMemoryBytes,
                 TotalReservedBytes, GcUsedBytes, GfxUsedBytes,
                 DrawCalls, SetPassCalls, Batches, Triangles, Vertices,
                 (gpuOverride != null && gpuOverride.HasData) ? gpuOverride : GpuFrameTimeNs,
-                hotspots, hotspotsAvailable, WasDeepProfile, SceneBatching, worstFrame);
+                hotspots, hotspotsAvailable, WasDeepProfile, SceneBatching, worstFrames, topGcSite, CategoryCounters);
+
+        /// <summary>Convenience overload: a single worst frame → a one-item list. Used by tests and simple callers.</summary>
+        public RuntimeProfileResult WithHotspots(
+            IReadOnlyList<Hotspot> hotspots, bool hotspotsAvailable, WorstFrameInfo worstFrame,
+            MetricStats gpuOverride = null) =>
+            WithHotspots(hotspots, hotspotsAvailable, worstFrame != null ? new[] { worstFrame } : null, gpuOverride);
 
         /// <summary>Average FPS derived from main-thread frame time; returns 0 when no data is available.</summary>
         public double AverageFps =>

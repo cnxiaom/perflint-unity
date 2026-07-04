@@ -24,6 +24,7 @@ namespace PerfLint.Runtime
             Stutter(r, findings);
             GcPerFrame(r, findings);
             MemoryTrend(r, findings);
+            GraphicsMemory(r, findings);
             DrawCallsAndSetPass(r, findings);
             GpuBound(r, findings);
             TriangleDensity(r, findings);
@@ -39,28 +40,31 @@ namespace PerfLint.Runtime
             var ft = r.FrameTimeNs;
             if (ft == null || !ft.HasData) return;
 
-            double avgMs = ft.Avg / 1_000_000.0;
-            double fps = r.AverageFps;
+            // Use the MEDIAN (sustained) frame time, not the mean: a one-off level-gen/loading freeze inflates the mean (e.g. to "33 FPS") while the game
+            // actually runs at 100 FPS steady-state. FPS001 is about *sustained* low frame rate; the catastrophic freezes are reported separately by FPS003.
+            double medMs = ft.Median / 1_000_000.0;
+            if (medMs <= 0) return;
+            double fps = 1000.0 / medMs;
 
-            if (avgMs > 33.3) // < 30 FPS
+            if (medMs > 33.3) // < 30 FPS sustained
             {
                 findings.Add(new Finding(
                     ruleId: "RUN.FPS001",
                     domain: Domain.Runtime,
                     severity: Severity.Critical,
-                    title: L.Tr($"Low runtime frame rate: avg {fps:0} FPS (main thread {avgMs:0.0} ms/frame)", $"运行时帧率偏低：平均 {fps:0} FPS（主线程 {avgMs:0.0} ms/帧）"),
-                    detail: L.Tr($"Average main-thread frame time during sampling was {avgMs:0.0} ms (~{fps:0} FPS), below 30 FPS. ", $"采样期间主线程平均帧时间 {avgMs:0.0} ms（约 {fps:0} FPS），低于 30 FPS。") +
+                    title: L.Tr($"Low sustained frame rate: median {fps:0} FPS (main thread {medMs:0.0} ms/frame)", $"运行时持续帧率偏低：中位 {fps:0} FPS（主线程 {medMs:0.0} ms/帧）"),
+                    detail: L.Tr($"The median main-thread frame time during sampling was {medMs:0.0} ms (~{fps:0} FPS), below 30 FPS — a sustained slowdown, not a one-off spike. ", $"采样期间主线程中位帧时间 {medMs:0.0} ms（约 {fps:0} FPS），低于 30 FPS——是持续性偏慢，而非一次性尖刺。") +
                             L.Tr("The main thread is the bottleneck. Expand the \"CPU Hotspots\" below to find the most expensive methods, then optimize line by line with the script GC analysis in the main panel. ", "主线程是瓶颈所在域。展开下方「CPU 热点」定位最耗时的方法，并结合主面板的脚本 GC 分析逐行优化。") +
                             L.Tr("(Your frame-rate target depends on your platform; mobile typically aims for 30/60 FPS.)", "（帧率目标取决于你的目标平台，移动端通常以 30/60 FPS 为线。）")));
             }
-            else if (avgMs > 22.2) // < 45 FPS
+            else if (medMs > 22.2) // < 45 FPS sustained
             {
                 findings.Add(new Finding(
                     ruleId: "RUN.FPS001",
                     domain: Domain.Runtime,
                     severity: Severity.Warning,
-                    title: L.Tr($"Moderate runtime frame rate: avg {fps:0} FPS (main thread {avgMs:0.0} ms/frame)", $"运行时帧率中等：平均 {fps:0} FPS（主线程 {avgMs:0.0} ms/帧）"),
-                    detail: L.Tr($"Average main-thread frame time during sampling was {avgMs:0.0} ms (~{fps:0} FPS). If you target 60 FPS and need more headroom, ", $"采样期间主线程平均帧时间 {avgMs:0.0} ms（约 {fps:0} FPS）。若目标 60 FPS 仍有余量需优化，") +
+                    title: L.Tr($"Moderate sustained frame rate: median {fps:0} FPS (main thread {medMs:0.0} ms/frame)", $"运行时持续帧率中等：中位 {fps:0} FPS（主线程 {medMs:0.0} ms/帧）"),
+                    detail: L.Tr($"The median main-thread frame time during sampling was {medMs:0.0} ms (~{fps:0} FPS). If you target 60 FPS and need more headroom, ", $"采样期间主线程中位帧时间 {medMs:0.0} ms（约 {fps:0} FPS）。若目标 60 FPS 仍有余量需优化，") +
                             L.Tr("expand the \"CPU Hotspots\" below to find the main cost centers.", "可展开下方「CPU 热点」定位主要耗时点。")));
             }
         }
@@ -74,8 +78,12 @@ namespace PerfLint.Runtime
             double p95Ms = ft.P95 / 1_000_000.0;
             double maxMs = ft.Max / 1_000_000.0;
 
-            // Stutter signal: p95 is notably above the average (long-tail spike), and p95 itself is slow enough. Distinct from the "sustained low frame rate" problem.
-            if (p95Ms > 33.3 && p95Ms >= avgMs * 1.8)
+            // A catastrophic single-frame freeze is present (FPS003 reports it in detail, per culprit, below). When so, suppress the coarser FPS002 — its
+            // p95 just restates the same freeze cluster and adds noise. (FPS001 already uses the median, so a freeze can't drag it into a false "slow game".)
+            bool catastrophic = maxMs >= 100.0 && maxMs >= p95Ms * 3.0 && maxMs >= avgMs * 4.0;
+
+            // Stutter signal: p95 notably above average (long-tail), p95 itself slow enough. Distinct from sustained low frame rate; suppressed when FPS003 covers it.
+            if (p95Ms > 33.3 && p95Ms >= avgMs * 1.8 && !catastrophic)
             {
                 findings.Add(new Finding(
                     ruleId: "RUN.FPS002",
@@ -86,115 +94,219 @@ namespace PerfLint.Runtime
                             L.Tr("Common causes: per-frame/bursty GC collections, synchronous asset loading, instantiation spikes. First check below for a \"per-frame GC allocation\" warning.", "常见成因：每帧/突发 GC 回收、资源同步加载、实例化峰值。先看下方是否有「每帧 GC 分配」告警。")));
             }
 
-            // Catastrophic single-frame spike: max far exceeds p95 (an isolated frame, not a long tail) and the absolute value has reached the level of a player-perceptible freeze.
-            // p95 deliberately ignores single-point outliers, so a one-off "689 ms freeze" like this would slip through FPS002 — this check covers it separately.
-            // Triple criterion: absolute value ≥100 ms (perceptible freeze) + ≥3×p95 (genuinely an outlier, not just generally slow) + ≥4× the average.
-            if (maxMs >= 100.0 && maxMs >= p95Ms * 3.0 && maxMs >= avgMs * 4.0)
+            // Single-frame spike(s): max far exceeds p95 (outliers, not a long tail) and reaches a player-perceptible freeze. p95 ignores single-point
+            // outliers, so these slip through FPS002 — covered here per culprit. The triple criterion (`catastrophic`, above) gates whether to report at all.
+            if (!catastrophic) return;
+
+            string deepNote = r.WasDeepProfile
+                ? L.Tr("(Note: Deep Profile inflates frame times across the board, so absolute milliseconds run high; but the spike's deviation relative to p95/average is still real. Re-test on device to confirm the magnitude.)", "（注意：Deep Profile 会整体放大帧时间，绝对毫秒数偏高；但它相对 p95/均值的离群程度仍真实，建议真机复测确认量级。）")
+                : "";
+
+            // A level-gen freeze is a CLUSTER of heavy frames across several phases (PlaceObstaclesAsync / AllVehiclesHavePaths / …), not one frame.
+            // RuntimeSampler aggregates spike frames by culprit (script+method); emit ONE finding per culprit, ranked by cost, each with its own Locate.
+            var frames = r.WorstFrames;
+            if (frames == null || frames.Count == 0)
             {
-                Severity sev = maxMs >= 500.0 ? Severity.Critical : Severity.Warning;
-                string deepNote = r.WasDeepProfile
-                    ? L.Tr("(Note: Deep Profile inflates frame times across the board, so absolute milliseconds run high; but the spike's deviation relative to p95/average is still real. Re-test on device to confirm the magnitude.)", "（注意：Deep Profile 会整体放大帧时间，绝对毫秒数偏高；但它相对 p95/均值的离群程度仍真实，建议真机复测确认量级。）")
-                    : "";
+                findings.Add(BuildSpikeFinding(null, maxMs, avgMs, p95Ms, deepNote, "", couldntCapture: false));
+                return;
+            }
 
-                // Attribution: two complementary clues (see RuntimeSampler.SnapshotWorstFrame).
-                //  - Top self-time entries: where time ultimately lands in leaf functions (often engine/third-party library leaves).
-                //  - The script entry point on the heaviest call path: "which of your code" triggered it — self-time always lands in leaves and can't point to user scripts;
-                //    you must drill down the main trunk by Total (including children) for it to surface (equivalent to sorting by Total in the Profiler's Hierarchy view).
-                string attribution = "";
-                string culpritScript = null;  // The user script (not a third-party package) that triggered the spike, used to attach Locate
-                string culpritMethod = null;  // The culprit method name, so Locate can jump to the declaration line when opening the script
-                bool offerLineAnalysis = false; // Whether to offer "line-level analysis / AI Fix" — only meaningful when the heavy work is genuinely inside a user script
-                var wf = r.WorstFrame;
-                if (wf != null && wf.HasData)
+            // Keep only frames whose CULPRIT is itself a genuine freeze (by its own inclusive Total, not the EditorLoop-inflated frame total) — this filters
+            // red-herrings like a 50ms log call that merely rode on a high-overhead frame, and keeps ranking honest so a real 363ms phase isn't displaced.
+            double floor = System.Math.Max(100.0, avgMs * 3.0);
+            // Keep only frames that (a) are themselves a genuine freeze (by culprit Total, not the EditorLoop-inflated frame total) AND (b) we can attribute to a
+            // script. An unattributable spike (an EditorLoop/Deep-Profile artifact frame with no user/package method on its path) is pure noise once we have real
+            // culprits — drop it. Only when NOTHING attributes do we emit a single honest "couldn't capture" pointer.
+            var attributed = new List<WorstFrameInfo>();
+            foreach (var wf in frames)
+            {
+                if (wf == null || !wf.HasData || SpikeDisplayMs(wf) < floor) continue;
+                if (wf.UserCallPath != null && wf.UserCallPath.Count > 0) attributed.Add(wf);
+            }
+
+            if (attributed.Count == 0)
+            {
+                // A spike happened (gate passed) but no frame could be attributed to a script → be honest rather than misattribute.
+                findings.Add(BuildSpikeFinding(null, maxMs, avgMs, p95Ms, deepNote, "", couldntCapture: true));
+                return;
+            }
+
+            const int MaxSpikeFindings = 4;
+            for (int i = 0; i < attributed.Count && i < MaxSpikeFindings; i++)
+            {
+                // On the first (worst) finding, if there are more culprits than we show, name the overflow so nothing is silently dropped.
+                string extra = "";
+                if (i == 0 && attributed.Count > MaxSpikeFindings)
                 {
-                    string selfLeaders = "";
-                    if (wf.TopMarkers.Count > 0)
+                    var more = new List<string>();
+                    for (int j = MaxSpikeFindings; j < attributed.Count && more.Count < 6; j++)
+                        more.Add(SpikeCulpritShort(attributed[j]) ?? L.Tr($"{SpikeDisplayMs(attributed[j]):0} ms frame", $"{SpikeDisplayMs(attributed[j]):0} ms 帧"));
+                    extra = L.Tr($"\n\nThis window had {attributed.Count} distinct spiking culprits; showing the top {MaxSpikeFindings} by cost. Others: {string.Join(", ", more)}.", $"\n\n本窗口共 {attributed.Count} 个不同尖刺来源，仅列耗时前 {MaxSpikeFindings} 个。其余：{string.Join("、", more)}。");
+                }
+                findings.Add(BuildSpikeFinding(attributed[i], SpikeDisplayMs(attributed[i]), avgMs, p95Ms, deepNote, extra, couldntCapture: false));
+            }
+        }
+
+        /// <summary>The culprit's game-relevant magnitude (ms): deepest USER method's inclusive Total; else deepest PACKAGE method's Total; else the frame self-total. Mirrors RuntimeSampler.CulpritMagnitude.</summary>
+        private static double SpikeDisplayMs(WorstFrameInfo wf)
+        {
+            if (wf == null || !wf.HasData) return 0;
+            var full = wf.UserCallPath;
+            if (full != null)
+            {
+                for (int i = full.Count - 1; i >= 0; i--)
+                    if (!IsPackageScript(full[i].ScriptPath)) return full[i].TotalMs > 0 ? full[i].TotalMs : wf.TotalSelfMs;
+                if (full.Count > 0) return full[full.Count - 1].TotalMs > 0 ? full[full.Count - 1].TotalMs : wf.TotalSelfMs;
+            }
+            return wf.TotalSelfMs;
+        }
+
+        /// <summary>The innermost mapped method on a spike frame's heaviest path — deepest user script, else deepest package method, else null. For the "others" overflow list.</summary>
+        private static string SpikeCulpritShort(WorstFrameInfo wf)
+        {
+            var full = wf?.UserCallPath;
+            if (full == null) return null;
+            for (int i = full.Count - 1; i >= 0; i--)
+                if (!IsPackageScript(full[i].ScriptPath)) return full[i].Marker;
+            return full.Count > 0 ? full[full.Count - 1].Marker : null;
+        }
+
+        /// <summary>
+        /// Build one RUN.FPS003 finding for a single spike frame (one culprit). spikeMs is that frame's magnitude. When wf is null this is a generic spike
+        /// pointer: couldntCapture=false → "jump to the slowest frame in the Profiler"; couldntCapture=true → "the spike frame's call stack couldn't be captured".
+        /// </summary>
+        // displayMs = the culprit's game-relevant magnitude (SpikeDisplayMs), already computed by the caller (matches Unity Profiler, excludes EditorLoop/Deep-Profile
+        // overhead that inflates the raw frame total); for the wf==null generic path it's the window max.
+        private static Finding BuildSpikeFinding(WorstFrameInfo wf, double displayMs, double avgMs, double p95Ms, string deepNote, string extraNote, bool couldntCapture)
+        {
+            // Attribution (see RuntimeSampler.SnapshotWorstFrame): the heaviest-Total call path names the triggering script; self-time leaders name where the time lands.
+            string attribution = "";
+            string culpritScript = null;    // user/package script for Locate
+            string culpritMethod = null;    // method name so Locate jumps to the declaration
+            string culpritShort = null;     // short label for the title suffix
+            bool offerLineAnalysis = false; // line-level analysis / AI Fix only when the heavy work is genuinely inside a user script
+            bool attributed = false;
+
+            if (wf != null && wf.HasData)
+            {
+                string selfLeaders = ""; double leadersSum = 0;
+                if (wf.TopMarkers.Count > 0)
+                {
+                    var parts = new List<string>();
+                    foreach (var m in wf.TopMarkers)
                     {
-                        var parts = new List<string>();
-                        foreach (var m in wf.TopMarkers)
-                            parts.Add(L.Tr($"\"{m.Marker}\" {m.SelfMs:0.0} ms", $"「{m.Marker}」{m.SelfMs:0.0} ms"));
-                        selfLeaders = string.Join(" · ", parts);
+                        parts.Add(L.Tr($"\"{m.Marker}\" {m.SelfMs:0.0} ms", $"「{m.Marker}」{m.SelfMs:0.0} ms"));
+                        leadersSum += m.SelfMs;
                     }
-
-                    var full = wf.UserCallPath; // Methods mapped to scripts on the heaviest call path (outer→inner, includes user scripts and third-party package scripts)
-                    // The deepest user script (non-Packages/) method = the entry point that triggered the spike.
-                    int culpritIdx = -1;
-                    for (int i = 0; i < full.Count; i++)
-                        if (!IsPackageScript(full[i].ScriptPath)) culpritIdx = i;
-
-                    if (culpritIdx >= 0)
-                    {
-                        var culprit = full[culpritIdx];
-                        culpritScript = culprit.ScriptPath;
-                        culpritMethod = MethodNameOf(culprit.Marker);
-
-                        // User-script call chain (outer→inner, with consecutive duplicates removed), showing at most the innermost 3 levels.
-                        var chain = new List<string>();
-                        for (int i = 0; i <= culpritIdx; i++)
-                        {
-                            if (IsPackageScript(full[i].ScriptPath)) continue;
-                            if (chain.Count > 0 && chain[chain.Count - 1] == full[i].Marker) continue;
-                            chain.Add(full[i].Marker);
-                        }
-                        if (chain.Count > 3) chain.RemoveRange(0, chain.Count - 3);
-                        string chainText = string.Join(" → ", chain);
-
-                        // Whether the heavy work lands in a third-party package downstream of the culprit (e.g. A*'s BlockUntilCalculated) —
-                        // if so, editing library source line by line is not the right model (same logic as [0.14.1] HOT001): withdraw line-level analysis and give usage-layer advice instead.
-                        string downstreamPkg = null;
-                        for (int i = culpritIdx + 1; i < full.Count; i++)
-                            if (IsPackageScript(full[i].ScriptPath)) { downstreamPkg = PackageNameOf(full[i].ScriptPath); break; }
-
-                        string head = L.Tr($"\n**This spike was triggered by your script: {culprit.Marker}** (~{culprit.TotalMs:0} ms including children, attributed by Total — matching Unity Profiler's Hierarchy ordering).", $"\n**这次尖刺是你的脚本触发的：{culprit.Marker}**（含子项约 {culprit.TotalMs:0} ms，按 Total 归因，与 Unity Profiler 的 Hierarchy 排序一致）。") +
-                                      (chain.Count > 1 ? L.Tr($"\nCall chain (outer→inner): {chainText}.", $"\n调用链（外→内）：{chainText}。") : "");
-
-                        if (downstreamPkg != null)
-                        {
-                            // The heavy work is inside a third-party package: the script is only the caller. No line-level analysis (it would jump into read-only library source, or scan your file and find nothing).
-                            offerLineAnalysis = false;
-                            attribution = head +
-                                L.Tr($"\nBut the **actual time is spent inside the third-party package `{downstreamPkg}`** (top self-time: {selfLeaders}) — your script is only the caller; the heavy work is in the library. ", $"\n但**实际耗时在第三方包 `{downstreamPkg}` 内部**（self-time 大头：{selfLeaders}）——你的脚本只是发起调用的一方，重活在库里。") +
-                                L.Tr("Editing library source line by line isn't the right model (package re-import overwrites it, and it breaks official support), so no line-level analysis / AI Fix is offered here. ", "逐行改库源码不是正确模型（包重导入会覆盖、且断官方支持），故这里不提供逐行分析/AI Fix。") +
-                                L.Tr("The fix belongs at the **usage layer**: spread this one-off batch call across multiple frames/coroutines, reduce scale or precision (a coarser graph / fewer nodes), or cache and reuse the result. ", "优化在**用法层**：把这次一次性批量调用分摊到多帧/协程、降规模或精度（更粗的图/更少节点）、缓存结果复用。") +
-                                L.Tr("Click Locate to open your call site, and use Explain to get AI suggestions tailored to it.", "点 Locate 打开你的调用点，用 Explain 让 AI 针对它给改法。");
-                        }
-                        else
-                        {
-                            // The heavy work is in the user script itself (or the engine/BCL it calls): line-level analysis is useful (find hot loops / per-frame allocations).
-                            offerLineAnalysis = true;
-                            attribution = head +
-                                (string.IsNullOrEmpty(selfLeaders) ? "" :
-                                    L.Tr($"\nTop self-time inside it: {selfLeaders}.", $"\n其内部 self-time 大头：{selfLeaders}。")) +
-                                L.Tr(" Click \"Line-level analysis\" to drill into the specific slow/allocating lines in this method; if it's a one-off batch computation, the lever is reducing the work it triggers (spread across frames/coroutines, reduce scale, cache and reuse).", "点「逐行分析」可落到这个方法里具体慢/分配的行；若是一次性批量计算，着力点是减少它触发的工作量（分摊到多帧/协程、降规模、缓存复用）。");
-                        }
-                    }
-                    else if (!string.IsNullOrEmpty(selfLeaders))
-                    {
-                        // No user script on the path (pure engine spike, or Deep Profile not enabled so no method-level markers) → fall back to self-time attribution.
-                        attribution = L.Tr("\nThis frame was mostly spent in: ", "\n该帧主要耗在：") + selfLeaders +
-                                      L.Tr(". These are the top self-time entries picked from the slowest frame (engine/loading noise already filtered out). ", "。这是从最慢那一帧挑出的 self-time 大户（已滤除引擎/加载噪音）。") +
-                                      L.Tr("No specific user script could be located — to pinpoint the method, enable Deep Profile and re-sample.", "未能定位到具体用户脚本——若想精确到方法，开启 Deep Profile 后重采样。");
-                    }
+                    selfLeaders = string.Join(" · ", parts);
                 }
 
-                string capturedCulprit = culpritScript;
-                string capturedMethod = culpritMethod;
-                findings.Add(new Finding(
-                    ruleId: "RUN.FPS003",
-                    domain: Domain.Runtime,
-                    severity: sev,
-                    title: L.Tr($"Runtime single-frame stutter spike: slowest frame {maxMs:0} ms ({maxMs / System.Math.Max(avgMs, 0.01):0}x the {avgMs:0.0} ms average)", $"运行时单帧卡顿尖刺：最慢一帧 {maxMs:0} ms（均值 {avgMs:0.0} ms 的 {maxMs / System.Math.Max(avgMs, 0.01):0} 倍）"),
-                    detail: L.Tr($"An isolated extra-long frame occurred during sampling — about {maxMs:0} ms for a single frame, far exceeding the 95th percentile {p95Ms:0.0} ms and the average {avgMs:0.0} ms. ", $"采样期间出现一次孤立的超长帧——单帧约 {maxMs:0} ms，远超 95 分位 {p95Ms:0.0} ms 与均值 {avgMs:0.0} ms。") +
-                            L.Tr("Players will clearly feel a hitch/freeze. This kind of single-point spike is deliberately ignored by the p95 stutter check (FPS002), so it is flagged separately. ", "玩家会明显感到一次卡顿/冻结。这类单点尖刺被 p95 卡顿检测（FPS002）刻意忽略，故单独标出。") + deepNote + attribution + "\n" +
-                            L.Tr("Common causes: a one-off batch computation (e.g. batch pathfinding/baking during level generation), synchronous asset loading, an Instantiate storm, or a forced GC.Collect. ", "常见成因：一次性批量计算（如关卡生成的批量寻路/烘焙）、同步资源加载、Instantiate 风暴、强制 GC.Collect。") +
-                            L.Tr("If it happens during level generation/loading, consider spreading the work across frames (coroutines/chunking) or masking it with a loading screen. ", "若发生在关卡生成/加载阶段，考虑把工作分摊到多帧（协程/分块）或用加载屏遮蔽。") +
-                            (string.IsNullOrEmpty(capturedCulprit)
-                                ? L.Tr("Pinpointing: in the Unity Profiler, jump to the slowest frame and expand the CPU call stack to see the full call chain.", "精确定位：在 Unity Profiler 里跳到最慢那一帧、展开 CPU 调用栈即可看到完整调用链。")
-                                : L.Tr("Click Locate to open the script pinpointed above directly.", "点 Locate 直接打开上面定位到的脚本。")),
-                    targetPath: capturedCulprit,
-                    ping: string.IsNullOrEmpty(capturedCulprit) ? (System.Action)null : () => ScannerUtil.OpenScript(capturedCulprit, capturedMethod),
-                    codeFile: offerLineAnalysis ? capturedCulprit : null));
+                var full = wf.UserCallPath; // methods on the heaviest call path (outer→inner, user + package)
+                int culpritIdx = -1;
+                for (int i = 0; i < full.Count; i++)
+                    if (!IsPackageScript(full[i].ScriptPath)) culpritIdx = i; // deepest user script = the entry point that triggered the spike
+
+                if (culpritIdx >= 0)
+                {
+                    attributed = true;
+                    var culprit = full[culpritIdx];
+                    culpritScript = culprit.ScriptPath;
+                    culpritMethod = MethodNameOf(culprit.Marker);
+                    culpritShort = culprit.Marker;
+
+                    // User-script call chain (outer→inner, consecutive dupes removed, innermost 3 levels).
+                    var chain = new List<string>();
+                    for (int i = 0; i <= culpritIdx; i++)
+                    {
+                        if (IsPackageScript(full[i].ScriptPath)) continue;
+                        if (chain.Count > 0 && chain[chain.Count - 1] == full[i].Marker) continue;
+                        chain.Add(full[i].Marker);
+                    }
+                    if (chain.Count > 3) chain.RemoveRange(0, chain.Count - 3);
+                    string chainText = string.Join(" → ", chain);
+
+                    // Heavy work in a third-party package downstream of the culprit (e.g. A*)? Then it's a caller — usage-layer advice, no line-level analysis.
+                    string downstreamPkg = null;
+                    for (int i = culpritIdx + 1; i < full.Count; i++)
+                        if (IsPackageScript(full[i].ScriptPath)) { downstreamPkg = PackageNameOf(full[i].ScriptPath); break; }
+
+                    string gcPhrase = culprit.GcBytes >= 1024 ? L.Tr($", allocating ~{Human(culprit.GcBytes)}", $"、分配约 {Human(culprit.GcBytes)}") : "";
+                    string head = L.Tr($"\n**This spike was triggered by your script: {culprit.Marker}** (~{culprit.TotalMs:0} ms including children{gcPhrase}, attributed by Total — matching Unity Profiler's Hierarchy ordering).", $"\n**这次尖刺是你的脚本触发的：{culprit.Marker}**（含子项约 {culprit.TotalMs:0} ms{gcPhrase}，按 Total 归因，与 Unity Profiler 的 Hierarchy 排序一致）。") +
+                                  (chain.Count > 1 ? L.Tr($"\nCall chain (outer→inner): {chainText}.", $"\n调用链（外→内）：{chainText}。") : "");
+
+                    if (downstreamPkg != null)
+                    {
+                        offerLineAnalysis = false;
+                        attribution = head +
+                            L.Tr($"\nBut the **actual time is spent inside the third-party package `{downstreamPkg}`** (top self-time: {selfLeaders}) — your script is only the caller; the heavy work is in the library. ", $"\n但**实际耗时在第三方包 `{downstreamPkg}` 内部**（self-time 大头：{selfLeaders}）——你的脚本只是发起调用的一方，重活在库里。") +
+                            L.Tr("Editing library source line by line isn't the right model (package re-import overwrites it, and it breaks official support), so no line-level analysis / AI Fix is offered here. ", "逐行改库源码不是正确模型（包重导入会覆盖、且断官方支持），故这里不提供逐行分析/AI Fix。") +
+                            L.Tr("The fix belongs at the **usage layer**: spread this one-off batch call across multiple frames/coroutines, reduce scale or precision (a coarser graph / fewer nodes), or cache and reuse the result. ", "优化在**用法层**：把这次一次性批量调用分摊到多帧/协程、降规模或精度（更粗的图/更少节点）、缓存结果复用。") +
+                            L.Tr("Click Locate to open your call site, and use Explain to get AI suggestions tailored to it.", "点 Locate 打开你的调用点，用 Explain 让 AI 针对它给改法。");
+                    }
+                    else
+                    {
+                        offerLineAnalysis = true;
+                        attribution = head +
+                            (string.IsNullOrEmpty(selfLeaders) ? "" :
+                                L.Tr($"\nTop self-time inside it: {selfLeaders}.", $"\n其内部 self-time 大头：{selfLeaders}。")) +
+                            L.Tr(" Click \"Line-level analysis\" to drill into the specific slow/allocating lines in this method; if it's a one-off batch computation, the lever is reducing the work it triggers (spread across frames/coroutines, reduce scale, cache and reuse).", "点「逐行分析」可落到这个方法里具体慢/分配的行；若是一次性批量计算，着力点是减少它触发的工作量（分摊到多帧/协程、降规模、缓存复用）。");
+                    }
+                }
+                // No user script on the path, but third-party package method(s) are (e.g. A* pathfinding). Name the package, usage-layer advice, Locate to library source.
+                else if (full.Count > 0)
+                {
+                    attributed = true;
+                    var pkgFrame = full[full.Count - 1]; // deepest mapped method (all are package here)
+                    culpritScript = pkgFrame.ScriptPath;
+                    culpritMethod = MethodNameOf(pkgFrame.Marker);
+                    culpritShort = pkgFrame.Marker;
+                    offerLineAnalysis = false;
+                    string pkg = PackageNameOf(pkgFrame.ScriptPath);
+                    string pkgLabel = pkg != null ? L.Tr($"the third-party package `{pkg}`", $"第三方包 `{pkg}`") : L.Tr("a third-party package", "第三方包");
+                    string pkgGcPhrase = pkgFrame.GcBytes >= 1024 ? L.Tr($", allocating ~{Human(pkgFrame.GcBytes)}", $"、分配约 {Human(pkgFrame.GcBytes)}") : "";
+                    attribution =
+                        L.Tr($"\n**This spike is inside {pkgLabel}: {pkgFrame.Marker}** (~{pkgFrame.TotalMs:0} ms including children{pkgGcPhrase}, attributed by Total). ", $"\n**这次尖刺发生在{pkgLabel}内部：{pkgFrame.Marker}**（含子项约 {pkgFrame.TotalMs:0} ms{pkgGcPhrase}，按 Total 归因）。") +
+                        L.Tr("No user script was on the main-thread call path — your code triggers this work indirectly (a common case: a synchronous pathfinding/graph rebuild or NavMesh/mesh bake kicked off during level generation). ", "主线程调用路径上没有你的脚本——是你的代码间接触发了这段工作（常见：关卡生成时同步发起的寻路/图重建、NavMesh/网格烘焙）。") +
+                        L.Tr("Editing library source isn't the right model, so no line-level analysis / AI Fix is offered here. The fix is at the **usage layer**: don't rebuild/scan synchronously per object — batch it, spread it across frames, do it once, or run it async/off the main thread. ", "改库源码不是正确模型，故这里不提供逐行分析/AI Fix。优化在**用法层**：别每个物体都同步重建/重扫——批量处理、分摊到多帧、只做一次，或改成异步/放到非主线程。") +
+                        L.Tr("Click Locate to open the library method, then trace back to where you invoke it; use Explain for AI suggestions tailored to it.", "点 Locate 打开库方法，再回溯到你发起调用的位置；用 Explain 让 AI 针对它给改法。");
+                }
+                // Self-time leaders are trustworthy only when they explain a real chunk of the frame; if time is spread across engine/GC internals (filtered), fall through to honest.
+                else if (!string.IsNullOrEmpty(selfLeaders) && leadersSum >= wf.TotalSelfMs * 0.2)
+                {
+                    attributed = true;
+                    attribution = L.Tr("\nThis frame was mostly spent in: ", "\n该帧主要耗在：") + selfLeaders +
+                                  L.Tr(". These are the top self-time entries picked from the slowest frame (engine/loading noise already filtered out). ", "。这是从最慢那一帧挑出的 self-time 大户（已滤除引擎/加载噪音）。") +
+                                  L.Tr("No specific user script could be located — to pinpoint the method, enable Deep Profile and re-sample.", "未能定位到具体用户脚本——若想精确到方法，开启 Deep Profile 后重采样。");
+                }
+
+                if (!attributed)
+                    couldntCapture = true; // captured a frame but its time is spread across engine/GC internals with no dominant user-code marker
             }
+
+            if (!attributed && couldntCapture)
+                attribution = L.Tr("\nThe slowest frame's call stack couldn't be captured — the spike likely occurred outside the sampling window (keep sampling running while it happens), or its time is spread across engine/GC internals with no single user-code hotspot. ", "\n最慢那一帧的调用栈未能捕获——尖刺很可能发生在采样窗口之外（在它发生时保持采样即可捕获），或耗时分散在引擎/GC 内部、没有单一用户代码热点。");
+
+            Severity sev = displayMs >= 500.0 ? Severity.Critical : Severity.Warning;
+            string capturedCulprit = culpritScript;
+            string capturedMethod = culpritMethod;
+            string titleSuffix = culpritShort != null ? $" — {culpritShort}" : "";
+            bool hasCulprit = !string.IsNullOrEmpty(capturedCulprit);
+            // Concise detail: intro + the specific attribution + one action line. The generic "common causes / spread across frames" boilerplate is kept ONLY
+            // for the unattributed case (where it's the only guidance we have) — repeating it on every attributed finding is what made the panel read as noise.
+            string intro = L.Tr($"An extra-long frame occurred during sampling — about {displayMs:0} ms for a single frame, far exceeding the 95th percentile {p95Ms:0.0} ms and the average {avgMs:0.0} ms. Players will clearly feel a hitch/freeze. ", $"采样期间出现一次超长帧——单帧约 {displayMs:0} ms，远超 95 分位 {p95Ms:0.0} ms 与均值 {avgMs:0.0} ms。玩家会明显感到一次卡顿/冻结。");
+            // Attributed findings already end with their own Locate/Explain guidance (in `attribution`) — don't append a second, redundant Locate line.
+            string tail = hasCulprit
+                ? ""
+                : L.Tr("Common causes: a one-off batch computation (batch pathfinding/baking during level generation), synchronous asset loading, an Instantiate storm, or a forced GC.Collect. In the Unity Profiler, jump to the slowest frame and expand the CPU call stack to see the full chain.", "常见成因：一次性批量计算（关卡生成的批量寻路/烘焙）、同步资源加载、Instantiate 风暴、强制 GC.Collect。在 Unity Profiler 里跳到最慢那一帧、展开 CPU 调用栈即可看到完整调用链。");
+            return new Finding(
+                ruleId: "RUN.FPS003",
+                domain: Domain.Runtime,
+                severity: sev,
+                title: L.Tr($"Runtime stutter spike: ~{displayMs:0} ms ({displayMs / System.Math.Max(avgMs, 0.01):0}x the {avgMs:0.0} ms average){titleSuffix}", $"运行时卡顿尖刺：约 {displayMs:0} ms（均值 {avgMs:0.0} ms 的 {displayMs / System.Math.Max(avgMs, 0.01):0} 倍）{titleSuffix}"),
+                detail: intro + deepNote + attribution + (string.IsNullOrEmpty(tail) ? "" : "\n" + tail) + extraNote,
+                targetPath: capturedCulprit,
+                ping: string.IsNullOrEmpty(capturedCulprit) ? (System.Action)null : () => ScannerUtil.OpenScript(capturedCulprit, capturedMethod),
+                codeFile: offerLineAnalysis ? capturedCulprit : null);
         }
 
         private static void GcPerFrame(RuntimeProfileResult r, List<Finding> findings)
@@ -202,23 +314,63 @@ namespace PerfLint.Runtime
             var gc = r.GcPerFrameBytes;
             if (gc == null || !gc.HasData) return;
 
-            double avgBytes = gc.Avg;
+            // Use the MEDIAN (sustained) per-frame allocation, not the mean: a level-gen/loading burst allocates MBs on a few frames and inflates the mean,
+            // but that transient GC is already attributed per-culprit by RUN.FPS003 (which now shows the allocating method + its bytes). GC001 is about
+            // *sustained* per-frame allocation (GetComponent / string concat / LINQ in Update), which the static "Script GC" analysis pinpoints line by line.
+            double medBytes = gc.Median;
             double maxBytes = gc.Max;
 
-            // Sustained per-frame allocation is one of the primary causes of stutter. ≥1 KB/frame warrants attention; ≥8 KB/frame is escalated to high priority.
-            if (avgBytes >= 1024)
+            // ≥1 KB/frame sustained warrants attention; ≥8 KB/frame is escalated to high priority.
+            if (medBytes >= 1024)
             {
-                Severity sev = avgBytes >= 8 * 1024 ? Severity.Critical : Severity.Warning;
-                findings.Add(new Finding(
-                    ruleId: "RUN.GC001",
-                    domain: Domain.Runtime,
-                    severity: sev,
-                    title: L.Tr($"Sustained per-frame GC allocation: avg {Human(avgBytes)}/frame (peak {Human(maxBytes)})", $"运行时持续每帧 GC 分配：平均 {Human(avgBytes)}/帧（峰值 {Human(maxBytes)}）"),
-                    detail: L.Tr($"During sampling, an average of {Human(avgBytes)} of managed-heap allocation was produced per frame (peak {Human(maxBytes)}). ", $"采样期间平均每帧产生 {Human(avgBytes)} 托管堆分配（峰值 {Human(maxBytes)}）。") +
-                            L.Tr("Sustained per-frame allocation periodically triggers GC and causes stutter. This is runtime-**confirmed** GC pressure — ", "持续的每帧分配会周期性触发 GC、造成卡顿。这是运行时**证实**的 GC 压力——") +
-                            L.Tr("click Locate to jump to the main panel's \"Script GC / per-frame allocation\" findings, which pinpoint allocation sites line by line (GetComponent / string concatenation / LINQ, etc.) ", "点 Locate 跳到主面板的「脚本 GC / 每帧分配」问题，它会逐行定位分配点（GetComponent/字符串拼接/LINQ 等），") +
-                            L.Tr("with one-click AI Fix (run Scan Project first if you haven't). Entries marked as scripts in the \"CPU Hotspots\" below are the first things to investigate.", "并支持一键 AI Fix（若还没扫描，先点 Scan Project）。下方「CPU 热点」中标为脚本的条目是优先排查对象。"),
-                    ping: () => PerfLint.UI.PerfLintWindow.OpenWindow().FocusOnScriptGcRules()));
+                Severity sev = medBytes >= 8 * 1024 ? Severity.Critical : Severity.Warning;
+                string intro = L.Tr($"During sampling, a median of {Human(medBytes)} of managed-heap allocation was produced per frame (peak {Human(maxBytes)}) — a sustained per-frame allocation (not a one-off level-gen burst; those are attributed per-culprit by the runtime stutter-spike findings above). Sustained per-frame allocation periodically triggers GC and causes stutter. ", $"采样期间每帧中位产生 {Human(medBytes)} 托管堆分配（峰值 {Human(maxBytes)}）——这是持续性的每帧分配（而非一次性关卡生成爆发，后者已由上方运行时尖刺 finding 逐 culprit 归因）。持续的每帧分配会周期性触发 GC、造成卡顿。");
+
+                var site = r.TopGcSite;
+                if (site != null && !string.IsNullOrEmpty(site.ScriptPath))
+                {
+                    // Runtime attribution: point Locate at the actual per-frame allocator we measured this session, not the static "Script GC" panel.
+                    string method = MethodNameOf(site.Method);
+                    string sitePath = site.ScriptPath;
+                    findings.Add(new Finding(
+                        ruleId: "RUN.GC001",
+                        domain: Domain.Runtime,
+                        severity: sev,
+                        title: L.Tr($"Runtime GC allocation: median {Human(medBytes)}/frame — heaviest allocator {site.Method}", $"运行时 GC 分配：中位 {Human(medBytes)}/帧——分配最大的是 {site.Method}"),
+                        detail: intro +
+                                L.Tr($"**Runtime attribution: the heaviest per-frame allocator measured was `{site.Method}` (up to ~{Human(site.BytesPerFrame)} in a single frame).** Click Locate to open it, then cut its allocations at the source (cache buffers/arrays instead of allocating each call, avoid per-frame GetComponent / LINQ / string concatenation / boxing; if it's a level-gen batch, allocate once and reuse). ", $"**运行时归因：本次单帧分配最大的是 `{site.Method}`（单帧最高约 {Human(site.BytesPerFrame)}）。**点 Locate 打开它，从源头减少分配（缓存 buffer/数组而非每次新建、避免每帧 GetComponent/LINQ/字符串拼接/装箱；若是关卡生成的批量分配，改成分配一次复用）。") +
+                                L.Tr("(No line-level Script-GC scan is offered here — the runtime allocation is inside this method's logic/subtree, not a static allocation pattern; Locate + manual review is the reliable path.)", "（这里不提供逐行「脚本 GC」扫描——运行时分配来自该方法的逻辑/子树，而非静态可识别的分配模式；Locate 打开人工审阅更可靠。）"),
+                        targetPath: sitePath,
+                        ping: () => ScannerUtil.OpenScript(sitePath, method)));
+                }
+                else if (!r.WasDeepProfile)
+                {
+                    // Couldn't attribute because Deep Profile was OFF → the Hierarchy has only coarse markers (BehaviourUpdate, etc.) that don't map to a
+                    // method. Don't send the user to an (often empty) static panel — tell them the one action that unlocks function-level GC attribution.
+                    findings.Add(new Finding(
+                        ruleId: "RUN.GC001",
+                        domain: Domain.Runtime,
+                        severity: sev,
+                        title: L.Tr($"Runtime GC allocation: median {Human(medBytes)}/frame (peak {Human(maxBytes)}) — enable Deep Profile to pinpoint the source", $"运行时 GC 分配：中位 {Human(medBytes)}/帧（峰值 {Human(maxBytes)}）——开 Deep Profile 才能定位来源"),
+                        detail: intro +
+                                L.Tr("**Deep Profile is OFF**, so these allocations can't be attributed to a specific method — the Hierarchy only has coarse markers. Turn on the \"Deep Profile\" toggle at the top of this panel and re-sample; this finding will then pinpoint the allocating function and Locate straight to it. ", "**未开启 Deep Profile**,无法把这些分配归因到具体方法——Hierarchy 只有粗粒度 marker。点本面板顶部的「Deep Profile」开关后重新采样,本条即可定位到分配函数并直接 Locate 过去。") +
+                                L.Tr("(Deep Profile has high overhead — use it for localization, not for measuring real frame rate.)", "（Deep Profile 开销大,仅用于定位,别用来测真实帧率。）")));
+                        // No Locate/Ping: without Deep Profile there is no function to open, and the static panel would likely be empty.
+                }
+                else
+                {
+                    // Deep Profile was ON but no dominant runtime allocator resolved → the allocation is genuinely spread thin, or lands inside a third-party
+                    // package / engine call that isn't a user script. Point to the static Script GC analysis (which shows a helpful empty-state when it can't see it).
+                    findings.Add(new Finding(
+                        ruleId: "RUN.GC001",
+                        domain: Domain.Runtime,
+                        severity: sev,
+                        title: L.Tr($"Runtime GC allocation: median {Human(medBytes)}/frame (peak {Human(maxBytes)}) — spread across many sites", $"运行时 GC 分配：中位 {Human(medBytes)}/帧（峰值 {Human(maxBytes)}）——分散在多处"),
+                        detail: intro +
+                                L.Tr("No single runtime method dominates the allocation (it's spread across many sites, or lands inside a third-party package / engine call). Check the main PerfLint panel's \"Script GC / per-frame allocation\" analysis for line-level patterns (GetComponent / string concatenation / LINQ, etc.); ", "没有单一运行时方法主导分配（分散在多处,或落在第三方包/引擎调用里）。到主 PerfLint 面板的「脚本 GC / 每帧分配」分析里看逐行分配模式（GetComponent/字符串拼接/LINQ 等）;") +
+                                L.Tr("if it finds nothing, record a GC.Alloc sample in the Unity Profiler (CPU module → \"GC Alloc\" column) to catch boxing / package / engine allocations the static scan can't see.", "若查不到,用 Unity Profiler 录一段 GC.Alloc（CPU 模块的「GC Alloc」列）来捕获静态扫描看不到的装箱/包/引擎分配。"),
+                        ping: () => PerfLint.UI.PerfLintWindow.OpenWindow().FocusOnScriptGcRules()));
+                }
             }
         }
 
@@ -291,6 +443,102 @@ namespace PerfLint.Runtime
                             L.Tr("re-sample during steady-state play (without loading new scenes/assets); if memory still grows monotonically, take and compare snapshots with the Unity Memory Profiler to pinpoint it.", "请在稳定运行（无加载新场景/资源）的状态下重新采样一段，若内存仍单调增长，再用 Unity Memory Profiler 抓快照对比定位。") +
                             breakdown));
             }
+
+            // ── RUN.MEM003: Name WHICH object/asset categories grew (leak-suspect: created and never destroyed). Attributes the memory growth without a heap
+            // snapshot — fires alongside MEM001 (real total growth) and lists the categories whose count/memory climbed over the window. ──
+            if (growth > 50L * 1024 * 1024 && r.DurationSeconds >= 5 && r.CategoryCounters != null)
+            {
+                var grown = new List<string>();
+                bool materialGrew = false;
+
+                void CheckCount(string key, string label, double floor)
+                {
+                    if (r.CategoryCounters.TryGetValue(key, out var s) && s != null && s.HasData && s.TrendDelta >= floor && s.Last > s.First)
+                        grown.Add($"{label} +{s.TrendDelta:0} ({s.First:0} → {s.Last:0})");
+                }
+                void CheckMem(string key, string label, double floorBytes)
+                {
+                    if (r.CategoryCounters.TryGetValue(key, out var s) && s != null && s.HasData && s.TrendDelta >= floorBytes && s.Last > s.First)
+                        grown.Add($"{label} +{Human(s.TrendDelta)} ({Human(s.First)} → {Human(s.Last)})");
+                }
+
+                CheckCount("GameObject Count", L.Tr("GameObjects", "GameObject"), 20);
+                CheckCount("Object Count",     L.Tr("UnityEngine.Objects", "UnityEngine.Object 总数"), 50);
+                CheckCount("Texture Count",    L.Tr("Textures", "纹理"), 10);
+                CheckMem  ("Texture Memory",   L.Tr("Texture memory", "纹理显存"), 8L * 1024 * 1024);
+                CheckCount("Mesh Count",       L.Tr("Meshes", "网格"), 10);
+                CheckMem  ("Mesh Memory",      L.Tr("Mesh memory", "网格内存"), 8L * 1024 * 1024);
+                if (r.CategoryCounters.TryGetValue("Material Count", out var matS) && matS != null && matS.HasData && matS.TrendDelta >= 10 && matS.Last > matS.First)
+                {
+                    materialGrew = true;
+                    grown.Add($"{L.Tr("Materials", "材质")} +{matS.TrendDelta:0} ({matS.First:0} → {matS.Last:0})");
+                }
+
+                if (grown.Count > 0)
+                {
+                    // Gated cross-ref: only mention GPU004 when runtime material instancing actually crossed its emission threshold (never a dangling reference).
+                    var sb = r.SceneBatching;
+                    string matNote = (materialGrew && sb != null && sb.HasData && sb.InstancedMaterialRendererCount >= MaterialInstancingMinCount)
+                        ? L.Tr(" (materials are also being cloned at runtime — see RUN.GPU004)", "（材质还在运行时被克隆——见 RUN.GPU004）")
+                        : "";
+                    findings.Add(new Finding(
+                        ruleId: "RUN.MEM003",
+                        domain: Domain.Runtime,
+                        severity: Severity.Info,
+                        title: L.Tr("Object/asset instances growing during sampling", "运行时对象/资源实例持续增长"),
+                        detail: L.Tr("These object/asset categories climbed over the sampling window:\n  • ", "以下对象/资源类别在采样窗口内增长：\n  • ") + string.Join("\n  • ", grown) + matNote + "\n\n" +
+                                L.Tr("This may be normal (loading a level creates objects) OR a leak — objects/assets created and never destroyed. ", "这可能正常（加载关卡会创建对象），也可能是泄漏——创建后从未销毁。") +
+                                L.Tr("Verify: sample again during steady-state play (no new scenes/assets loading); if these counts keep rising and don't fall back to a baseline, the objects aren't being destroyed. ", "复核：在稳定运行（不加载新场景/资源）时再采样一段；若这些数量持续上升、不回落到基线，说明对象没有被销毁。") +
+                                L.Tr("Common causes: spawned objects / VFX not pooled or Destroy()'d, materials/textures instantiated at runtime, DontDestroyOnLoad duplicates. Use the Unity Memory Profiler to confirm the exact type.", "常见成因：生成的物体/特效未池化或未 Destroy()、运行时实例化的材质/纹理、DontDestroyOnLoad 重复。用 Unity Memory Profiler 确认具体类型。")));
+                }
+            }
+        }
+
+        // ── RUN.MEM004: name the biggest textures / render targets / meshes in memory (VRAM localization). Fires when a single asset is genuinely large. ──
+        private static void GraphicsMemory(RuntimeProfileResult r, List<Finding> findings)
+        {
+            var sb = r.SceneBatching;
+            if (sb == null || !sb.HasData) return;
+
+            // RUN.MEM005: many IDENTICAL runtime RenderTextures alive at once → likely created repeatedly without Release() (a VRAM leak static scanning can't see).
+            var rt = sb.SuspectRtLeak;
+            if (rt != null && rt.Count >= 8)
+            {
+                findings.Add(new Finding(
+                    ruleId: "RUN.MEM005",
+                    domain: Domain.Runtime,
+                    severity: Severity.Warning,
+                    title: L.Tr($"{rt.Count} identical {rt.Width}×{rt.Height} RenderTextures alive ({Human(rt.TotalBytes)}) — likely not Released()", $"{rt.Count} 个相同的 {rt.Width}×{rt.Height} RenderTexture 同时存活（{Human(rt.TotalBytes)}）——疑似没 Release()"),
+                    detail: L.Tr($"{rt.Count} RenderTextures of {rt.Width}×{rt.Height} ({rt.Format}), created at runtime (not project assets), are alive at once and consume {Human(rt.TotalBytes)}. ", $"{rt.Count} 个 {rt.Width}×{rt.Height}（{rt.Format}）的 RenderTexture 在运行时创建（非工程资产）、同时存活，占用 {Human(rt.TotalBytes)}。") +
+                            L.Tr("You rarely need this many identical render targets — this usually means a script does `new RenderTexture(...)` repeatedly (per frame / per spawn / per camera) and never calls `Release()` / `Destroy()` on the old one. ", "很少需要这么多相同的渲染目标——通常是脚本反复 `new RenderTexture(...)`（每帧/每次生成/每个相机）而没有对旧的调用 `Release()` / `Destroy()`。") +
+                            L.Tr("Fix: cache and reuse a single RenderTexture, or use RenderTexture.GetTemporary / ReleaseTemporary for short-lived ones. (If you already pool them via GetTemporary, this may be the pool and is expected.) ", "修复：缓存复用同一个 RenderTexture，或短生命周期的用 RenderTexture.GetTemporary / ReleaseTemporary。（若你已用 GetTemporary 池化，这可能就是池、属正常。）") +
+                            L.Tr("Click Locate to select them.", "点 Locate 选中它们。"),
+                    ping: sb.HasRtLeakExamples ? (System.Action)sb.SelectRtLeakExamples : null));
+            }
+
+            var assets = sb.TopMemoryAssets;
+            if (assets == null || assets.Count == 0) return;
+            if (assets[0].Bytes < 16L * 1024 * 1024) return; // only flag when at least one asset is genuinely large (e.g. an uncompressed 2K texture / big RT)
+
+            var lines = new List<string>();
+            foreach (var a in assets)
+            {
+                if (a.Bytes < 2L * 1024 * 1024) break; // stop before listing small ones
+                lines.Add($"{a.Name} ({a.Kind}) — {Human(a.Bytes)}");
+                if (lines.Count >= 6) break;
+            }
+            if (lines.Count == 0) return;
+
+            findings.Add(new Finding(
+                ruleId: "RUN.MEM004",
+                domain: Domain.Runtime,
+                severity: Severity.Info,
+                title: L.Tr($"Large graphics assets in memory: {assets[0].Name} {Human(assets[0].Bytes)} + more", $"显存占用大的图形资源：{assets[0].Name} {Human(assets[0].Bytes)} 等"),
+                detail: L.Tr("The biggest textures / render targets / meshes currently loaded (by runtime memory):\n  • ", "当前加载的最大纹理/渲染目标/网格（按运行时内存）：\n  • ") + string.Join("\n  • ", lines) + "\n\n" +
+                        L.Tr("Check whether each needs its current resolution/format: compress textures (ASTC / BCn) instead of RGBA32, lower an oversized import Max Size, generate mipmaps only where needed, and Release() runtime RenderTextures you no longer use. Whether a size is 'too big' depends on your platform's VRAM budget. ", "逐个确认是否需要当前分辨率/格式：纹理用压缩格式（ASTC / BCn）而非 RGBA32、调低过大的导入 Max Size、按需生成 mipmap，运行时不再用的 RenderTexture 及时 Release()。是否『过大』取决于目标平台显存预算。") +
+                        L.Tr("(Editor-only render targets — Game/Scene view, editor windows, gizmos — are filtered out; an occasional editor-internal asset may still slip through.) ", "（编辑器专用渲染目标——Game/Scene 视图、编辑器窗口、Gizmo——已过滤；个别编辑器内部资源仍可能漏网。）") +
+                        L.Tr("Click Locate to select them (project textures open their import settings).", "点 Locate 选中它们（工程纹理会打开导入设置）。"),
+                ping: sb.HasTopMemoryAssets ? (System.Action)sb.SelectTopMemoryAssets : null));
         }
 
         private static void DrawCallsAndSetPass(RuntimeProfileResult r, List<Finding> findings)

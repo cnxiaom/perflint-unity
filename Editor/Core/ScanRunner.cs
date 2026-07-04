@@ -56,6 +56,12 @@ namespace PerfLint.Core
 
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
+                // Never discover scanners from PerfLint's own test assemblies. When the package is linked/embedded,
+                // Tests/ compile inside the user's project too, and a test's fake IScanner with a parameterless ctor
+                // would run in every real scan (observed: a TEST.EXEMPT finding showing up in a user project's
+                // report). Tests always pass their fake scanners to Run(...) explicitly, so they lose nothing.
+                if (asm.GetName().Name.StartsWith("PerfLint.Tests", StringComparison.Ordinal)) continue;
+
                 Type[] types;
                 try
                 {
@@ -133,7 +139,7 @@ namespace PerfLint.Core
             // applied in one place so every rule benefits automatically.
             // Sorting: severity descending first, then by domain and rule ID, to guarantee a stable, reproducible report.
             var ordered = findings
-                .Where(f => !IgnoreSettings.ShouldIgnore(f.TargetPath ?? f.CodeFile))
+                .Where(f => f.IgnoreExempt || !IgnoreSettings.ShouldIgnore(f.TargetPath ?? f.CodeFile))
                 .OrderByDescending(f => f.Severity)
                 .ThenBy(f => f.Domain)
                 .ThenBy(f => f.RuleId, StringComparer.Ordinal)
@@ -208,7 +214,7 @@ namespace PerfLint.Core
 
             var merged = previous.Findings.Where(f => !removeRules.Contains(f.RuleId))
                 .Concat(fresh)
-                .Where(f => !IgnoreSettings.ShouldIgnore(f.TargetPath ?? f.CodeFile))
+                .Where(f => f.IgnoreExempt || !IgnoreSettings.ShouldIgnore(f.TargetPath ?? f.CodeFile))
                 .OrderByDescending(f => f.Severity)
                 .ThenBy(f => f.Domain)
                 .ThenBy(f => f.RuleId, StringComparer.Ordinal)
@@ -265,7 +271,7 @@ namespace PerfLint.Core
 
             var merged = previous.Findings.Where(f => !BelongsToFile(f))
                 .Concat(fresh)
-                .Where(f => !IgnoreSettings.ShouldIgnore(f.TargetPath ?? f.CodeFile))
+                .Where(f => f.IgnoreExempt || !IgnoreSettings.ShouldIgnore(f.TargetPath ?? f.CodeFile))
                 .OrderByDescending(f => f.Severity)
                 .ThenBy(f => f.Domain)
                 .ThenBy(f => f.RuleId, StringComparer.Ordinal)
@@ -307,7 +313,7 @@ namespace PerfLint.Core
             if (!handled) return null; // no file-level scanner claimed the file (non-script assets, etc.)
 
             var ordered = fresh
-                .Where(f => !IgnoreSettings.ShouldIgnore(f.TargetPath ?? f.CodeFile))
+                .Where(f => f.IgnoreExempt || !IgnoreSettings.ShouldIgnore(f.TargetPath ?? f.CodeFile))
                 .OrderByDescending(f => f.Severity)
                 .ThenBy(f => f.Domain)
                 .ThenBy(f => f.RuleId, StringComparer.Ordinal)

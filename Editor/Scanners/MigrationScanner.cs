@@ -38,6 +38,16 @@ namespace PerfLint.Scanners
             public System.Func<string> Title;
             public System.Func<string> Detail;
             public bool RequiresUnity2023_1; // Only report when the current Unity is ≥2023.1/6 (the version where this API is truly deprecated)
+            public bool RequiresUnity2022_1; // Only report when the current Unity is ≥2022.1 (e.g. URP 13 marking RenderTargetHandle obsolete); on 2021 LTS it is still the current API
+            // Optional exact gate: report only when this returns true. Sharper than version thresholds for APIs whose
+            // deprecation point is hard to pin (e.g. GetInstanceID somewhere in the 6000.x line): reflect over the
+            // CURRENT engine and ask whether the member actually carries [Obsolete] — zero guessing, zero noise on
+            // editors where the API is still current. Null = always active (subject to the version flags above).
+            public System.Func<bool> ActiveWhen;
+            // Severity policy: Critical = blocks compilation on the current editor (removed API / error-level
+            // obsolete), Warning = deprecation warning only. Receives unity2023_1Plus for rules whose "breaking
+            // from" line is 2023.1 (e.g. RenderTargetHandle). Null = Warning.
+            public System.Func<bool, Severity> SeverityFn;
             // Whether AI one-click migration is permitted. Only applies to "rename-style" cases (FindObjectOfType→FindAnyObjectByType, LoadLevel→LoadScene):
             // replacing the flagged fragment is sufficient. Structural rewrites (WWW→UnityWebRequest, GUIText→UGUI, Legacy particles) set this to false —
             // they change the entire usage block/scope; a local fragment replacement cannot reach all downstream usages of the method, so AI would corrupt the code. Just report + locate, leave to the developer.
@@ -62,10 +72,14 @@ namespace PerfLint.Scanners
             },
             new ApiRule {
                 Pattern = new Regex(@"\bnew\s+WWW\b", RegexOptions.Compiled),
-                RuleId = "MIG.WWW", Title = () => L.Tr("Removed API: WWW", "已移除 API：WWW"),
-                Detail = () => L.Tr("WWW is deprecated/removed. Use UnityWebRequest (requires using UnityEngine.Networking). This is a structural migration, not a rename: "
+                // Fact check (Tim, 2026-07-04): WWW is warning-level obsolete since 2018.3 and STILL COMPILES on
+                // Unity 6 — deprecated, unmaintained, but not removed. Title/severity must not claim otherwise.
+                RuleId = "MIG.WWW", Title = () => L.Tr("Deprecated API: WWW", "废弃 API：WWW"),
+                Detail = () => L.Tr("WWW has been deprecated since Unity 2018.3 — it still compiles (with a warning) even on Unity 6, but is unmaintained and slated for removal. "
+                         + "Migrate to UnityWebRequest (requires using UnityEngine.Networking). This is a structural migration, not a rename: "
                          + "the async model, DownloadHandler, result checks, and variable scoping all differ, so the whole request flow must be rewritten by hand; no one-click fix.",
-                         "WWW 已废弃/移除。改用 UnityWebRequest（需 using UnityEngine.Networking）。这是结构性迁移而非改名："
+                         "WWW 自 Unity 2018.3 起废弃——在 Unity 6 上仍能编译（警告级），但已停止维护、列入移除计划。"
+                         + "建议迁移到 UnityWebRequest（需 using UnityEngine.Networking）。这是结构性迁移而非改名："
                          + "异步模型、DownloadHandler、result 检查、变量作用域都不同，需人工整体改写该请求流程，不提供一键修复。"),
                 AllowAiFix = false
             },
@@ -73,21 +87,60 @@ namespace PerfLint.Scanners
                 Pattern = new Regex(@"\bApplication\.LoadLevel", RegexOptions.Compiled),
                 RuleId = "MIG.LoadLevel", Title = () => L.Tr("Removed API: Application.LoadLevel", "已移除 API：Application.LoadLevel"),
                 Detail = () => L.Tr("Application.LoadLevel/LoadLevelAsync has been removed. Use SceneManager.LoadScene (UnityEngine.SceneManagement).",
-                              "Application.LoadLevel/LoadLevelAsync 已移除。改用 SceneManager.LoadScene（UnityEngine.SceneManagement）。")
+                              "Application.LoadLevel/LoadLevelAsync 已移除。改用 SceneManager.LoadScene（UnityEngine.SceneManagement）。"),
+                SeverityFn = _ => Severity.Critical // removed on every supported editor → guaranteed compile error
             },
             new ApiRule {
                 Pattern = new Regex(@"\bGUIText\b|\bGUITexture\b", RegexOptions.Compiled),
                 RuleId = "MIG.GUIText", Title = () => L.Tr("Removed components: GUIText/GUITexture", "已移除组件：GUIText/GUITexture"),
                 Detail = () => L.Tr("GUIText/GUITexture have been removed. Use UGUI (Text/Image) or TextMeshPro. This is a structural replacement (components/prefabs/references all change), so it must be migrated by hand; no one-click fix.",
                               "GUIText/GUITexture 已移除。改用 UGUI（Text/Image）或 TextMeshPro。这是结构性替换（组件/预制体/引用都要换），需人工迁移，不提供一键修复。"),
+                AllowAiFix = false,
+                SeverityFn = _ => Severity.Critical // removed on every supported editor → guaranteed compile error
+            },
+            new ApiRule {
+                Pattern = new Regex(@"\bGetInstanceID\b", RegexOptions.Compiled),
+                RuleId = "MIG.GetInstanceID", Title = () => L.Tr("Deprecated API: GetInstanceID", "废弃 API：GetInstanceID"),
+                Detail = () => L.Tr("Object.GetInstanceID() is marked obsolete on this Unity version (newer Unity 6 releases; compile error where obsolete-as-error). " +
+                              "Migrate to GetEntityId() — but note this is NOT a plain rename: the EntityId→int implicit conversion is also obsolete there, " +
+                              "so every int variable/field/dictionary key that receives the id must change type to EntityId as well (EntityId is comparable " +
+                              "and works as a dictionary key). Rewrite the id's whole flow by hand; no one-click fix.",
+                              "Object.GetInstanceID() 在当前 Unity 版本已标记废弃（较新的 Unity 6 版本；error 级废弃时直接编译失败）。" +
+                              "迁移到 GetEntityId()——但注意这不是单纯改名：EntityId→int 的隐式转换在该版本同样废弃，" +
+                              "接收该 id 的所有 int 变量/字段/字典 key 都要连带改为 EntityId 类型（EntityId 可比较、可作字典 key）。" +
+                              "需人工改写该 id 的整条流转，不提供一键修复。"),
+                // Reflect over the CURRENT engine: report only where GetInstanceID actually carries [Obsolete]
+                // (real case: CS0619 on 6000.5 while 2022.3 is perfectly fine — a version threshold would be a guess).
+                ActiveWhen = () => GetInstanceIdIsObsolete,
+                // Error-level obsolete ([Obsolete(msg, true)] → CS0619) blocks compilation → Critical; warning-level → Warning.
+                SeverityFn = _ => GetInstanceIdObsoleteIsError ? Severity.Critical : Severity.Warning,
+                // Structural after all: on 6000.5 the EntityId→int implicit operator is error-level obsolete too, so a
+                // call-site swap breaks every int receiver (real rollback). The id's type must migrate through the file.
                 AllowAiFix = false
+            },
+            new ApiRule {
+                // Word boundaries keep variable names (renderTargetHandle / m_RenderTargetHandle) out; only the type name itself matches.
+                Pattern = new Regex(@"\bRenderTargetHandle\b", RegexOptions.Compiled),
+                RuleId = "MIG.RenderTargetHandle", Title = () => L.Tr("Deprecated API: RenderTargetHandle (URP)", "废弃 API：RenderTargetHandle（URP）"),
+                Detail = () => L.Tr("URP's RenderTargetHandle is deprecated since Unity 2022.1 (URP 13) and removed in Unity 6 — custom render passes that use it no longer compile there "
+                         + "(a top blocker when upgrading older URP assets). Migrate to RTHandle: allocate in OnCameraSetup via RTHandles.Alloc / RenderingUtils.ReAllocateIfNeeded, "
+                         + "pass the handle itself instead of .Identifier()/.id, and release it explicitly (Dispose). This changes the pass's whole resource lifecycle, "
+                         + "so it must be rewritten by hand; no one-click fix.",
+                         "URP 的 RenderTargetHandle 自 Unity 2022.1（URP 13）废弃、Unity 6 已移除——使用它的自定义 render pass 在 Unity 6 无法编译"
+                         + "（老 URP 资产升级的头号阻塞点）。迁移到 RTHandle：在 OnCameraSetup 用 RTHandles.Alloc / RenderingUtils.ReAllocateIfNeeded 分配，"
+                         + "直接传句柄（不再用 .Identifier()/.id），并需显式释放（Dispose）。整个 pass 的资源生命周期都要改，需人工整体改写，不提供一键修复。"),
+                RequiresUnity2022_1 = true,
+                AllowAiFix = false,
+                // #breakingFrom(2023.1): error-level (blocks compilation) on 2023.1+/6 → Critical there; warning-level obsolete on 2022 → Warning.
+                SeverityFn = unity2023_1Plus => unity2023_1Plus ? Severity.Critical : Severity.Warning
             },
             new ApiRule {
                 Pattern = new Regex(@"\bParticleEmitter\b|\bParticleRenderer\b|\bParticleAnimator\b", RegexOptions.Compiled),
                 RuleId = "MIG.LegacyParticles", Title = () => L.Tr("Removed: legacy particle components", "已移除：Legacy 粒子组件"),
                 Detail = () => L.Tr("Legacy particles (ParticleEmitter/Renderer/Animator) have been removed. Use the Shuriken Particle System. This is a structural replacement, so it must be migrated by hand; no one-click fix.",
                               "Legacy 粒子（ParticleEmitter/Renderer/Animator）已移除。改用 Shuriken Particle System。这是结构性替换，需人工迁移，不提供一键修复。"),
-                AllowAiFix = false
+                AllowAiFix = false,
+                SeverityFn = _ => Severity.Critical // removed on every supported editor → guaranteed compile error
             },
         };
 
@@ -103,6 +156,7 @@ namespace PerfLint.Scanners
             // Version-aware: FindObjectOfType and similar are only reported on Unity ≥2023.1/6 (where they are truly deprecated);
             // otherwise they are pure noise for users still on 2021/2022 who are not upgrading.
             bool unity2023_1Plus = IsAtLeast2023_1(Application.unityVersion);
+            bool unity2022_1Plus = IsAtLeast2022_1(Application.unityVersion);
 
             // Input backend: 0=old Input Manager, 1=new Input System only, 2=Both enabled.
             // The old UnityEngine.Input only truly stops working under "new system only"; that is when MIG.LegacyInputApi is reported.
@@ -118,7 +172,7 @@ namespace PerfLint.Scanners
 
                 string path = AssetDatabase.GUIDToAssetPath(guids[i]);
                 if (!Handles(path)) continue;
-                foreach (var f in ScanScript(path, unity2023_1Plus, newInputOnly))
+                foreach (var f in ScanScript(path, unity2022_1Plus, unity2023_1Plus, newInputOnly))
                     yield return f;
             }
 
@@ -167,21 +221,22 @@ namespace PerfLint.Scanners
         {
             if (!Handles(assetPath)) yield break;
             bool unity2023_1Plus = IsAtLeast2023_1(Application.unityVersion);
+            bool unity2022_1Plus = IsAtLeast2022_1(Application.unityVersion);
             bool newInputOnly = ReadActiveInputHandler() == 1;
-            foreach (var f in ScanScript(assetPath, unity2023_1Plus, newInputOnly))
+            foreach (var f in ScanScript(assetPath, unity2022_1Plus, unity2023_1Plus, newInputOnly))
                 yield return f;
         }
 
         /// <summary>Match deprecated APIs and legacy input APIs line by line in a single script. Shared by the full Scan and the single-file ScanFile to guarantee both paths produce consistent results.</summary>
-        private IEnumerable<Finding> ScanScript(string path, bool unity2023_1Plus, bool newInputOnly)
+        private IEnumerable<Finding> ScanScript(string path, bool unity2022_1Plus, bool unity2023_1Plus, bool newInputOnly)
         {
             var lines = ReadLines(path);
             if (lines == null) yield break;
-            foreach (var f in ScanSource(lines, path, unity2023_1Plus, newInputOnly)) yield return f;
+            foreach (var f in ScanSource(lines, path, unity2022_1Plus, unity2023_1Plus, newInputOnly)) yield return f;
         }
 
         /// <summary>Pure logic: match deprecated APIs / legacy input APIs against already-loaded source lines (no file I/O, making it easy to verify false positives/negatives in end-to-end unit tests).</summary>
-        internal static IEnumerable<Finding> ScanSource(string[] lines, string path, bool unity2023_1Plus, bool newInputOnly)
+        internal static IEnumerable<Finding> ScanSource(string[] lines, string path, bool unity2022_1Plus, bool unity2023_1Plus, bool newInputOnly)
         {
             for (int ln = 0; ln < lines.Length; ln++)
             {
@@ -193,11 +248,13 @@ namespace PerfLint.Scanners
                 foreach (var rule in ApiRules)
                 {
                     if (rule.RequiresUnity2023_1 && !unity2023_1Plus) continue;
+                    if (rule.RequiresUnity2022_1 && !unity2022_1Plus) continue;
+                    if (rule.ActiveWhen != null && !rule.ActiveWhen()) continue;
                     if (!rule.Pattern.IsMatch(code)) continue;
                     yield return new Finding(
                         ruleId: rule.RuleId,
                         domain: Domain.Migration,
-                        severity: Severity.Warning,
+                        severity: rule.SeverityFn?.Invoke(unity2023_1Plus) ?? Severity.Warning,
                         title: rule.Title(),
                         detail: rule.Detail(),
                         targetPath: $"{path}:{line}",
@@ -439,14 +496,22 @@ namespace PerfLint.Scanners
                 yield return new Finding(
                     ruleId: "MIG.AsmdefBrokenRef",
                     domain: Domain.Migration,
+                    // Warning, NOT Critical: Unity silently SKIPS unresolved asmdef references and compiles the
+                    // assembly anyway (the Inspector greys them out: "missing and will not be referenced during
+                    // compilation"). Real-world proof: Viking Village's WaterSystem.Runtime.asmdef carries a
+                    // dangling GUID reference while the project compiles and runs fine. The actual risk is
+                    // conditional — code that USES types from the missing assembly fails with CS0246, and the
+                    // feature the reference existed for may be silently absent.
                     severity: Severity.Warning,
                     title: L.Tr("Assembly Definition has unresolved references", "程序集定义存在无法解析的引用"),
                     detail: L.Tr($"{path} references assemblies that cannot be resolved: {list}. " +
-                            "These were likely renamed or removed during a package/Unity migration (e.g. com.unity.textmeshpro merged into UGUI in Unity 6). " +
-                            "Open the .asmdef and remove or repoint the broken references, otherwise this assembly will fail to compile.",
+                            "These were likely renamed or removed during a package/Unity migration, or left behind when the asset was extracted from a larger project. " +
+                            "Unity skips unresolved references and still compiles this assembly (the Inspector shows them greyed out) — so if your project compiles and the feature works, this is leftover clutter you can remove safely. " +
+                            "It becomes a real problem only when code in this assembly needs types from the missing assembly (compile errors), or when the reference pointed at a package that should be installed — then reinstall it or repoint the reference instead.",
                             $"{path} 引用了无法解析的程序集：{list}。" +
-                            "这通常是包/Unity 迁移时改名或移除导致（如 Unity 6 把 com.unity.textmeshpro 合并进 UGUI）。" +
-                            "打开该 .asmdef 移除或重新指向这些引用，否则该程序集会编译失败。"),
+                            "这通常是包/Unity 迁移时改名或移除导致，或资产从更大的工程里摘出来时的残留。" +
+                            "Unity 会跳过无法解析的引用、照常编译该程序集（Inspector 里显示为灰条）——所以如果工程编译正常、功能正常，这就是可以放心清理的历史残留。" +
+                            "只有两种情况它才是真问题：该程序集的代码用到了缺失程序集里的类型（会编译报错），或这条引用本该指向一个需要安装的包——那就重装该包或重新指向，而不是删除。"),
                     targetPath: cap,
                     ping: () => PingAsset(cap));
             }
@@ -531,6 +596,53 @@ namespace PerfLint.Scanners
             int minor = 0;
             if (parts.Length > 1) int.TryParse(parts[1], out minor);
             return (major, minor);
+        }
+
+        /// <summary>
+        /// Whether Object.GetInstanceID carries [Obsolete] on THIS engine (newer Unity 6 deprecates it in favor of
+        /// GetEntityId). Evaluated once per domain load; internal and writable so tests can exercise both rule paths
+        /// on an editor where the real value is false (2022.3).
+        /// </summary>
+        internal static bool GetInstanceIdIsObsolete = MemberIsObsolete(typeof(UnityEngine.Object), "GetInstanceID");
+
+        /// <summary>Whether that [Obsolete] is error-level ([Obsolete(msg, true)] → CS0619, blocks compilation) — decides Critical vs Warning.</summary>
+        internal static bool GetInstanceIdObsoleteIsError = MemberObsoleteIsError(typeof(UnityEngine.Object), "GetInstanceID");
+
+        /// <summary>Reflection: does the public parameterless instance method carry [Obsolete] on the current engine?</summary>
+        internal static bool MemberIsObsolete(System.Type type, string methodName)
+        {
+            try
+            {
+                var m = type?.GetMethod(methodName, System.Type.EmptyTypes);
+                return m != null && m.IsDefined(typeof(System.ObsoleteAttribute), inherit: true);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Reflection: is the member's [Obsolete] error-level (IsError=true) on the current engine?</summary>
+        internal static bool MemberObsoleteIsError(System.Type type, string methodName)
+        {
+            try
+            {
+                var m = type?.GetMethod(methodName, System.Type.EmptyTypes);
+                var attr = m == null ? null : (System.ObsoleteAttribute)System.Attribute.GetCustomAttribute(m, typeof(System.ObsoleteAttribute), inherit: true);
+                return attr != null && attr.IsError;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Whether the current Unity is ≥ 2022.1 (including Unity 6 = 6000.x), i.e. the version line where URP 13 marks RenderTargetHandle obsolete.</summary>
+        internal static bool IsAtLeast2022_1(string version)
+        {
+            if (string.IsNullOrEmpty(version)) return false;
+            var parts = version.Split('.');
+            if (!int.TryParse(parts[0], out int major)) return false;
+            int minor = parts.Length > 1 && int.TryParse(parts[1], out int m) ? m : 0;
+
+            if (major >= 6000) return true;                // Unity 6+ (6000.x)
+            if (major > 2022 && major < 6000) return true; // 2023 / 2024…
+            if (major == 2022) return minor >= 1;          // 2022.1+
+            return false;                                  // 2021 and earlier
         }
 
         /// <summary>Whether the current Unity is ≥ 2023.1 (including Unity 6 = 6000.x), i.e. the version line where FindObjectOfType and similar are deprecated.</summary>

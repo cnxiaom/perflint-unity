@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace PerfLint.Core
 {
@@ -33,8 +34,28 @@ namespace PerfLint.Core
 
         public bool SupportsTargetChoice => RunWithChoice != null;
 
+        /// <summary>
+        /// Optional whole-batch entry point. When set, a rule-level "run all" hands the FULL list of target asset paths
+        /// to this delegate in ONE call instead of invoking <see cref="Run"/> per finding — so an implementation can
+        /// batch expensive tail work (e.g. a single AssetDatabase.SaveAssets for hundreds of Addressables entries
+        /// instead of one save per item) and return a categorized summary (extracted / skipped / failed). Must not
+        /// show any UI. Single-item execution still uses <see cref="Run"/>.
+        /// </summary>
+        public Func<IReadOnlyList<string>, FixResult> BatchRun { get; }
+
+        public bool SupportsBatchRun => BatchRun != null;
+
+        /// <summary>
+        /// Optional confirmation body for the rule-level "run all". <see cref="ConfirmMessage"/> is written for ONE
+        /// finding and often names its specific asset — reusing it for a 331-item batch both misleads (the dialog
+        /// appears to be about a single asset) and overflows Unity's dialog length limit (which then truncates
+        /// mid-sentence and appends "see the editor log file"). When null, the UI falls back to ConfirmMessage.
+        /// </summary>
+        public string BatchConfirmMessage { get; }
+
         public FindingAction(string label, string confirmMessage, Func<FixResult> run, bool requiresPro = true,
-            Func<string, FixResult> runWithChoice = null)
+            Func<string, FixResult> runWithChoice = null, Func<IReadOnlyList<string>, FixResult> batchRun = null,
+            string batchConfirmMessage = null)
         {
             if (string.IsNullOrEmpty(label)) throw new ArgumentException("label is required", nameof(label));
             Label = label;
@@ -42,6 +63,8 @@ namespace PerfLint.Core
             Run = run ?? throw new ArgumentNullException(nameof(run));
             RequiresPro = requiresPro;
             RunWithChoice = runWithChoice;
+            BatchRun = batchRun;
+            BatchConfirmMessage = batchConfirmMessage;
         }
     }
 }

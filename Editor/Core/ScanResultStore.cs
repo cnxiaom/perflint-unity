@@ -143,7 +143,8 @@ namespace PerfLint.Core
             // does not erase a rule that was once fixable (otherwise the "Refresh to enable fix" button
             // would disappear permanently).
             hadFix = f.CanAutoFix || f.WasAutoFixable,
-            hadAction = f.HasAction || f.WasActionable
+            hadAction = f.HasAction || f.WasActionable,
+            ignoreExempt = f.IgnoreExempt
         };
 
         private static Finding FromDto(FindingDto d)
@@ -189,7 +190,10 @@ namespace PerfLint.Core
                 // Remember "was auto-fixable / was actionable" so that hadFix/hadAction are not erased
                 // when re-persisting (the fix entry point must not be lost).
                 wasAutoFixable: d.hadFix,
-                wasActionable: d.hadAction);
+                wasActionable: d.hadAction,
+                // Preserved so ignored-path-exempt duplication findings don't get filtered away by the
+                // post-restore rescan merges (the filter runs again in RescanRules/RescanFile).
+                ignoreExempt: d.ignoreExempt);
         }
 
         private static bool LooksLikeAssetPath(string p) =>
@@ -234,6 +238,7 @@ namespace PerfLint.Core
             public int codeLine;
             public bool hadFix;
             public bool hadAction;
+            public bool ignoreExempt;
         }
 
         [Serializable]

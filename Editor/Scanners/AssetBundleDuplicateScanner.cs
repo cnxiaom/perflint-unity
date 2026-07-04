@@ -12,6 +12,12 @@ namespace PerfLint.Scanners
     /// Assets domain (package size optimization): AssetBundle implicit-dependency duplicate packing detection.
     ///   ASSET.ABDUP000 — Summary (project-level): total number of shared assets packed multiple times, estimated total waste.
     ///   ASSET.ABDUP001 — Per-asset: a shared asset not explicitly assigned to any bundle is copied into each bundle that references it.
+    ///   ASSET.ABDUP002 — Built-in resources (Resources/unity_builtin_extra, Library/unity default resources) implicitly
+    ///     referenced by ≥2 bundles: the referenced built-in objects (Default-Particle, built-in shaders, default font…)
+    ///     are copied into EVERY bundle that references them and can never be explicitly assigned to a bundle for
+    ///     de-duplication — the only fix is replacing the built-in reference with a project-local copy. One project-level
+    ///     finding per container (max 2), Info: nearly every AB project hits this, so per-reference findings would be noise,
+    ///     but the duplication is real (course-verified common trap) and invisible without tooling.
     ///
     /// How it works: assets that are referenced by multiple bundles but not explicitly assigned to any bundle (implicit
     /// dependencies) are **copied into every bundle that references them** at build time — the classic package-size killer,
@@ -56,8 +62,9 @@ namespace PerfLint.Scanners
                     // Allow real assets under Assets/ and Packages/: assets inside Packages (URP/built-in shaders,
                     // TMP font materials, third-party package prefabs) are also copied into each bundle that implicitly
                     // depends on them, and the user can explicitly assign them to de-duplicate.
-                    // Only exclude built-in virtual resources (Resources/unity_builtin_extra, Library/..., etc. —
-                    // they do not start with either of these two prefixes and cannot be explicitly assigned).
+                    // Built-in virtual resources never show up here — path-level GetDependencies no longer reports the
+                    // built-in containers at all (verified empirically on 2022.3) — so ABDUP002 detects them separately
+                    // below via object-level CollectDependencies.
                     if (!dep.StartsWith("Assets/") && !dep.StartsWith("Packages/")) continue;
                     if (IsExcluded(dep)) continue;            // scripts / assemblies / shader includes do not enter a bundle on their own
 
@@ -69,6 +76,11 @@ namespace PerfLint.Scanners
                     set.Add(bundles[i]);
                 }
             }
+
+            // ABDUP002 — built-in containers referenced by ≥2 bundles (emitted before the per-asset list, which
+            // early-returns when there are no Assets/-level duplicates and must not swallow these).
+            foreach (var f in BuildBuiltinFindings(bundles, context))
+                yield return f;
 
             // 3) Included in ≥2 bundles = duplicate packing. **Sort by estimated in-memory size descending** (textures ≈
             //    the Inspector storage value) so the most memory-impactful duplicates surface first; fall back to source
@@ -131,6 +143,9 @@ namespace PerfLint.Scanners
                             L.Tr("\nExplicitly assign it to one shared bundle and have the other bundles reference it.",
                                  "\n建议把它显式分配到一个共享 bundle，其余 bundle 引用即可。"),
                     targetPath: d.Path,
+                    // Duplication findings bypass the ignore-path filter (see Finding.IgnoreExempt): third-party
+                    // duplication bloats the user's build, and the fix (explicit bundle assignment) doesn't edit the asset.
+                    ignoreExempt: true,
                     ping: () => ScannerUtil.PingAsset(d.Path));
             }
         }
@@ -142,6 +157,94 @@ namespace PerfLint.Scanners
             public long Size;   // raw on-disk source file bytes (verifiable in Explorer / Project view)
             public long Mem;    // estimated in-memory size (textures ≈ Inspector value); 0 if unavailable — the sort key
             public List<string> Bundles;
+        }
+
+        /// <summary>
+        /// Built-in virtual resource containers whose referenced objects get copied into every referencing bundle:
+        /// "Resources/unity_builtin_extra" (Standard/Sprites/Unlit shaders, Default-Material, Default-Particle…) and
+        /// "Library/unity default resources" (Cube/Sphere meshes, default font, UI shaders). Matched by suffix to be
+        /// robust against a leading path segment changing.
+        /// </summary>
+        internal static bool IsBuiltinContainer(string dep)
+            => !string.IsNullOrEmpty(dep)
+            && (dep.EndsWith("unity_builtin_extra", StringComparison.OrdinalIgnoreCase)
+             || dep.EndsWith("unity default resources", StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>
+        /// ASSET.ABDUP002 findings: one per built-in container referenced by ≥2 bundles.
+        /// Detection MUST go through object-level <see cref="EditorUtility.CollectDependencies"/>: path-level
+        /// AssetDatabase.GetDependencies silently omits the built-in containers (verified on 2022.3 — a material on a
+        /// built-in shader reports no dependency at all), which is precisely why this duplication is invisible to most
+        /// tooling. CollectDependencies loads objects, so the probe is capped: enough for real layouts (a bundle's
+        /// builtin usage almost always shows within its first assets) without turning into a full project load.
+        /// </summary>
+        private static IEnumerable<Finding> BuildBuiltinFindings(string[] bundles, ScanContext context)
+        {
+            const int maxExamples = 6;   // example lines shown per container
+            const int maxProbes = 300;   // CollectDependencies calls total (each loads an asset + its object graph)
+
+            var toBundles = new Dictionary<string, HashSet<string>>();  // container → referencing bundles
+            var examples = new Dictionary<string, List<string>>();      // container → "asset ← bundle" lines
+            int probes = 0;
+            foreach (var b in bundles)
+            {
+                if (probes >= maxProbes) break;
+                foreach (var asset in AssetDatabase.GetAssetPathsFromAssetBundle(b))
+                {
+                    context.CancellationToken.ThrowIfCancellationRequested();
+                    if (++probes > maxProbes) break;
+
+                    var main = AssetDatabase.LoadMainAssetAtPath(asset);
+                    if (main == null || main is SceneAsset) continue; // scene contents aren't traversable here
+                    foreach (var o in EditorUtility.CollectDependencies(new[] { main }))
+                    {
+                        if (o == null) continue;
+                        string p = AssetDatabase.GetAssetPath(o);
+                        if (!IsBuiltinContainer(p)) continue;
+
+                        if (!toBundles.TryGetValue(p, out var bset))
+                        {
+                            bset = new HashSet<string>();
+                            toBundles[p] = bset;
+                            examples[p] = new List<string>();
+                        }
+                        bool newForBundle = bset.Add(b);
+                        if (newForBundle && examples[p].Count < maxExamples)
+                            examples[p].Add($"{asset}  ←  {b}"); // one example per (container, bundle): the first referencing root
+                    }
+                }
+            }
+
+            foreach (var kv in toBundles.OrderBy(k => k.Key, StringComparer.Ordinal))
+            {
+                string container = kv.Key;
+                if (kv.Value.Count < 2) continue;
+                var bundleList = kv.Value.OrderBy(b => b, StringComparer.Ordinal).ToList();
+                string shortName = container.Substring(container.LastIndexOf('/') + 1);
+                var exampleLines = examples[container];
+                string exampleBlock = exampleLines.Count > 0
+                    ? L.Tr($"\nExample assets pulling it in (bundle roots):\n  {string.Join("\n  ", exampleLines)}",
+                           $"\n引用示例（bundle 根资源）：\n  {string.Join("\n  ", exampleLines)}")
+                    : "";
+                yield return new Finding(
+                    ruleId: "ASSET.ABDUP002",
+                    domain: Domain.Assets,
+                    severity: Severity.Info,
+                    title: L.Tr($"Built-in resources ({shortName}) duplicated across {bundleList.Count} AssetBundles",
+                                $"内置资源（{shortName}）被 {bundleList.Count} 个 AssetBundle 重复打包"),
+                    groupTitle: L.Tr("Built-in resources duplicated across AssetBundles", "内置资源被多个 AssetBundle 重复打包"),
+                    detail: L.Tr($"Content in {bundleList.Count} bundles references Unity's built-in resources ({container}) — default particle/material, " +
+                                 "built-in shaders, default font, primitive meshes, etc. Built-in objects can never be assigned to a bundle, so each referencing " +
+                                 "bundle packs its OWN copy of whatever it references (memory holds one copy per loaded bundle). Affected bundles:",
+                                 $"{bundleList.Count} 个 bundle 的内容引用了 Unity 内置资源（{container}）——默认粒子/材质、内置 shader、默认字体、基础网格等。" +
+                                 "内置对象无法分配到任何 bundle，每个引用它的 bundle 都会各自打包一份所引用的内置对象（同时加载时内存各占一份）。受影响的 bundle：") +
+                            $"\n  {string.Join("\n  ", bundleList)}" +
+                            exampleBlock +
+                            L.Tr("\nFix: replace built-in references with project-local copies (e.g. import your own particle texture / shader / font and point the assets at it), " +
+                                 "then assign those copies to a shared bundle. Classic trap: a default Particle System silently references the built-in Default-Particle texture.",
+                                 "\n修法：把内置引用换成项目内的副本（如导入自己的粒子贴图/shader/字体并让资源改用它），再把副本分配进共享 bundle。" +
+                                 "经典坑：默认粒子系统会静默引用内置 Default-Particle 贴图。"));
+            }
         }
 
         private static bool IsExcluded(string path)

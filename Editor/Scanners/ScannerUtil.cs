@@ -58,6 +58,19 @@ namespace PerfLint.Scanners
                         bool boundaryBefore = !(char.IsLetterOrDigit(before) || before == '_' || before == '.');
                         int p = after;
                         while (p < ln.Length && ln[p] == ' ') p++;
+                        // Allow a generic parameter list before the parens, e.g. "LoadAssetAsync<T>(" / "Get<TKey, TVal>(" — the profiler marker drops
+                        // the generic args (shows "LoadAssetAsync()"), so without this an async/generic method wouldn't match and Locate fell to line 1.
+                        if (p < ln.Length && ln[p] == '<')
+                        {
+                            int depth = 0;
+                            while (p < ln.Length)
+                            {
+                                if (ln[p] == '<') depth++;
+                                else if (ln[p] == '>') { depth--; if (depth == 0) { p++; break; } }
+                                p++;
+                            }
+                            while (p < ln.Length && ln[p] == ' ') p++;
+                        }
                         bool followedByParen = p < ln.Length && ln[p] == '(';
                         if (boundaryBefore && followedByParen)
                         {
