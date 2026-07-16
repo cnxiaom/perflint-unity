@@ -10,6 +10,28 @@ namespace PerfLint.Scanners
     /// <summary>Small utilities shared across scanners. public: sub-assemblies for optional modules (e.g. Addressables) need access too.</summary>
     public static class ScannerUtil
     {
+        /// <summary>How many heavy asset loads a scan loop may accumulate before forcing a memory reclaim. See <see cref="ThrottleReclaim"/>.</summary>
+        public const int LoadReclaimInterval = 64;
+
+        /// <summary>
+        /// Memory-reclaim throttle for scan loops that <c>LoadAssetAtPath</c> heavy assets (textures, materials, audio clips).
+        /// A scan runs synchronously in one call stack and never yields a frame, so <c>Resources.UnloadAsset</c> does NOT flush
+        /// the editor's deferred GPU release — every loaded asset stays resident until the scan returns. On a large project the
+        /// loads accumulate in graphics/native memory until the driver can't allocate and the editor hard-crashes
+        /// (d3d11 E_OUTOFMEMORY, observed on an ~12k-texture project 2026-07-05). Call once per load with the running counter;
+        /// every <see cref="LoadReclaimInterval"/> loads it forces a synchronous sweep, bounding peak memory to a small constant.
+        /// Returns the updated counter (reset to 0 on a sweep). The sweep cost is negligible (~1 per 64 loads).
+        /// </summary>
+        public static int ThrottleReclaim(int loadsSinceReclaim)
+        {
+            if (++loadsSinceReclaim >= LoadReclaimInterval)
+            {
+                EditorUtility.UnloadUnusedAssetsImmediate();
+                return 0;
+            }
+            return loadsSinceReclaim;
+        }
+
         /// <summary>Highlights and selects an asset in the Project window; used as Finding.Ping.</summary>
         public static void PingAsset(string path)
         {

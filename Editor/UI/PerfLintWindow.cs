@@ -33,6 +33,10 @@ namespace PerfLint.UI
         private VisualElement _roslynBox;
         private Label _roslynNotice;
         private Button _roslynButton;
+        private VisualElement _sceneScopeBox;   // persistent Info notice: scan is project-wide, but a few scene-level checks only reflect the open scene(s)
+        private Label _sceneScopeNotice;
+        private VisualElement _stalePluginBox; // "you're running a pre-update PerfLint build" notice (compile-broken projects never reload the domain)
+        private Label _stalePluginLabel;
         private VisualElement _staleBanner; // Info banner after a report is restored from disk (non-blocking): the report is already visible; hints that a full rescan is available
         private Label _staleLabel;
         private Label _filterStatus;
@@ -53,6 +57,11 @@ namespace PerfLint.UI
         private int _enablingTick;
         private const string KRoslynEnabling = "PerfLint.Roslyn.Enabling";
         private const string KRoslynEnablingDeadline = "PerfLint.Roslyn.EnablingDeadline";
+        // The loaded-scene set at the last scan (sorted, '|'-joined), so the scope notice can warn "you switched
+        // scenes since the last scan — re-scan" for the scene-level rules. SessionState so it survives domain reload
+        // alongside the persisted result. Absent (== KScannedScenesUnset) means no scan has run this session.
+        private const string KScannedScenes = "PerfLint.Window.ScannedScenes";
+        private const string KScannedScenesUnset = "__perflint_unset__";
 
         // State after a report is restored from disk (surviving domain reload / window reopen): restored findings carry no
         // Fix/Action instances (those aren't serializable). Only these rules previously had one-click fixes; clicking
@@ -60,7 +69,15 @@ namespace PerfLint.UI
         // full scan runs, it's removed from this set. An empty set means the current results are entirely "live".
         private readonly HashSet<string> _restoredFixableRuleIds = new HashSet<string>();
 
-        // Filter state. Info is hidden by default, directly cutting the mass of "advisory-level" noise.
+        // Filter state — persisted across window close/reopen (and editor restarts) via EditorPrefs, so a user who turns
+        // Info on (or Warning off) doesn't have it silently reset every time they reopen the window. Info stays hidden by
+        // default (first run) to cut advisory-level noise. Keys are in EditorPrefs (per-machine, not per-project).
+        private const string PrefCritical = "PerfLint.Filter.Critical";
+        private const string PrefWarning = "PerfLint.Filter.Warning";
+        private const string PrefInfo = "PerfLint.Filter.Info";
+        private const string PrefOnlyFixable = "PerfLint.Filter.OnlyFixable";
+        // Defaults here; the persisted values are loaded in OnEnable — EditorPrefs.GetBool is NOT allowed from a
+        // ScriptableObject field initializer (Unity throws), so it must not run at construction time.
         private bool _showCritical = true;
         private bool _showWarning = true;
         private bool _showInfo = false;
@@ -103,13 +120,41 @@ namespace PerfLint.UI
         {
             LicenseService.Changed += RefreshLicenseButton;
             PerfLintScriptFixVerifier.FixRolledBack += OnAiChangeRolledBack;
+            // Register as the live-result authority: while open, asset-edit incremental updates come to this window (which
+            // holds Fix instances) instead of overwriting the Fix-less on-disk baseline. See PerfLintAutoRescan.
+            PerfLintAutoRescan.WindowRefresh = IncrementalRefresh;
+            // Load persisted filter state here (NOT in field initializers — EditorPrefs is disallowed from a ScriptableObject
+            // constructor). OnEnable runs before CreateGUI/BuildFilterBar, so the toggles render with the restored values.
+            _showCritical = EditorPrefs.GetBool(PrefCritical, true);
+            _showWarning = EditorPrefs.GetBool(PrefWarning, true);
+            _showInfo = EditorPrefs.GetBool(PrefInfo, false);
+            _onlyFixable = EditorPrefs.GetBool(PrefOnlyFixable, false);
         }
 
         private void OnDisable()
         {
             LicenseService.Changed -= RefreshLicenseButton;
             PerfLintScriptFixVerifier.FixRolledBack -= OnAiChangeRolledBack;
+            if (PerfLintAutoRescan.WindowRefresh == (System.Action)IncrementalRefresh) PerfLintAutoRescan.WindowRefresh = null;
             StopEnablingPoll(); // don't leak the EditorApplication.update subscription if the window is closed mid-enable
+        }
+
+        /// <summary>
+        /// Background auto-pump hand-off (registered in <see cref="OnEnable"/> while the window is open): consume the pending
+        /// changed files into the LIVE result (keeping Fix instances), re-render, and persist. This is what makes an asset
+        /// edit — which triggers no domain reload — show up in an already-open report without a full rescan.
+        /// </summary>
+        private void IncrementalRefresh()
+        {
+            if (_lastResult == null || _results == null) return;
+            Vector2 scroll = _results.scrollOffset;
+            var updated = PerfLintIncrementalRescan.Apply(_lastResult, out bool changed);
+            if (!changed) return;
+            _lastResult = updated;
+            ScanResultStore.Save(_lastResult);
+            RenderHeader(_lastResult);
+            RenderResults();
+            RestoreScrollAfterLayout(scroll);
         }
 
         /// <summary>
@@ -292,6 +337,55 @@ namespace PerfLint.UI
             root.Add(_roslynBox);
             UpdateRoslynNotice();
 
+            // ── Scan-scope notice ────────────────────────────────────────────────────────────────
+            // Most rules scan the whole project (AssetDatabase); a few (ISceneScoped: Static Batching,
+            // GPU Instancing overlap, Skinned Instancing, Mesh LOD) only see the CURRENTLY loaded scene(s).
+            // Without this, a user scanning with an empty/light scene gets a silently partial bill for those
+            // rules (exactly how the SBATCH001 miss happened). Persistent Info line; reads the live scene name(s)
+            // and enumerates the ISceneScoped scanners so the rule list never drifts. Refreshed on focus (the
+            // open scene can change between visits).
+            _sceneScopeBox = new VisualElement
+            {
+                style =
+                {
+                    marginBottom = 4,
+                    paddingTop = 4, paddingBottom = 4, paddingLeft = 8, paddingRight = 8,
+                    backgroundColor = new Color(0.30f, 0.55f, 0.85f, 0.12f),
+                }
+            };
+            _sceneScopeNotice = new Label
+            {
+                style =
+                {
+                    whiteSpace = WhiteSpace.Normal,
+                    color = new Color(0.62f, 0.78f, 0.95f),
+                    fontSize = 11
+                }
+            };
+            _sceneScopeBox.Add(_sceneScopeNotice);
+            root.Add(_sceneScopeBox);
+            UpdateSceneScopeNotice();
+
+            // ── Stale plugin build notice ─────────────────────────────────────────────────────────
+            // A compile-broken project never domain-reloads, so a PerfLint update (package update, or live-linked
+            // source in dev) can sit on disk while this window keeps running the pre-update build — and every
+            // "re-test after the fix" silently tests the old code. Shown only in that exact state (source newer
+            // than this domain's load + compilation failed); refreshed on focus, when the state can change.
+            _stalePluginBox = new VisualElement
+            {
+                style =
+                {
+                    display = DisplayStyle.None,
+                    marginBottom = 4,
+                    paddingTop = 4, paddingBottom = 4, paddingLeft = 8, paddingRight = 8,
+                    backgroundColor = new Color(0.85f, 0.65f, 0.13f, 0.15f),
+                }
+            };
+            _stalePluginLabel = new Label { style = { whiteSpace = WhiteSpace.Normal } };
+            _stalePluginBox.Add(_stalePluginLabel);
+            root.Add(_stalePluginBox);
+            UpdateStalePluginNotice();
+
             // ── Restore info banner (shown after a report is restored from disk; non-blocking) ──────────────
             // The report is persisted and survives domain reload / window reopen, so we no longer blank the report or force an 86s full rescan here.
             // It just informs: the report is from the last scan and may be slightly stale; Locate/AI Fix work immediately, one-click fixes use "Refresh" on a rule,
@@ -380,16 +474,10 @@ namespace PerfLint.UI
             if (restored.FixableRuleIds != null)
                 foreach (var id in restored.FixableRuleIds) _restoredFixableRuleIds.Add(id);
 
-            // Changed files (modified by AI Fix + scripts the user manually edited/deleted/moved): incrementally rescan to make their findings live (replacing a full rescan).
-            // Both sources are registered in PerfLintPendingRescan, written by the change tracker / verifier before domain reload, and consumed here.
-            var changed = PerfLintPendingRescan.Consume();
-            bool refreshedAny = false;
-            foreach (var file in changed)
-            {
-                if (string.IsNullOrEmpty(file)) continue;
-                var updated = ScanRunner.RescanFile(file, _lastResult);
-                if (updated != null) { _lastResult = updated; refreshedAny = true; }
-            }
+            // Changed files (modified by AI Fix + scripts/assets the user manually edited/deleted/moved): incrementally rescan
+            // to make their findings live (replacing a full rescan). Both sources are registered in PerfLintPendingRescan,
+            // written by the change tracker / verifier before domain reload, and consumed here via the shared apply step.
+            _lastResult = PerfLintIncrementalRescan.Apply(_lastResult, out bool refreshedAny);
             if (refreshedAny) ScanResultStore.Save(_lastResult);
 
             SessionState.EraseBool(PerfLintScriptFixVerifier.RescanFlag);
@@ -421,11 +509,11 @@ namespace PerfLint.UI
                 style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, flexWrap = Wrap.Wrap, marginBottom = 2 }
             };
 
-            bar.Add(MakeToggle("Critical", _showCritical, v => { _showCritical = v; RenderResults(); }));
-            bar.Add(MakeToggle("Warning", _showWarning, v => { _showWarning = v; RenderResults(); }));
-            _infoToggle = MakeToggle("Info", _showInfo, v => { _showInfo = v; RenderResults(); });
+            bar.Add(MakeToggle("Critical", _showCritical, v => { _showCritical = v; EditorPrefs.SetBool(PrefCritical, v); RenderResults(); }));
+            bar.Add(MakeToggle("Warning", _showWarning, v => { _showWarning = v; EditorPrefs.SetBool(PrefWarning, v); RenderResults(); }));
+            _infoToggle = MakeToggle("Info", _showInfo, v => { _showInfo = v; EditorPrefs.SetBool(PrefInfo, v); RenderResults(); });
             bar.Add(_infoToggle);
-            bar.Add(MakeToggle(L.Tr("Fixable only", "只看可修复"), _onlyFixable, v => { _onlyFixable = v; RenderResults(); }));
+            bar.Add(MakeToggle(L.Tr("Fixable only", "只看可修复"), _onlyFixable, v => { _onlyFixable = v; EditorPrefs.SetBool(PrefOnlyFixable, v); RenderResults(); }));
 
             var search = new TextField { value = _search };
             _searchField = search;
@@ -514,8 +602,127 @@ namespace PerfLint.UI
                 _lastResult = result;
                 _restoredFixableRuleIds.Clear(); // A full scan produces live findings, so the restored state is all invalidated
                 ScanResultStore.Save(_lastResult);
+                // Record which scene(s) this scan actually saw, so the scope notice can later tell the user when they've
+                // switched scenes and the scene-level findings (SBATCH001 etc.) have gone stale.
+                SessionState.SetString(KScannedScenes, SceneKey(CurrentLoadedSceneNames()));
+                UpdateSceneScopeNotice();
                 RenderHeader(result);
                 RenderResults();
+            }
+        }
+
+        /// <summary>
+        /// Show/hide the "you're running a pre-update PerfLint build" notice. Only fires when the package source
+        /// on disk is newer than the running build AND the project's compile errors block the reload that would
+        /// normally pick it up — the state where every re-test silently tests old code. Refreshed on focus.
+        /// </summary>
+        private void UpdateStalePluginNotice()
+        {
+            if (_stalePluginBox == null) return;
+            bool stale = Core.PerfLintStaleBuildGuard.IsDomainStale();
+            _stalePluginBox.style.display = stale ? DisplayStyle.Flex : DisplayStyle.None;
+            if (stale)
+                _stalePluginLabel.text = L.Tr(
+                    "⚠ PerfLint or this project's packages changed on disk, but compile errors prevent Unity from reloading scripts — " +
+                    "this session is still running the pre-change code (loaded packages may not match what the compiler now checks against). " +
+                    "Fix the compile errors, or restart the editor to load the current state.",
+                    "⚠ PerfLint 或本工程的包已在磁盘上变更，但编译错误阻止了 Unity 重载脚本——当前会话仍在运行变更前的代码" +
+                    "（内存中的包可能与编译器实际校验的版本不一致）。请先修复编译错误，或重启编辑器加载最新状态。");
+        }
+
+        private void OnFocus()
+        {
+            UpdateStalePluginNotice();
+            UpdateSceneScopeNotice(); // the open scene can change while the window is unfocused
+        }
+
+        /// <summary>
+        /// Refresh the persistent "scan scope" notice: scan is project-wide, but the ISceneScoped rules only reflect
+        /// the currently loaded scene(s). Reads the live scene name(s) and enumerates the discovered ISceneScoped
+        /// scanners so the rule list stays in sync as rules are added/removed. Static string builder — no allocation-heavy path.
+        /// </summary>
+        internal static string BuildSceneScopeText(IReadOnlyList<string> loadedSceneNames, IReadOnlyList<string> sceneScopedRuleNames)
+        {
+            string rules = sceneScopedRuleNames != null && sceneScopedRuleNames.Count > 0
+                ? string.Join(", ", sceneScopedRuleNames)
+                : L.Tr("Static Batching, GPU Instancing, Mesh LOD", "Static Batching、GPU Instancing、Mesh LOD");
+
+            bool anyScene = loadedSceneNames != null && loadedSceneNames.Count > 0;
+            string scenes = anyScene ? string.Join(", ", loadedSceneNames) : null;
+
+            string head = L.Tr("Scan covers the whole project. A few scene-level checks (",
+                               "扫描覆盖整个工程。少数场景级检查（") + rules + L.Tr(") only reflect ", "）只反映");
+            string tail = anyScene
+                ? L.Tr($"the open scene(s): {scenes}. Open your heaviest scene and re-scan for a complete picture.",
+                       $"当前打开的场景：{scenes}。打开最重的场景重扫可得完整结果。")
+                : L.Tr("the currently loaded scene(s) — no scene is open, so these checks find nothing. Open your heaviest scene and re-scan.",
+                       "当前加载的场景——现在没有打开任何场景，故这几项检查什么都扫不到。请打开最重的场景重扫。");
+            return head + tail;
+        }
+
+        /// <summary>
+        /// The "you switched scenes since the last scan — re-scan" warning. Pure so the stale-detection wording is
+        /// unit-testable. Names both the scanned and now-open scene(s) plus the affected scene-level rules.
+        /// </summary>
+        internal static string BuildSceneChangedText(
+            IReadOnlyList<string> scannedScenes, IReadOnlyList<string> currentScenes, IReadOnlyList<string> ruleNames)
+        {
+            string rules = ruleNames != null && ruleNames.Count > 0
+                ? string.Join(", ", ruleNames)
+                : L.Tr("Static Batching, GPU Instancing, Mesh LOD", "Static Batching、GPU Instancing、Mesh LOD");
+            string scanned = scannedScenes != null && scannedScenes.Count > 0 ? string.Join(", ", scannedScenes) : L.Tr("(none)", "(无)");
+            string now = currentScenes != null && currentScenes.Count > 0 ? string.Join(", ", currentScenes) : L.Tr("(none)", "(无)");
+            return L.Tr(
+                $"⚠ Scene changed since the last scan (scanned: {scanned} · now open: {now}). The scene-level checks ({rules}) still reflect the old scene — re-scan to update them.",
+                $"⚠ 上次扫描后场景已切换（扫描时：{scanned} · 当前：{now}）。场景级检查（{rules}）仍是旧场景的结果——请重扫更新。");
+        }
+
+        /// <summary>Currently loaded scene name(s), for display.</summary>
+        private static List<string> CurrentLoadedSceneNames()
+        {
+            var loaded = new List<string>();
+            for (int i = 0; i < UnityEngine.SceneManagement.SceneManager.sceneCount; i++)
+            {
+                var sc = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                if (!sc.isLoaded) continue;
+                loaded.Add(string.IsNullOrEmpty(sc.name) ? L.Tr("(untitled)", "(未命名)") : sc.name);
+            }
+            return loaded;
+        }
+
+        /// <summary>Order-insensitive comparison/storage key for a loaded-scene set.</summary>
+        private static string SceneKey(IReadOnlyList<string> names)
+            => string.Join("|", names.OrderBy(n => n, StringComparer.Ordinal));
+
+        private void UpdateSceneScopeNotice()
+        {
+            if (_sceneScopeNotice == null) return;
+
+            var loaded = CurrentLoadedSceneNames();
+            var ruleNames = ScanRunner.DiscoverScanners()
+                .OfType<ISceneScoped>()
+                .Cast<IScanner>()
+                .Select(s => s.Name)
+                .ToList();
+
+            string scannedKey = SessionState.GetString(KScannedScenes, KScannedScenesUnset);
+            bool hasScan = scannedKey != KScannedScenesUnset;
+
+            if (hasScan && scannedKey != SceneKey(loaded))
+            {
+                // Scene-level findings on screen are for a scene that's no longer open — flag it amber and prompt a re-scan.
+                var scannedNames = string.IsNullOrEmpty(scannedKey)
+                    ? new List<string>()
+                    : scannedKey.Split('|').ToList();
+                _sceneScopeNotice.text = BuildSceneChangedText(scannedNames, loaded, ruleNames);
+                _sceneScopeNotice.style.color = new Color(0.95f, 0.78f, 0.30f);
+                _sceneScopeBox.style.backgroundColor = new Color(0.85f, 0.65f, 0.13f, 0.15f);
+            }
+            else
+            {
+                _sceneScopeNotice.text = BuildSceneScopeText(loaded, ruleNames);
+                _sceneScopeNotice.style.color = new Color(0.62f, 0.78f, 0.95f);
+                _sceneScopeBox.style.backgroundColor = new Color(0.30f, 0.55f, 0.85f, 0.12f);
             }
         }
 
@@ -985,6 +1192,27 @@ namespace PerfLint.UI
                 titleRow.Add(explain);
             }
 
+            // Addressables duplicate rules (AADUP001 / AARES001) are report-only and driven by the official Analyze
+            // dependency simulation — nothing here mutates the project, so a stale list only refreshes on a rescan.
+            // The common case is a MANUAL refactor the tool can't do for you: following AARES001's guidance you move a
+            // TMP font out of a Resources folder, and until you rescan, AARES001 still lists it and AADUP001 hasn't
+            // picked it up as an extractable duplicate. A full Scan is the ~100s-class cost; this button re-runs ONLY
+            // the two Addressables duplicate scanners (RescanRules → seconds), so the AARES001 row disappears and the
+            // asset reappears under AADUP001 without a full project scan. Scanning is free (no Pro/credit gate).
+            if (ruleGroup.Key == "ASSET.AARES001" || ruleGroup.Key == "ASSET.AADUP001")
+            {
+                var reanalyze = new Button(() => RescanRules(new[] { "ASSET.AADUP001", "ASSET.AARES001" }))
+                {
+                    text = L.Tr("Re-analyze", "重新分析"),
+                    tooltip = L.Tr("Re-run the Addressables duplicate analysis for these two rules only — not a full project scan (seconds, not ~100s). Use it after manually moving assets out of a Resources folder so the AARES001 / AADUP001 lists update.",
+                                   "仅重跑这两条 Addressables 重复规则，不做全项目扫描（几秒，非上百秒）。手动把资源移出 Resources 目录后点它，AARES001 / AADUP001 列表随即更新。")
+                };
+                reanalyze.style.marginLeft = 4;
+                reanalyze.style.flexShrink = 0;
+                reanalyze.RegisterCallback<PointerDownEvent>(e => e.StopPropagation());
+                titleRow.Add(reanalyze);
+            }
+
             // Put the title row into the Foldout's built-in Toggle "input cell" (the cell with the toggle arrow). It must be added into unity-toggle__input,
             // otherwise titleRow becomes another flex-grow child of the Toggle, each taking half the width with the arrow cell → the title is pushed to the window's centerline
             // and the right-side buttons are also clipped out of the window. Added into the input cell, it follows the arrow, fills the whole row, and the title left-aligns normally and wraps with the window.
@@ -995,8 +1223,13 @@ namespace PerfLint.UI
             // Rule-level "action-type" batch (e.g. "Extract to shared group, all") goes at the top of the expanded area on its own prominent line —
             // in the header line the title's flexGrow fills the space and the button would be pushed out of view on the window's right. Distinct from Fix All: config-changing actions don't go into Fix All.
             // Note: the batch targets ALL of this rule's findings (including those not shown, limited by MaxRowsPerRule), not just the visible rows.
-            var actionItems = items.Where(f => f.HasAction).ToList();
-            if (actionItems.Count > 0)
+            // Only actions that opt into rule-level batching get a "run all" button. Excludes actions whose per-row
+            // targets differ (PKG001 disables a DIFFERENT module per finding — a shared "Disable X all" label would be
+            // wrong) or that can't run in a loop (each disable triggers a package re-resolve + domain reload).
+            // A single actionable finding gets no batch line either: "run all (1)" is the per-row button with a
+            // redundant label — and project-level singleton rules (the PROJ family) would show it on every scan.
+            var actionItems = items.Where(f => f.HasAction && f.Action.AllowRuleBatch).ToList();
+            if (actionItems.Count > 1)
             {
                 string label = actionItems[0].Action.Label;
                 var bar = new VisualElement

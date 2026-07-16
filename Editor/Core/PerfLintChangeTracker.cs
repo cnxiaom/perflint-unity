@@ -4,20 +4,20 @@ using UnityEditor;
 namespace PerfLint.Core
 {
     /// <summary>
-    /// Listens to asset imports and registers **scripts that the user has manually edited/deleted/moved**
-    /// into <see cref="PerfLintPendingRescan"/>, so that after a domain reload the window performs an
-    /// incremental rescan of only those files — otherwise, after manually editing code, the report keeps
-    /// showing stale findings (e.g. commenting out a line does not make its warning disappear).
+    /// Listens to asset imports and registers **any asset a file-level scanner can incrementally re-scan** — scripts the
+    /// user edited/deleted/moved AND now textures/audio/materials/etc. — into <see cref="PerfLintPendingRescan"/>, so the
+    /// report stays live after a manual edit instead of showing stale findings (e.g. changing a texture's compression, or
+    /// commenting out a Debug.Log, without a full ~150s rescan).
     ///
-    /// This is the counterpart of the AI-fix incremental refresh (where the verifier registers changed files)
-    /// for the "non-AI, pure manual edit" scenario: save script → recompile →
-    /// domain reload → window rebuilds and consumes this list → RescanFile makes it real-time.
+    /// Two consumers drain the queue (see <see cref="PerfLintAutoRescan"/>): after a script edit's domain reload the window
+    /// consumes on rebuild; after an asset edit (no domain reload) the debounced auto-pump brings the baseline up to date —
+    /// updating the open window's live result, or the on-disk baseline when no window is open.
     ///
-    /// Only watches <c>.cs</c> files (only script-based rules do file-level incremental updates in this project:
-    /// DebugLog / Migration / Script GC-Roslyn); and only records when a persisted baseline already exists
-    /// (no point recording when there is no report to update). If the batch is too large,
-    /// <see cref="PerfLintPendingRescan"/> automatically falls back to a "whole baseline expired" marker
-    /// to avoid serially rescanning hundreds of files on domain reload.
+    /// Which paths qualify is asked of the discovered file scanners' path-based <see cref="IFileScanner.Handles"/>
+    /// (<see cref="ScanRunner.IsFileScannable"/>), so this automatically covers every scanner that opts into incremental
+    /// re-scan — no per-type list to maintain here. Only records when a persisted baseline already exists (nothing to
+    /// update otherwise). Oversized batches fall back to a "whole baseline expired" marker inside
+    /// <see cref="PerfLintPendingRescan"/> to avoid serially rescanning hundreds of files.
     /// </summary>
     internal sealed class PerfLintChangeTracker : AssetPostprocessor
     {
@@ -33,7 +33,7 @@ namespace PerfLint.Core
             {
                 if (paths == null) return;
                 foreach (var p in paths)
-                    if (!string.IsNullOrEmpty(p) && p.EndsWith(".cs")) changed.Add(p);
+                    if (!string.IsNullOrEmpty(p) && ScanRunner.IsFileScannable(p)) changed.Add(p);
             }
 
             Consider(importedAssets);     // newly created / re-imported after modification
@@ -41,7 +41,13 @@ namespace PerfLint.Core
             Consider(movedAssets);        // new path after move
             Consider(movedFromAssetPaths); // old path before move → clears findings under the old path
 
-            if (changed.Count > 0) PerfLintPendingRescan.Record(changed);
+            if (changed.Count > 0)
+            {
+                PerfLintPendingRescan.Record(changed);
+                // Asset edits don't trigger a domain reload, so the window's on-reload consume won't fire — nudge the
+                // debounced auto-pump to catch the baseline up on the next editor tick.
+                PerfLintAutoRescan.Notify();
+            }
         }
     }
 }

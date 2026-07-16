@@ -21,6 +21,16 @@ namespace PerfLint.Core
         /// <summary>Whether a Pro subscription is required to execute this action.</summary>
         public bool RequiresPro { get; }
 
+        /// <summary>
+        /// Whether the UI may offer a rule-level "run all" button that fires this action across every finding of the
+        /// same rule. True for actions that are homogeneous and independent (e.g. "Extract to shared group" — each
+        /// finding does the same thing to its own asset). Set FALSE when the findings' actions differ per row or can't
+        /// run in a loop: e.g. PKG001's disable targets a DIFFERENT module per finding (so a shared "Disable X all"
+        /// label would be a lie) and each disable triggers a package re-resolve + domain reload + one-at-a-time compile
+        /// verification — batching them would break mid-loop. When false, only the per-row button is shown.
+        /// </summary>
+        public bool AllowRuleBatch { get; }
+
         /// <summary>The execution delegate. Implementations must not show any UI; return the result and let the UI handle the prompt.</summary>
         public Func<FixResult> Run { get; }
 
@@ -55,7 +65,7 @@ namespace PerfLint.Core
 
         public FindingAction(string label, string confirmMessage, Func<FixResult> run, bool requiresPro = true,
             Func<string, FixResult> runWithChoice = null, Func<IReadOnlyList<string>, FixResult> batchRun = null,
-            string batchConfirmMessage = null)
+            string batchConfirmMessage = null, bool allowRuleBatch = true)
         {
             if (string.IsNullOrEmpty(label)) throw new ArgumentException("label is required", nameof(label));
             Label = label;
@@ -65,6 +75,7 @@ namespace PerfLint.Core
             RunWithChoice = runWithChoice;
             BatchRun = batchRun;
             BatchConfirmMessage = batchConfirmMessage;
+            AllowRuleBatch = allowRuleBatch;
         }
     }
 }

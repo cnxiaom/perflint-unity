@@ -33,7 +33,7 @@ namespace PerfLint.Scanners
     /// the API is absent. A dedicated unit test asserts the reflection resolves, so the release version matrix
     /// (2021.3/2022.3/2023.1/U6) catches any signature change per version instead of silently losing the rule.
     /// </summary>
-    public sealed class StaticBatchingScanner : IScanner
+    public sealed class StaticBatchingScanner : IScanner, ISceneScoped
     {
         public string Name => "Static Batching Memory";
         public Domain Domain => Domain.Performance;
@@ -109,8 +109,10 @@ namespace PerfLint.Scanners
                              "Top contributors:\n  " + string.Join("\n  ", top) + "\n" +
                              "This is a frame-time ↔ memory trade-off, not a defect: static batching cuts draw-call CPU cost by paying memory. " +
                              "If your project is memory-bound (or the Memory Profiler shows Mesh dominated by 'Combined Mesh'), disabling it can " +
-                             "reclaim most of this estimate; a real-world case dropped Mesh memory 350MB → 62MB with GPU time unchanged. If you are " +
-                             "draw-call-bound instead, keep it and treat this as your bill. The estimate is approximate (~16-bit indices assumed; " +
+                             "reclaim most of this estimate; a real-world case dropped Mesh memory 350MB → 62MB with GPU time unchanged. " +
+                             "The Combined Meshes are baked into the player too, so this inflates build size as well — and Unity's Build Report hides it: " +
+                             "its per-category breakdown counts user assets only, so the combined geometry shows under no category (not even Meshes), only in 'Complete build size'. " +
+                             "If you are draw-call-bound instead, keep it and treat this as your bill. The estimate is approximate (~16-bit indices assumed; " +
                              "Optimize Mesh Data may strip attributes at build). Only loaded scenes are counted — open your heaviest scene for a full bill. " +
                              "Also note batches split at 64000 vertices, and marking huge unique meshes BatchingStatic buys nothing (no shared draws) while still paying the copy.",
                              $"{target} 平台启用了 Static Batching，且当前已加载场景（{string.Join("、", sceneNames)}）含 " +
@@ -118,6 +120,7 @@ namespace PerfLint.Scanners
                              $"（按实例、叠加在原网格之上）——预计额外占用约 {totalHuman} 运行时网格内存。主要来源：\n  " + string.Join("\n  ", top) + "\n" +
                              "这是帧时间 ↔ 内存的取舍而非缺陷：静态合批用内存换 Draw Call 的 CPU 开销。若项目受内存压制" +
                              "（或 Memory Profiler 里 Mesh 大头是「Combined Mesh」），关闭它能拿回本估算的大部分；实测案例网格内存 350MB → 62MB、GPU 耗时不变。" +
+                             "这些 Combined Mesh 也会被打进 Player，故同样撑大包体——而 Unity 的 Build Report 看不见它：按类目统计只算用户资产，合并几何不落任何类目（连 Meshes 都不算），只体现在 Complete build size 总数里。" +
                              "若瓶颈在 Draw Call，则保留并把这当成一笔明账。估算为约值（按 16 位索引估；构建时 Optimize Mesh Data 可能剔除部分顶点属性）。" +
                              "只统计已加载场景——打开最重的场景可得完整账单。另注意合批按 64000 顶点拆批；巨型独占网格标 BatchingStatic 没有共享收益、白付复制代价。"),
                 targetPath: null,

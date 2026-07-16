@@ -14,7 +14,8 @@ namespace PerfLint.Core
     ///   1) Copies the bundled Microsoft.CodeAnalysis(.CSharp).dll into the project's Editor-only plugin
     ///      directory, along with pre-authored .meta files that set the correct import options
     ///      (Editor-only, Validate References off) — no per-DLL manual configuration needed;
-    ///   2) Adds the scripting define `PERFLINT_ROSLYN`;
+    ///   2) Adds the scripting define `PERFLINT_ROSLYN` — to ALL build target groups, because defines
+    ///      are stored per group and a per-group write silently un-enables the module on platform switch;
     ///   3) Triggers a recompile — after which the PerfLint.Editor.Roslyn assembly is compiled and
     ///      the GC / per-frame allocation / CPU hot-loop rules become active.
     ///
@@ -385,39 +386,130 @@ namespace PerfLint.Core
             }
         }
 
-        // ── Scripting Define operations (targeting the currently active Build Target Group) ──────────
+        // ── Scripting Define operations ───────────────────────────────────────────────────────────────
+        // Scripting defines are stored PER BuildTargetGroup. Writing only the active group breaks on
+        // platform switch: enable on Standalone → switch to WebGL → the WebGL group lacks the define →
+        // the Roslyn assembly (defineConstraints-gated) is not compiled → the "not enabled" banner
+        // reappears even though the DLLs are installed. Install/Uninstall therefore write the define to
+        // ALL valid groups, and RoslynDefineSync (below) heals installs made by older per-group versions.
         private static BuildTargetGroup ActiveGroup =>
             BuildPipeline.GetBuildTargetGroup(EditorUserBuildSettings.activeBuildTarget);
 
-        public static bool HasDefine()
+        /// <summary>Whether the define is present for the ACTIVE group (i.e. what the current compilation sees).</summary>
+        public static bool HasDefine() => HasDefineOn(ActiveGroup);
+
+        private static bool HasDefineOn(BuildTargetGroup group)
         {
-            var defs = PlayerSettings.GetScriptingDefineSymbolsForGroup(ActiveGroup)
-                .Split(';').Select(s => s.Trim());
-            return defs.Contains(Define);
+            try
+            {
+                return PlayerSettings.GetScriptingDefineSymbolsForGroup(group)
+                    .Split(';').Select(s => s.Trim()).Contains(Define);
+            }
+            catch { return false; }
         }
 
-        private static void AddDefine()
+        /// <summary>True if any valid group carries the define — treated as "the user enabled the module for this project".</summary>
+        internal static bool HasDefineOnAnyGroup() => DefineTargetGroups().Any(HasDefineOn);
+
+        /// <summary>Whether the core DLLs are physically present in the project (regardless of defines). Used by the heal to avoid resurrecting a torn-out module.</summary>
+        internal static bool CoreDllsInProject() => DllsAlreadyInProject();
+
+        /// <summary>Re-applies the define to all valid groups (the heal entry point; same write path as Install).</summary>
+        internal static void ReapplyDefineToAllGroups() => AddDefine();
+
+        /// <summary>
+        /// All BuildTargetGroup values worth writing defines to: skips Unknown and [Obsolete] members
+        /// (writing to obsolete groups logs editor errors, and enum aliases would double-write).
+        /// Internal for regression testing.
+        /// </summary>
+        internal static BuildTargetGroup[] DefineTargetGroups()
         {
-            var group = ActiveGroup;
-            var defs = PlayerSettings.GetScriptingDefineSymbolsForGroup(group)
+            var groups = new System.Collections.Generic.List<BuildTargetGroup>();
+            foreach (var field in typeof(BuildTargetGroup).GetFields(
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+            {
+                if (field.IsDefined(typeof(ObsoleteAttribute), inherit: false)) continue;
+                var g = (BuildTargetGroup)field.GetValue(null);
+                if (g == BuildTargetGroup.Unknown) continue;
+                if (!groups.Contains(g)) groups.Add(g);
+            }
+            return groups.ToArray();
+        }
+
+        /// <summary>Adds <paramref name="define"/> to a ';'-separated define list. Returns the updated list, or null when no write is needed (already present). Pure; internal for tests.</summary>
+        internal static string AddDefineToCsv(string csv, string define)
+        {
+            var defs = SplitDefines(csv);
+            if (defs.Contains(define)) return null;
+            defs.Add(define);
+            return string.Join(";", defs);
+        }
+
+        /// <summary>Removes <paramref name="define"/> from a ';'-separated define list. Returns the updated list, or null when no write is needed (not present). Pure; internal for tests.</summary>
+        internal static string RemoveDefineFromCsv(string csv, string define)
+        {
+            var defs = SplitDefines(csv);
+            if (!defs.Remove(define)) return null;
+            return string.Join(";", defs);
+        }
+
+        private static System.Collections.Generic.List<string> SplitDefines(string csv) =>
+            (csv ?? string.Empty)
                 .Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
                 .Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
-            if (!defs.Contains(Define))
+
+        private static void AddDefine() => ApplyToAllGroups(csv => AddDefineToCsv(csv, Define));
+
+        private static void RemoveDefine() => ApplyToAllGroups(csv => RemoveDefineFromCsv(csv, Define));
+
+        private static void ApplyToAllGroups(Func<string, string> transform)
+        {
+            foreach (var g in DefineTargetGroups())
             {
-                defs.Add(Define);
-                PlayerSettings.SetScriptingDefineSymbolsForGroup(group, string.Join(";", defs));
+                try
+                {
+                    string updated = transform(PlayerSettings.GetScriptingDefineSymbolsForGroup(g));
+                    if (updated != null) PlayerSettings.SetScriptingDefineSymbolsForGroup(g, updated);
+                }
+                catch { /* group unsupported by this editor — skip; only that group misses the define */ }
             }
         }
 
-        private static void RemoveDefine()
+        private static string ThisFilePath([CallerFilePath] string path = null) => path;
+    }
+
+    /// <summary>
+    /// Heals per-group define drift on load. Versions up to 1.1.0 wrote PERFLINT_ROSLYN only to the
+    /// then-active build target group, so switching platform (e.g. Standalone → WebGL) silently lost the
+    /// module: DLLs installed, banner claiming "not enabled". If any group carries the define but the
+    /// active one does not — and the core DLLs are still in the project (missing DLLs mean the user tore
+    /// the module out; never resurrect that) — re-apply the define to all groups. Costs one extra
+    /// recompile right after the platform-switch recompile, then stays a permanent no-op; the log line
+    /// makes the write observable. Current Install/Uninstall write all groups, so this only fires for
+    /// projects enabled by older versions (or a manually deleted per-group define).
+    /// </summary>
+    [InitializeOnLoad]
+    internal static class RoslynDefineSync
+    {
+        static RoslynDefineSync()
         {
-            var group = ActiveGroup;
-            var defs = PlayerSettings.GetScriptingDefineSymbolsForGroup(group)
-                .Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
-                .Select(s => s.Trim()).Where(s => s.Length > 0 && s != Define).ToList();
-            PlayerSettings.SetScriptingDefineSymbolsForGroup(group, string.Join(";", defs));
+            // PlayerSettings writes straight from InitializeOnLoad can race initial asset-db work; defer one tick.
+            EditorApplication.delayCall += SyncIfNeeded;
         }
 
-        private static string ThisFilePath([CallerFilePath] string path = null) => path;
+        private static void SyncIfNeeded()
+        {
+            try
+            {
+                if (RoslynSetup.HasDefine()) return;              // active group already carries it
+                if (!RoslynSetup.HasDefineOnAnyGroup()) return;   // never enabled / cleanly disabled
+                if (!RoslynSetup.CoreDllsInProject()) return;     // module torn out — do not resurrect
+                RoslynSetup.ReapplyDefineToAllGroups();
+                Debug.Log(L.Tr(
+                    "[PerfLint] Deep script analysis was enabled for another build target; re-applied PERFLINT_ROSLYN for the current target (one-time recompile).",
+                    "[PerfLint] 深度脚本分析此前在其它构建目标上启用过；已为当前目标补上 PERFLINT_ROSLYN（一次性重新编译）。"));
+            }
+            catch { /* never break editor load */ }
+        }
     }
 }

@@ -5,6 +5,7 @@ using PerfLint.Scanners;
 using UnityEditor;
 using UnityEditor.UIElements;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.UIElements;
 
 namespace PerfLint.UI
@@ -23,6 +24,9 @@ namespace PerfLint.UI
         private Label _stateLabel;
         private VisualElement _unavailableBox;
         private IVisualElementScheduledItem _poll;
+        private Label _devCountLabel;
+        private Label _devConnLabel;
+        private Toggle _devLogToggle;
 
         [MenuItem("Tools/PerfLint/Shader Variant Stripping")]
         public static void Open()
@@ -54,6 +58,13 @@ namespace PerfLint.UI
             L.InjectDevLangSwitch(toolbar, () => { root.Clear(); CreateGUI(); });
             root.Add(toolbar);
 
+            // Everything below scrolls. Without this, when the content is taller than the window (small window or a
+            // larger editor UI scale) the flex column shrinks each card, but wrapped Labels don't reflow shorter —
+            // text spills out of its shrunken card and overlaps the next one. minHeight=0 lets the ScrollView itself
+            // shrink below its content height (flex children default to min-height:auto).
+            var body = new ScrollView(ScrollViewMode.Vertical) { style = { flexGrow = 1, minHeight = 0 } };
+            root.Add(body);
+
             // ── Unavailable notice (internal API didn't resolve on this editor) ──
             _unavailableBox = MakeCard();
             _unavailableBox.style.display = DisplayStyle.None;
@@ -61,7 +72,7 @@ namespace PerfLint.UI
                 "Shader-variant recording isn't available on this Unity version (the editor's internal tracking API didn't resolve). Static shader diagnostics (SHDR001) still work in the Scan panel.",
                 "本 Unity 版本不支持着色器变体录制（编辑器内部追踪 API 未解析到）。静态着色器诊断（SHDR001）在扫描面板仍可用。"))
             { style = { whiteSpace = WhiteSpace.Normal, color = new Color(0.95f, 0.78f, 0.30f), fontSize = 11 } });
-            root.Add(_unavailableBox);
+            body.Add(_unavailableBox);
 
             // ── Capture status card ───────────────────
             var statusCard = MakeCard();
@@ -69,7 +80,7 @@ namespace PerfLint.UI
             _stateLabel = new Label { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.7f, fontSize = 11, marginTop = 4 } };
             statusCard.Add(_countLabel);
             statusCard.Add(_stateLabel);
-            root.Add(statusCard);
+            body.Add(statusCard);
 
             // ── Record controls ───────────────────────
             var controls = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginTop = 8, flexWrap = Wrap.Wrap } };
@@ -87,25 +98,27 @@ namespace PerfLint.UI
             playBtn.style.height = 26;
             playBtn.style.marginLeft = 6;
             controls.Add(playBtn);
-            root.Add(controls);
+            body.Add(controls);
 
             // ── How-to ────────────────────────────────
-            root.Add(new Label(L.Tr(
+            body.Add(new Label(L.Tr(
                 "How to capture: 1) Clear. 2) Enter Play Mode and walk through the scenes, quality levels and platforms you ship — Unity records every shader variant it actually renders. 3) Save to a .shadervariants asset. Then turn on Warm-up below: Unity precompiles those variants at startup, so they don't hitch the first time they're used. (Build-time stripping from the same asset is also available, but it's experimental — see its warning.)",
                 "录制步骤：1）清空。2）进入 Play Mode，把你要发布的场景、画质档、平台都走一遍——Unity 会记录它实际渲染过的每个着色器变体。3）保存为 .shadervariants 资产。然后在下方开启「启动预热」：Unity 启动时预编译这些变体，首次使用就不会卡顿。（同一份资产也可做构建期剥离，但那是实验性的——见其警告。）"))
             { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.85f, fontSize = 11, marginTop = 10 } });
 
-            root.Add(new Label(L.Tr(
+            body.Add(new Label(L.Tr(
                 "Tip: capture is cumulative until you Clear. Run several sessions (different scenes/quality/platforms) for fuller coverage — warm-up is safe either way (precompiling fewer variants just means a few first-use hitches remain), but stripping to an incomplete capture is what breaks builds.",
                 "提示：捕获会累积，直到你点清空。多跑几次（不同场景/画质/平台）覆盖更全——预热无论如何都安全（少预热几个，只是还剩几次首用卡顿），但「剥离到不完整捕获」才是会弄坏 build 的那个。"))
             { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.6f, fontSize = 11, marginTop = 6, unityFontStyleAndWeight = FontStyle.Italic } });
 
-            root.Add(BuildBLayerSections());
+            body.Add(BuildDeviceCaptureCard());
+
+            body.Add(BuildBLayerSections());
 
             var strictCard = BuildStrictMatchingCard();
-            if (strictCard != null) root.Add(strictCard);
+            if (strictCard != null) body.Add(strictCard);
 
-            root.Add(new Label(L.Tr(
+            body.Add(new Label(L.Tr(
                 "Recording runs locally and is never uploaded.",
                 "录制在本机完成、永不上传。"))
             { style = { whiteSpace = WhiteSpace.Normal, unityFontStyleAndWeight = FontStyle.Italic, opacity = 0.5f, marginTop = 10, fontSize = 10 } });
@@ -116,6 +129,8 @@ namespace PerfLint.UI
 
         private void RefreshState()
         {
+            RefreshDeviceState(); // device capture is independent of the editor's internal tracking API
+
             bool ok = ShaderVariantRecorder.Available;
             if (_unavailableBox != null) _unavailableBox.style.display = ok ? DisplayStyle.None : DisplayStyle.Flex;
             if (!ok)
@@ -172,6 +187,231 @@ namespace PerfLint.UI
         private static void EnterPlay()
         {
             if (!EditorApplication.isPlaying) EditorApplication.isPlaying = true;
+        }
+
+        /// <summary>
+        /// Device capture: what a development build compiles on the real device/graphics API — the set the editor's
+        /// Play Mode recorder can't see. The in-build recorder streams records back over the Profiler attach channel
+        /// (PlayerConnection) while the device runs; devices that can't attach leave a capture file to import, and a
+        /// raw Player.log / logcat dump imports too. Receiving is free and always on (the conversion hook is seeing
+        /// the numbers stream in); merging into a collection is the Pro action.
+        /// </summary>
+        private VisualElement BuildDeviceCaptureCard()
+        {
+            var card = MakeCard();
+            card.style.marginTop = 4;
+            card.Add(new Label(L.Tr("Capture on device (development builds)", "真机捕获（Development Build）"))
+            { style = { unityFontStyleAndWeight = FontStyle.Bold, marginBottom = 4 } });
+
+            card.Add(new Label(L.Tr(
+                "The editor records what the EDITOR renders. Your players compile a different set — per platform, graphics API and quality level. This captures the real thing from a running build.",
+                "编辑器录的是「编辑器渲染的变体」。打出的包在不同平台/图形 API/画质下编译的是另一套。这里从真实运行的构建里捕获真正的那套。"))
+            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.85f, fontSize = 11, marginBottom = 6 } });
+
+            _devLogToggle = new Toggle(L.Tr("Log shader compilation in players", "在播放器中记录着色器编译"))
+            { value = SafeGetLogWhenShaderCompiled() };
+            WrapToggleLabel(_devLogToggle);
+            _devLogToggle.tooltip = L.Tr(
+                "Sets Graphics Settings → Log Shader Compilation. Development builds then log each variant they compile, and PerfLint's in-build recorder picks those up. Release builds are unaffected.",
+                "设置 Graphics Settings → Log Shader Compilation。之后 Development Build 会记录它编译的每个变体，PerfLint 的包内录制器负责捕获。Release 构建不受影响。");
+            _devLogToggle.RegisterValueChangedCallback(evt =>
+            {
+                if (!SafeSetLogWhenShaderCompiled(evt.newValue))
+                    _devLogToggle.SetValueWithoutNotify(!evt.newValue);
+            });
+            card.Add(_devLogToggle);
+
+            card.Add(new Label(L.Tr(
+                "1) Turn on logging above. 2) Make a Development Build and run it — walk every scene, quality level and platform you ship. 3) Desktop players (Windows/macOS/Linux): an attached player (Build & Run attaches automatically) streams its variants here live, and also keeps a capture file (<persistentDataPath>/PerfLint/shader-variants-*.json) you can import later. 4) Android/iOS players can't read their own log — dump it instead (adb logcat > log.txt, or the Xcode console) and import the dump below. 5) Merge into a collection, then enable warm-up below.",
+                "1）开启上面的记录开关。2）打一个 Development Build 运行——把要发布的场景、画质、平台都走一遍。3）桌面播放器（Windows/macOS/Linux）：已连接的播放器（Build & Run 自动连接）会把变体实时传回这里，同时写一份捕获文件（<persistentDataPath>/PerfLint/shader-variants-*.json）供事后导入。4）Android/iOS 播放器读不到自己的日志——改为导出日志（adb logcat > log.txt，或 Xcode 控制台）后在下方导入。5）并入集合后，在下方开启预热。"))
+            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.85f, fontSize = 11, marginTop = 6 } });
+
+            _devCountLabel = new Label { style = { unityFontStyleAndWeight = FontStyle.Bold, marginTop = 8 } };
+            card.Add(_devCountLabel);
+            _devConnLabel = new Label { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 2, opacity = 0.8f } };
+            card.Add(_devConnLabel);
+
+            var buttons = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginTop = 8, flexWrap = Wrap.Wrap } };
+            var mergeBtn = new Button(OnMergeDeviceCapture) { text = L.Tr("Add to collection… (Pro)", "并入集合…（Pro）") };
+            mergeBtn.style.height = 26;
+            mergeBtn.style.backgroundColor = new Color(0.20f, 0.45f, 0.85f);
+            mergeBtn.style.color = Color.white;
+            mergeBtn.style.unityFontStyleAndWeight = FontStyle.Bold;
+            buttons.Add(mergeBtn);
+            var importBtn = new Button(OnImportDeviceCapture) { text = L.Tr("Import capture / log file…", "导入捕获 / 日志文件…") };
+            importBtn.style.height = 26;
+            importBtn.style.marginLeft = 6;
+            buttons.Add(importBtn);
+            var clearBtn = new Button(OnClearDeviceCapture) { text = L.Tr("Clear received", "清空已接收") };
+            clearBtn.style.height = 26;
+            clearBtn.style.marginLeft = 6;
+            buttons.Add(clearBtn);
+            card.Add(buttons);
+
+            card.Add(new Label(L.Tr(
+                "Streams over Unity's local editor-attach connection (the Profiler channel) — your LAN at most, never the internet.",
+                "数据走 Unity 本地的编辑器连接通道（Profiler 同款）——最多经局域网，绝不上互联网。"))
+            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.5f, fontSize = 10, marginTop = 6, unityFontStyleAndWeight = FontStyle.Italic } });
+
+            return card;
+        }
+
+        private void RefreshDeviceState()
+        {
+            if (_devCountLabel == null || _devConnLabel == null) return;
+
+            if (_devLogToggle != null)
+                _devLogToggle.SetValueWithoutNotify(SafeGetLogWhenShaderCompiled());
+
+            int received = PlayerVariantIngest.Count;
+            int sources = PlayerVariantIngest.Sources.Count;
+            _devCountLabel.text = received > 0
+                ? L.Tr($"Received {received:N0} variant records · {sources} source(s)", $"已接收 {received:N0} 条变体记录 · {sources} 个来源")
+                : L.Tr("Nothing received yet.", "尚未接收到任何记录。");
+
+            int players = PlayerVariantIngest.ConnectedPlayers;
+            if (players > 0 && PlayerVariantIngest.RecorderOnline)
+            {
+                bool live = EditorApplication.timeSinceStartup - PlayerVariantIngest.LastLiveReceive < 5.0;
+                _devConnLabel.text = live
+                    ? L.Tr($"● {players} player(s) attached · recorder online — receiving now.", $"● 已连接 {players} 个播放器 · 录制器在线——正在接收。")
+                    : L.Tr($"● {players} player(s) attached · recorder online — new variants stream in as they compile.", $"● 已连接 {players} 个播放器 · 录制器在线——新变体编译时会实时传回。");
+                _devConnLabel.style.color = new Color(0.45f, 0.80f, 0.50f);
+            }
+            else if (players > 0)
+            {
+                // Attached but the recorder never said hello: the running build has no active recorder — almost
+                // always a build made before capture was enabled (or before this PerfLint version). Rebuilding fixes it.
+                _devConnLabel.text = L.Tr(
+                    $"● {players} player(s) attached, but PerfLint's in-build recorder hasn't reported in. Most likely the running build predates enabling capture — make a fresh Development Build and run it. To verify, search the device's Player.log for \"PerfLint: recording compiled shader variants\".",
+                    $"● 已连接 {players} 个播放器，但包内录制器没有上报。最常见原因：正在跑的包是在开启捕获之前打的——重新打一个 Development Build 再运行。可在设备 Player.log 里搜 “PerfLint: recording compiled shader variants” 验证。");
+                _devConnLabel.style.color = new Color(0.95f, 0.70f, 0.20f);
+            }
+            else
+            {
+                _devConnLabel.text = L.Tr(
+                    "No player attached. Build & Run attaches automatically (or attach via the Profiler); importing a file works without any connection.",
+                    "未连接播放器。Build & Run 会自动连接（也可通过 Profiler 连接）；导入文件则完全不需要连接。");
+                _devConnLabel.style.color = new StyleColor(StyleKeyword.Null);
+            }
+        }
+
+        private void OnMergeDeviceCapture()
+        {
+            if (PlayerVariantIngest.Count == 0)
+            {
+                EditorUtility.DisplayDialog(L.Tr("Nothing received yet", "尚未接收到任何记录"),
+                    L.Tr("Run a development build with shader-compilation logging on, or import a capture file / Player.log first.", "请先运行开启了着色器编译记录的 Development Build，或先导入捕获文件 / Player.log。"), "OK");
+                return;
+            }
+            if (!Entitlements.RequirePro(L.Tr("Device variant capture", "真机变体捕获"))) return;
+
+            string path = EditorUtility.SaveFilePanelInProject(
+                L.Tr("Add device capture to a variant collection", "把真机捕获并入变体集合"),
+                "DeviceShaderVariants", "shadervariants",
+                L.Tr("Pick a new or existing .shadervariants asset — an existing collection is merged into, not overwritten.", "选择新建或已有的 .shadervariants 资产——已有集合走合并、不会被覆盖。"));
+            if (string.IsNullOrEmpty(path)) return;
+
+            var svc = AssetDatabase.LoadAssetAtPath<ShaderVariantCollection>(path);
+            if (svc == null)
+            {
+                svc = new ShaderVariantCollection { name = System.IO.Path.GetFileNameWithoutExtension(path) };
+                AssetDatabase.CreateAsset(svc, path);
+            }
+
+            var res = PlayerVariantSvcBuilder.Build(PlayerVariantIngest.Records(), svc);
+            EditorUtility.SetDirty(svc);
+            AssetDatabase.SaveAssets();
+
+            if (res.MissingShaders.Count > 0)
+            {
+                const int cap = 20;
+                var shown = res.MissingShaders.Count > cap ? res.MissingShaders.GetRange(0, cap) : res.MissingShaders;
+                Debug.LogWarning(
+                    $"PerfLint device capture: {res.MissingShaders.Count} captured shader(s) aren't in this project (packed in a bundle, renamed, or from another project):\n - "
+                    + string.Join("\n - ", shown) + (res.MissingShaders.Count > cap ? "\n   …" : ""));
+            }
+
+            string extraEn = "", extraZh = "";
+            if (res.UnresolvedVariants > 0)
+            {
+                extraEn += $"\n{res.UnresolvedVariants:N0} record(s) matched no pass/keyword combination of their shader and were skipped (never guessed in).";
+                extraZh += $"\n{res.UnresolvedVariants:N0} 条记录与其 shader 的任何 pass/keyword 组合都对不上，已跳过（绝不瞎猜写入）。";
+            }
+            if (res.MissingShaders.Count > 0)
+            {
+                extraEn += $"\n{res.MissingShaders.Count:N0} shader(s) aren't in this project — names are in the Console.";
+                extraZh += $"\n{res.MissingShaders.Count:N0} 个 shader 不在本工程——名单见 Console。";
+            }
+
+            // Point the shared B-layer picker at the merged collection so warm-up is one toggle away.
+            var settings = ShaderStripSettings.instance;
+            settings.svcPath = path;
+            settings.SaveNow();
+
+            EditorUtility.DisplayDialog(L.Tr("Device capture merged", "真机捕获已并入"),
+                L.Tr($"Added {res.Added:N0} variants ({res.AlreadyPresent:N0} already present) from {res.TotalRecords:N0} captured records.{extraEn}\n\nNext: enable warm-up on this collection below.",
+                     $"从 {res.TotalRecords:N0} 条捕获记录并入 {res.Added:N0} 个变体（{res.AlreadyPresent:N0} 个已存在）。{extraZh}\n\n下一步：在下方对该集合开启预热。"), "OK");
+
+            EditorGUIUtility.PingObject(svc);
+            Selection.activeObject = svc;
+            rootVisualElement.Clear();
+            CreateGUI(); // rebuild so the picker + warm-up state reflect the merged collection
+        }
+
+        private void OnImportDeviceCapture()
+        {
+            string path = EditorUtility.OpenFilePanel(
+                L.Tr("Import device capture (JSON) or player log", "导入真机捕获（JSON）或播放器日志"), "", "");
+            if (string.IsNullOrEmpty(path)) return;
+
+            var res = PlayerVariantIngest.ImportFile(path);
+            if (res.Error != null)
+            {
+                EditorUtility.DisplayDialog(L.Tr("Import failed", "导入失败"), res.Error, "OK");
+                return;
+            }
+            if (res.Parsed == 0)
+            {
+                EditorUtility.DisplayDialog(L.Tr("No variants found", "未发现变体"),
+                    L.Tr("That file contains no shader-compilation records. Expected the recorder's JSON capture, or a log from a development build with \"Log Shader Compilation\" on.",
+                         "该文件里没有着色器编译记录。需要录制器的 JSON 捕获文件，或开启了「Log Shader Compilation」的 Development Build 日志。"), "OK");
+                return;
+            }
+            ShowNotification(new GUIContent(L.Tr(
+                $"Imported {res.Parsed:N0} records ({(res.WasJson ? "capture file" : "log file")}) · {res.Added:N0} new",
+                $"已导入 {res.Parsed:N0} 条记录（{(res.WasJson ? "捕获文件" : "日志文件")}）· 新增 {res.Added:N0} 条")));
+            RefreshState();
+        }
+
+        private void OnClearDeviceCapture()
+        {
+            int n = PlayerVariantIngest.Count;
+            if (n == 0) return;
+            if (!EditorUtility.DisplayDialog(L.Tr("Clear received capture?", "清空已接收的捕获？"),
+                L.Tr($"Discard all {n:N0} received variant records? Collections you already saved are not affected.",
+                     $"丢弃已接收的全部 {n:N0} 条变体记录？已保存的集合不受影响。"),
+                L.Tr("Clear", "清空"), L.Tr("Cancel", "取消"))) return;
+            PlayerVariantIngest.Clear();
+            RefreshState();
+        }
+
+        private static bool SafeGetLogWhenShaderCompiled()
+        {
+            try { return GraphicsSettings.logWhenShaderIsCompiled; }
+            catch { return false; }
+        }
+
+        private static bool SafeSetLogWhenShaderCompiled(bool value)
+        {
+            try
+            {
+                GraphicsSettings.logWhenShaderIsCompiled = value;
+                EditorUtility.SetDirty(GraphicsSettings.GetGraphicsSettings());
+                AssetDatabase.SaveAssets();
+                return true;
+            }
+            catch { return false; }
         }
 
         /// <summary>

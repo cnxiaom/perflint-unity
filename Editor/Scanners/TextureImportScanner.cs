@@ -15,7 +15,7 @@ namespace PerfLint.Scanners
     ///   PERF.TEX004 — Sprite/UI texture has Mipmap enabled (~33% extra memory), high-confidence waste, auto-fixable.
     ///   PERF.TEX005 — Compression was requested but the imported texture is actually uncompressed (the importer silently fell back, multiplying VRAM/memory). The usual cause is dimensions a block format can't handle: ETC/ETC2 need multiples of 4, PVRTC needs square power-of-two. Evaluated against the active build target's real imported format → the engine's literal verdict, so zero false positives.
     /// </summary>
-    public sealed class TextureImportScanner : IScanner
+    public sealed class TextureImportScanner : IScanner, IFileScanner
     {
         public string Name => "Texture Import Settings";
         public Domain Domain => Domain.Performance;
@@ -29,6 +29,11 @@ namespace PerfLint.Scanners
         // settings cap well below it) while still bounding the worst-case single load.
         private const long Tex005MaxLoadPixels = 8192L * 8192L;
 
+        // TEX005 GPU/native reclaim throttle counter (see ScannerUtil.ThrottleReclaim). Instance field rather than a Scan-local
+        // so ScanTexture (shared by the full Scan loop and single-file ScanFile) can update it; a full Scan resets it up front,
+        // a single-file ScanFile resets it to 0 (one load never trips the sweep). Never touched concurrently (all main-thread).
+        private int _loadsSinceReclaim;
+
         public IEnumerable<Finding> Scan(ScanContext context)
         {
             // The compression format can be overridden by the "current build platform": once a platform's
@@ -36,14 +41,13 @@ namespace PerfLint.Scanners
             // page's values no longer apply to it. Reading only Default would cause false positives/negatives,
             // so TEX002 resolves the "actually effective" compression state per active platform. (Read/Write and
             // Mipmap are global settings, unaffected by platform.)
-            string platform = !string.IsNullOrEmpty(context.TargetPlatform)
-                ? context.TargetPlatform
-                : ScannerUtil.ActivePlatformName();
+            string platform = ResolvePlatform(context);
 
             var guids = AssetDatabase.FindAssets("t:Texture2D", new[] { "Assets" });
             // TEX005 alone needs the actually-imported runtime format (only a loaded texture exposes it). Resolve the active
             // build target once here; below we load only the compression-requested subset — never every texture.
             string activePlatform = ScannerUtil.ActivePlatformName();
+            _loadsSinceReclaim = 0;
             for (int i = 0; i < guids.Length; i++)
             {
                 context.CancellationToken.ThrowIfCancellationRequested();
@@ -51,116 +55,176 @@ namespace PerfLint.Scanners
 
                 string path = AssetDatabase.GUIDToAssetPath(guids[i]);
                 if (AssetImporter.GetAtPath(path) is not TextureImporter importer) continue;
+                foreach (var f in ScanTexture(path, importer, platform, activePlatform, bulk: true)) yield return f;
+            }
+        }
 
-                // Read dimensions from importer metadata instead of LoadAssetAtPath<Texture2D>. Loading a texture
-                // materializes its (often uncompressed) pixel payload into native memory; doing that for EVERY texture in a
-                // large project accumulates until the native heap is exhausted and the editor hard-crashes (SIGSEGV in
-                // Texture2D::CreatePixelDataWhenReading — exactly the museum-scale crash this replaces). No pixels load here.
-                GetImportedSize(importer, platform, out int w, out int h);
-                int maxDim = Mathf.Max(w, h);
-                string file = Path.GetFileName(path);
+        /// <summary>
+        /// Path-based (extension) gate for incremental re-scan. Deliberately NOT a GetAtPath/importer check: a DELETED
+        /// texture has no importer, but its stale findings still need clearing — RescanFile only clears findings for a
+        /// path some scanner Handles, so this must return true from the path alone. It's a loose superset (any image
+        /// extension); ScanFile then does the precise <c>GetAtPath is TextureImporter</c> check and no-ops otherwise,
+        /// so a non-texture file with an image extension costs one empty ScanFile and produces nothing.
+        /// </summary>
+        public bool Handles(string assetPath)
+        {
+            if (string.IsNullOrEmpty(assetPath)) return false;
+            switch (Path.GetExtension(assetPath).ToLowerInvariant())
+            {
+                case ".png": case ".jpg": case ".jpeg": case ".tga": case ".psd": case ".tif": case ".tiff":
+                case ".gif": case ".bmp": case ".exr": case ".hdr": case ".iff": case ".pict": case ".dds":
+                case ".webp": case ".cubemap":
+                    return true;
+                default:
+                    return false;
+            }
+        }
 
-                // PERF.TEX001 — Read/Write
-                if (importer.isReadable && maxDim >= ReadWriteSizeThreshold)
+        /// <summary>
+        /// Incremental single-file scan: same per-texture rules as the full Scan, for one asset. Enables RescanFile to refresh
+        /// just an edited texture instead of re-walking every texture in the project. Returns empty for non-texture assets.
+        /// </summary>
+        public IEnumerable<Finding> ScanFile(string assetPath, ScanContext context)
+        {
+            if (AssetImporter.GetAtPath(assetPath) is not TextureImporter importer) return System.Array.Empty<Finding>();
+            _loadsSinceReclaim = 0;
+            // bulk:false — a single-file rescan loads exactly one texture (no OOM risk), so it must NOT force-unload it:
+            // Resources.UnloadAsset on the asset the user just edited evicts it from memory and blanks its open Inspector.
+            return ScanTexture(assetPath, importer, ResolvePlatform(context), ScannerUtil.ActivePlatformName(), bulk: false);
+        }
+
+        private static string ResolvePlatform(ScanContext context)
+            => !string.IsNullOrEmpty(context.TargetPlatform) ? context.TargetPlatform : ScannerUtil.ActivePlatformName();
+
+        /// <summary>
+        /// All TEX00x rules for a single texture, in fixed order (TEX001→005). Shared by the full Scan loop and single-file
+        /// ScanFile so the two are guaranteed identical per asset (asserted by ScanFile_MatchesFullScan_PerTexture). Updates
+        /// the reclaim throttle field when it loads for TEX005.
+        /// </summary>
+        private List<Finding> ScanTexture(string path, TextureImporter importer, string platform, string activePlatform, bool bulk)
+        {
+            var findings = new List<Finding>();
+
+            // Read dimensions from importer metadata instead of LoadAssetAtPath<Texture2D>. Loading a texture
+            // materializes its (often uncompressed) pixel payload into native memory; doing that for EVERY texture in a
+            // large project accumulates until the native heap is exhausted and the editor hard-crashes (SIGSEGV in
+            // Texture2D::CreatePixelDataWhenReading — exactly the museum-scale crash this replaces). No pixels load here.
+            GetImportedSize(importer, platform, out int w, out int h);
+            int maxDim = Mathf.Max(w, h);
+            string file = Path.GetFileName(path);
+
+            // PERF.TEX001 — Read/Write
+            if (importer.isReadable && maxDim >= ReadWriteSizeThreshold)
+            {
+                findings.Add(new Finding(
+                    ruleId: "PERF.TEX001",
+                    domain: Domain.Performance,
+                    severity: Severity.Warning,
+                    title: L.Tr("Texture has Read/Write enabled", "纹理开启了 Read/Write"),
+                    detail: L.Tr($"'{file}' ({w}x{h}) has Read/Write Enabled, which keeps an uncompressed CPU copy in memory" +
+                            " (roughly doubling its footprint). Unless you call GetPixels/Texture2D.Apply at runtime, turn it off.",
+                            $"'{file}' ({w}x{h}) 开启了 Read/Write Enabled，会在内存中保留一份未压缩 CPU 副本" +
+                            "（约翻倍占用）。除非运行时需要 GetPixels/Texture2D.Apply，否则应关闭。"),
+                    targetPath: path,
+                    ping: () => ScannerUtil.PingAsset(path),
+                    fix: new TextureToggleFix(path, readable: false)));
+            }
+
+            // PERF.TEX002 — Uncompressed format (resolves the effective compression state per active platform)
+            if (IsEffectivelyUncompressed(importer, platform) && maxDim >= UncompressedSizeThreshold)
+            {
+                findings.Add(new Finding(
+                    ruleId: "PERF.TEX002",
+                    domain: Domain.Performance,
+                    severity: Severity.Warning,
+                    title: L.Tr("Texture is uncompressed", "纹理未压缩"),
+                    detail: L.Tr($"'{file}' ({w}x{h}) uses an Uncompressed format, taking several times more VRAM and build size than a compressed one. " +
+                            "Switching to Compressed (the platform auto-selects ASTC/ETC2/DXT) is usually visually indistinguishable. " +
+                            "For normal maps or images sensitive to banding, use CompressedHQ instead.",
+                            $"'{file}' ({w}x{h}) 使用 Uncompressed 格式，显存与包体占用是压缩格式的数倍。" +
+                            "改为 Compressed（平台自动选 ASTC/ETC2/DXT）通常肉眼无差。若是法线贴图或" +
+                            "对色带敏感的图，可改用 CompressedHQ。"),
+                    targetPath: path,
+                    ping: () => ScannerUtil.PingAsset(path),
+                    fix: new TextureToggleFix(path, compression: TextureImporterCompression.Compressed, platform: platform)));
+            }
+
+            // PERF.TEX003 — Oversized texture (reporting-only; downscaling is a judgment call, not auto-fixed)
+            if (maxDim >= OversizedThreshold)
+            {
+                findings.Add(new Finding(
+                    ruleId: "PERF.TEX003",
+                    domain: Domain.Performance,
+                    severity: Severity.Info,
+                    title: L.Tr("Oversized texture", "超大纹理"),
+                    detail: L.Tr($"'{file}' ({w}x{h}) is very large, with high VRAM/memory usage. Confirm you really need it this big; " +
+                            "mobile typically does fine with <=2048 (lower Max Size in the import settings, per platform).",
+                            $"'{file}' ({w}x{h}) 尺寸很大，显存/内存占用高。确认是否真的需要这么大；" +
+                            "移动端通常 ≤2048 即可（可在导入设置降低 Max Size，按平台分别设置）。"),
+                    targetPath: path,
+                    ping: () => ScannerUtil.PingAsset(path)));
+            }
+
+            // PERF.TEX004 — Sprite/UI texture has Mipmap enabled (high-confidence waste, fixable)
+            if (importer.mipmapEnabled
+                && (importer.textureType == TextureImporterType.Sprite || importer.textureType == TextureImporterType.GUI))
+            {
+                findings.Add(new Finding(
+                    ruleId: "PERF.TEX004",
+                    domain: Domain.Performance,
+                    severity: Severity.Info,
+                    title: L.Tr("Sprite/UI texture has Mipmaps enabled", "Sprite/UI 纹理开启了 Mipmap"),
+                    detail: L.Tr($"'{file}' is a Sprite/UI texture but has Mipmaps enabled, costing about 33% extra memory. " +
+                            "Screen-space UI usually doesn't need mipmaps; only world-space or heavily scaled sprites do.",
+                            $"'{file}' 是 Sprite/UI 纹理却开启了 Mipmap，会多占约 33% 内存。" +
+                            "屏幕空间 UI 通常不需要 Mipmap；仅世界空间或会大幅缩放的精灵才需要。"),
+                    targetPath: path,
+                    ping: () => ScannerUtil.PingAsset(path),
+                    fix: new TextureToggleFix(path, mipmap: false)));
+            }
+
+            // PERF.TEX005 — Compression requested but the imported texture is actually uncompressed (silent fallback).
+            // Judged against the ACTIVE build target's real imported format (Texture2D.format) — the engine's own verdict,
+            // so there are no false positives. This is the ONLY rule that needs the loaded texture, so we load it only when
+            // compression was requested (a small subset), skip pathologically huge ones (loading them would risk the very
+            // OOM we're avoiding — they're still surfaced by TEX003), and unload it immediately so peak memory stays at
+            // ~one texture. The intent is read for the active platform too (so the two sides match); this rule ignores
+            // context.TargetPlatform (hypothetical other platforms, not what was actually built).
+            if (!IsEffectivelyUncompressed(importer, activePlatform) && maxDim > 0 && (long)w * h <= Tex005MaxLoadPixels)
+            {
+                var tex = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+                bool fellBack = tex != null && IsSilentCompressionFallback(true, tex.format);
+                TextureFormat actualFormat = tex != null ? tex.format : default;
+                // Only a BULK scan force-unloads: a full project scan loads thousands of textures and must release each
+                // immediately (+ a throttled sweep) or the graphics driver OOM-crashes. A single-file (incremental) rescan
+                // loads exactly one texture — force-unloading it would evict an asset the user may be inspecting and blank
+                // its Inspector — so we leave it for Unity's normal asset management.
+                if (tex != null && bulk)
                 {
-                    yield return new Finding(
-                        ruleId: "PERF.TEX001",
+                    Resources.UnloadAsset(tex); // release the CPU pixel buffer immediately
+                    // ...but the GPU upload isn't reclaimed until a sweep runs; throttle one every N loads so peak VRAM/native
+                    // memory stays bounded on large projects instead of climbing until the graphics driver OOM-crashes.
+                    _loadsSinceReclaim = ScannerUtil.ThrottleReclaim(_loadsSinceReclaim);
+                }
+                if (fellBack)
+                {
+                    findings.Add(new Finding(
+                        ruleId: "PERF.TEX005",
                         domain: Domain.Performance,
                         severity: Severity.Warning,
-                        title: L.Tr("Texture has Read/Write enabled", "纹理开启了 Read/Write"),
-                        detail: L.Tr($"'{file}' ({w}x{h}) has Read/Write Enabled, which keeps an uncompressed CPU copy in memory" +
-                                " (roughly doubling its footprint). Unless you call GetPixels/Texture2D.Apply at runtime, turn it off.",
-                                $"'{file}' ({w}x{h}) 开启了 Read/Write Enabled，会在内存中保留一份未压缩 CPU 副本" +
-                                "（约翻倍占用）。除非运行时需要 GetPixels/Texture2D.Apply，否则应关闭。"),
+                        title: L.Tr("Texture compression silently failed", "纹理压缩静默失败"),
+                        detail: L.Tr($"'{file}' ({w}x{h}) is set to Compressed, but the importer fell back to an uncompressed format ({actualFormat}), " +
+                                "multiplying its VRAM and memory use. The usual cause is dimensions a block format can't compress: ETC/ETC2 require both sides to be multiples of 4, " +
+                                "and PVRTC requires square power-of-two. Resize to a compatible size (a multiple of 4, ideally power-of-two), or switch to a format that allows these dimensions (e.g. ASTC).",
+                                $"'{file}' ({w}x{h}) 设为 Compressed，但导入器回退成了未压缩格式（{actualFormat}），显存与内存占用翻数倍。" +
+                                "常见原因是尺寸不满足块压缩要求：ETC/ETC2 要求宽高均为 4 的倍数，PVRTC 要求正方形且为 2 的幂。" +
+                                "请改为兼容尺寸（4 的倍数，最好是 2 的幂），或改用允许该尺寸的格式（如 ASTC）。"),
                         targetPath: path,
-                        ping: () => ScannerUtil.PingAsset(path),
-                        fix: new TextureToggleFix(path, readable: false));
-                }
-
-                // PERF.TEX002 — Uncompressed format (resolves the effective compression state per active platform)
-                if (IsEffectivelyUncompressed(importer, platform) && maxDim >= UncompressedSizeThreshold)
-                {
-                    yield return new Finding(
-                        ruleId: "PERF.TEX002",
-                        domain: Domain.Performance,
-                        severity: Severity.Warning,
-                        title: L.Tr("Texture is uncompressed", "纹理未压缩"),
-                        detail: L.Tr($"'{file}' ({w}x{h}) uses an Uncompressed format, taking several times more VRAM and build size than a compressed one. " +
-                                "Switching to Compressed (the platform auto-selects ASTC/ETC2/DXT) is usually visually indistinguishable. " +
-                                "For normal maps or images sensitive to banding, use CompressedHQ instead.",
-                                $"'{file}' ({w}x{h}) 使用 Uncompressed 格式，显存与包体占用是压缩格式的数倍。" +
-                                "改为 Compressed（平台自动选 ASTC/ETC2/DXT）通常肉眼无差。若是法线贴图或" +
-                                "对色带敏感的图，可改用 CompressedHQ。"),
-                        targetPath: path,
-                        ping: () => ScannerUtil.PingAsset(path),
-                        fix: new TextureToggleFix(path, compression: TextureImporterCompression.Compressed, platform: platform));
-                }
-
-                // PERF.TEX003 — Oversized texture (reporting-only; downscaling is a judgment call, not auto-fixed)
-                if (maxDim >= OversizedThreshold)
-                {
-                    yield return new Finding(
-                        ruleId: "PERF.TEX003",
-                        domain: Domain.Performance,
-                        severity: Severity.Info,
-                        title: L.Tr("Oversized texture", "超大纹理"),
-                        detail: L.Tr($"'{file}' ({w}x{h}) is very large, with high VRAM/memory usage. Confirm you really need it this big; " +
-                                "mobile typically does fine with <=2048 (lower Max Size in the import settings, per platform).",
-                                $"'{file}' ({w}x{h}) 尺寸很大，显存/内存占用高。确认是否真的需要这么大；" +
-                                "移动端通常 ≤2048 即可（可在导入设置降低 Max Size，按平台分别设置）。"),
-                        targetPath: path,
-                        ping: () => ScannerUtil.PingAsset(path));
-                }
-
-                // PERF.TEX004 — Sprite/UI texture has Mipmap enabled (high-confidence waste, fixable)
-                if (importer.mipmapEnabled
-                    && (importer.textureType == TextureImporterType.Sprite || importer.textureType == TextureImporterType.GUI))
-                {
-                    yield return new Finding(
-                        ruleId: "PERF.TEX004",
-                        domain: Domain.Performance,
-                        severity: Severity.Info,
-                        title: L.Tr("Sprite/UI texture has Mipmaps enabled", "Sprite/UI 纹理开启了 Mipmap"),
-                        detail: L.Tr($"'{file}' is a Sprite/UI texture but has Mipmaps enabled, costing about 33% extra memory. " +
-                                "Screen-space UI usually doesn't need mipmaps; only world-space or heavily scaled sprites do.",
-                                $"'{file}' 是 Sprite/UI 纹理却开启了 Mipmap，会多占约 33% 内存。" +
-                                "屏幕空间 UI 通常不需要 Mipmap；仅世界空间或会大幅缩放的精灵才需要。"),
-                        targetPath: path,
-                        ping: () => ScannerUtil.PingAsset(path),
-                        fix: new TextureToggleFix(path, mipmap: false));
-                }
-
-                // PERF.TEX005 — Compression requested but the imported texture is actually uncompressed (silent fallback).
-                // Judged against the ACTIVE build target's real imported format (Texture2D.format) — the engine's own verdict,
-                // so there are no false positives. This is the ONLY rule that needs the loaded texture, so we load it only when
-                // compression was requested (a small subset), skip pathologically huge ones (loading them would risk the very
-                // OOM we're avoiding — they're still surfaced by TEX003), and unload it immediately so peak memory stays at
-                // ~one texture. The intent is read for the active platform too (so the two sides match); this rule ignores
-                // context.TargetPlatform (hypothetical other platforms, not what was actually built).
-                if (!IsEffectivelyUncompressed(importer, activePlatform) && maxDim > 0 && (long)w * h <= Tex005MaxLoadPixels)
-                {
-                    var tex = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
-                    bool fellBack = tex != null && IsSilentCompressionFallback(true, tex.format);
-                    TextureFormat actualFormat = tex != null ? tex.format : default;
-                    if (tex != null) Resources.UnloadAsset(tex); // free the native pixel buffer before we move on / yield
-                    if (fellBack)
-                    {
-                        yield return new Finding(
-                            ruleId: "PERF.TEX005",
-                            domain: Domain.Performance,
-                            severity: Severity.Warning,
-                            title: L.Tr("Texture compression silently failed", "纹理压缩静默失败"),
-                            detail: L.Tr($"'{file}' ({w}x{h}) is set to Compressed, but the importer fell back to an uncompressed format ({actualFormat}), " +
-                                    "multiplying its VRAM and memory use. The usual cause is dimensions a block format can't compress: ETC/ETC2 require both sides to be multiples of 4, " +
-                                    "and PVRTC requires square power-of-two. Resize to a compatible size (a multiple of 4, ideally power-of-two), or switch to a format that allows these dimensions (e.g. ASTC).",
-                                    $"'{file}' ({w}x{h}) 设为 Compressed，但导入器回退成了未压缩格式（{actualFormat}），显存与内存占用翻数倍。" +
-                                    "常见原因是尺寸不满足块压缩要求：ETC/ETC2 要求宽高均为 4 的倍数，PVRTC 要求正方形且为 2 的幂。" +
-                                    "请改为兼容尺寸（4 的倍数，最好是 2 的幂），或改用允许该尺寸的格式（如 ASTC）。"),
-                            targetPath: path,
-                            ping: () => ScannerUtil.PingAsset(path));
-                    }
+                        ping: () => ScannerUtil.PingAsset(path)));
                 }
             }
+
+            return findings;
         }
 
         /// <summary>

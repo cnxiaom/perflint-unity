@@ -47,25 +47,35 @@ namespace PerfLint.Scanners
                 list.Add(paths[i]);
             }
 
-            // 2) Hash only files within same-size groups; merge by "size:hash" key.
-            var byHash = new Dictionary<string, List<string>>();
-            int processed = 0;
+            // 2) Hash only files within same-size groups (a unique-size file can't duplicate anything). Reading each whole
+            //    file to MD5 it is the scanner's dominant cost on large projects — and HashFile is pure file I/O + MD5 with
+            //    no Unity API, so we hash the candidates in PARALLEL across cores. Determinism is preserved: MD5 is
+            //    deterministic and the size:hash grouping is order-independent (findings are sorted downstream). We can't call
+            //    ReportProgress from worker threads (it drives editor UI), so progress is reported coarsely around the block.
+            var candidates = new List<KeyValuePair<long, string>>(); // (size, path)
             foreach (var kv in bySize)
-            {
-                if (kv.Value.Count < 2) continue;
-                foreach (var path in kv.Value)
-                {
-                    context.CancellationToken.ThrowIfCancellationRequested();
-                    context.ReportProgress(Name, 0.5f + 0.5f * processed / Math.Max(1, paths.Count));
-                    processed++;
+                if (kv.Value.Count >= 2)
+                    foreach (var p in kv.Value)
+                        candidates.Add(new KeyValuePair<long, string>(kv.Key, p));
 
-                    string hash = HashFile(path);
-                    if (hash == null) continue;
-                    string key = kv.Key + ":" + hash;
-                    if (!byHash.TryGetValue(key, out var list)) { list = new List<string>(); byHash[key] = list; }
-                    list.Add(path);
-                }
+            context.ReportProgress(Name, 0.5f);
+            var hashes = new string[candidates.Count];
+            // ParallelOptions.CancellationToken makes Parallel.For throw a plain OperationCanceledException (not wrapped in
+            // AggregateException) on cancel, so ScanRunner's cancel path still catches it.
+            var parallelOpts = new System.Threading.Tasks.ParallelOptions { CancellationToken = context.CancellationToken };
+            System.Threading.Tasks.Parallel.For(0, candidates.Count, parallelOpts,
+                i => { hashes[i] = HashFile(candidates[i].Value); });
+
+            var byHash = new Dictionary<string, List<string>>();
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                string hash = hashes[i];
+                if (hash == null) continue;
+                string key = candidates[i].Key + ":" + hash;
+                if (!byHash.TryGetValue(key, out var list)) { list = new List<string>(); byHash[key] = list; }
+                list.Add(candidates[i].Value);
             }
+            context.ReportProgress(Name, 1f);
 
             // 3) Emit one Finding per group of identical-content files.
             foreach (var kv in byHash)

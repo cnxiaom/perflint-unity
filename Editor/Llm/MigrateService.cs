@@ -88,6 +88,7 @@ namespace PerfLint.Llm
         public static MigrateRecipe ForRule(string ruleId)
         {
             if (ruleId == RtHandleRecipe.RuleId) return RtHandleRecipe;
+            if (ruleId == GetInstanceIdRecipe.RuleId) return GetInstanceIdRecipe;
             if (ruleId == ShaderRecipes.UrpShaderRecipe.RuleId) return ShaderRecipes.UrpShaderRecipe;
             if (ruleId == GenericCompileErrorRecipe.RuleId) return GenericCompileErrorRecipe;
             return null;
@@ -197,6 +198,92 @@ namespace PerfLint.Llm
                 "严格按如下格式回复，不要有任何其他文字或解释：\n" +
                 "<<<FILE>>>\n（完整迁移后的源文件）\n<<<END>>>"
         };
+
+        // ── MIG.GetInstanceID → unique-key counter / GetEntityId with the type ripple (newer Unity 6) ─────
+        // History: this rule went through both other repair channels and each failed for a knowable reason —
+        // the plain LLM snippet fix invented APIs newer than its training data, and the deterministic rename
+        // was evicted because on 6000.5 even the EntityId→int implicit operator is error-level obsolete (the
+        // receivers must migrate WITH the call). The whole-file recipe is the correct shape: the split below
+        // (unique key vs real identity) is exactly the generic playbook's rule 2, promoted to a dedicated
+        // recipe with an engine probe so the model never guesses the EntityId API surface.
+        private static readonly MigrateRecipe GetInstanceIdRecipe = new MigrateRecipe
+        {
+            RuleId = "MIG.GetInstanceID",
+            Summary = () => L.Tr(
+                "Rewrites this file off the deprecated GetInstanceID(): call sites that only need a unique key switch to a local counter (no type changes anywhere); call sites that need real object identity move to GetEntityId() with the EntityId type propagated through this file's receivers.",
+                "把此文件整体迁离已废弃的 GetInstanceID()：仅需唯一键的调用点改用本地计数器（不改任何类型）；确需对象身份的调用点改 GetEntityId() 并在本文件内连带传播 EntityId 类型。"),
+            MustDisappear = new[] { "GetInstanceID" },
+            ProbeEnvironment = ProbeGetInstanceIdApi,
+            SystemPrompt =
+                "你是资深 Unity 工程师。用户给你一个完整的 C# 源文件：其中调用了在该 Unity 版本已废弃的 GetInstanceID()。" +
+                "请整体迁移此文件，迁移后代码中不得再出现 GetInstanceID。\n" +
+                "用户消息中会给出【当前引擎实测 API】——反射自本机引擎的权威事实，优先于你对任何 Unity 版本的记忆。\n" +
+                "【逐调用点二选一（关键判据：返回值的用途）】\n" +
+                "a. 返回值仅用作「唯一键/标识」（字典 key、job 系统句柄、日志标签等，不要求与引擎对象身份一致）——" +
+                "尤其当该值会传给你看不到的其他文件的 int 参数/字段/字典时【必须】用本方案：\n" +
+                "   - 类内加 private static int s_NextPerfLintId; 在原赋值处改为 ++s_NextPerfLintId。\n" +
+                "   - 【每个实例只取一次号并存进字段复用】——绝不能在每次使用时重新取号，否则同一对象前后拿到不同 id。\n" +
+                "   - 本方案不改变任何字段/参数/返回值类型，是跨文件最安全的最小修改。\n" +
+                "b. 确需真实对象身份（要与别处取到的同一对象 id 比对），且实测 API 表明 GetEntityId() 存在：改调 GetEntityId()，" +
+                "并把接收该值的**本文件内**变量/字段/字典 key 的类型 int→EntityId（EntityId 可比较、可作字典 key）。" +
+                "【绝不能把 EntityId 值赋给 int】——实测 API 会告知隐式转换的废弃级别；" +
+                "若该值必须传出到其他文件的 int 签名，回到方案 a。\n" +
+                "【反幻觉纪律】绝不调用你不能确定存在于该 Unity 版本的 API；不引入新包依赖；不改与本迁移无关的代码。\n" +
+                "【硬性要求】\n" +
+                "- 输出必须是完整、可直接编译的整个源文件：从第一行到最后一行逐行给出，不得省略、不得用「// ... 其余不变」占位、不得截断。\n" +
+                "- 原文件声明的每个类型（class/struct/interface/enum）必须原名保留；公共 API（public 方法签名/属性）尽量不动，" +
+                "确须改动时留 // TODO(PerfLint AI Migrate): 注明调用方需跟进。\n" +
+                "- 只做与本迁移相关的改动：类名、命名空间、无关方法、注释与空行布局保持原样。\n" +
+                "严格按如下格式回复，不要有任何其他文字或解释：\n" +
+                "<<<FILE>>>\n（完整迁移后的源文件）\n<<<END>>>"
+        };
+
+        /// <summary>
+        /// Reflection probe for the GetInstanceID migration: does GetEntityId() exist on THIS engine, and how
+        /// deprecated is the EntityId→int implicit conversion (the fact that killed the deterministic rename).
+        /// Always returns a facts block — "GetEntityId absent" is itself the decisive fact (forces plan a).
+        /// </summary>
+        private static string ProbeGetInstanceIdApi()
+        {
+            bool hasGetEntityId = false;
+            int implicitState = 0; // 0 = EntityId type missing, 1 = usable, 2 = warning-obsolete, 3 = error-obsolete
+            try
+            {
+                foreach (var m in typeof(UnityEngine.Object).GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+                    if (m.Name == "GetEntityId" && m.GetParameters().Length == 0) { hasGetEntityId = true; break; }
+
+                var et = Type.GetType("UnityEngine.EntityId, UnityEngine.CoreModule");
+                if (et != null)
+                {
+                    implicitState = 1;
+                    foreach (var m in et.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+                    {
+                        if (m.Name != "op_Implicit" || m.ReturnType != typeof(int)) continue;
+                        var attr = (ObsoleteAttribute)Attribute.GetCustomAttribute(m, typeof(ObsoleteAttribute));
+                        if (attr != null) implicitState = attr.IsError ? 3 : 2;
+                        break;
+                    }
+                }
+            }
+            catch { /* partial facts are still facts */ }
+            return FormatGetInstanceIdFacts(hasGetEntityId, implicitState);
+        }
+
+        /// <summary>Pure formatting of the GetInstanceID probe result (unit-testable on engines without EntityId).</summary>
+        internal static string FormatGetInstanceIdFacts(bool hasGetEntityId, int implicitToIntState)
+        {
+            var sb = new StringBuilder();
+            sb.Append("【当前引擎实测 API（反射自本机引擎，权威，优先于你的记忆）】\n");
+            sb.Append("Object.GetEntityId() 存在：").Append(hasGetEntityId ? "是" : "否——方案 b 不可用，所有调用点按方案 a 处理").Append('\n');
+            switch (implicitToIntState)
+            {
+                case 3: sb.Append("EntityId→int 隐式转换：error 级废弃（编译错误——EntityId 值绝不能进 int）"); break;
+                case 2: sb.Append("EntityId→int 隐式转换：warning 级废弃（能编译，但绝不要依赖）"); break;
+                case 1: sb.Append("EntityId→int 隐式转换：可用（仍应保持类型一致，不要依赖它）"); break;
+                default: sb.Append("EntityId 类型：不存在——所有调用点按方案 a 处理"); break;
+            }
+            return sb.ToString();
+        }
 
         // ── MIG.CompileError → the GENERIC error-driven recipe (tier 3 of the repair ladder) ─────────────
         // Where per-API recipes carry deep domain playbooks, this one gets only the universal discipline plus a
@@ -374,9 +461,39 @@ namespace PerfLint.Llm
         public static void Propose(MigrateRecipe recipe, string filePath, Action<MigrateProposal> onDone)
             => Propose(recipe, new MigrateTarget { FilePath = filePath }, onDone);
 
+        /// <summary>
+        /// Whether the editor domain is stale w.r.t. the disk (package change / plugin update blocked from
+        /// reloading by compile errors). Swappable for tests; default = the real guard. Gating here — before
+        /// any LLM call — because in that state the environment probes reflect the OLD loaded assemblies while
+        /// compile verification judges against the NEW packages: every generated round is doomed and every
+        /// credit wasted (real case: URP upgraded 10.8→17.5 mid-session, probe kept teaching the removed
+        /// compatibility pass shape, three rounds burned on CS0115).
+        /// </summary>
+        internal static Func<bool> DomainStaleProbe = Core.PerfLintStaleBuildGuard.IsDomainStale;
+
         public static void Propose(MigrateRecipe recipe, MigrateTarget target, Action<MigrateProposal> onDone)
         {
             string filePath = target.FilePath;
+
+            bool domainStale;
+            try { domainStale = DomainStaleProbe != null && DomainStaleProbe(); }
+            catch { domainStale = false; }
+            if (domainStale)
+            {
+                onDone(new MigrateProposal
+                {
+                    Ok = false,
+                    FilePath = filePath,
+                    Error = L.Tr(
+                        "The editor is running pre-change code: PerfLint or this project's packages changed on disk, but compile errors " +
+                        "prevent Unity from reloading. Generating now would probe the OLD loaded packages while compilation checks the NEW " +
+                        "ones — the rewrite would fail and waste AI credits. Restart the editor, then try again.",
+                        "编辑器正在运行变更前的代码：PerfLint 或本工程的包已在磁盘上变更，但编译错误阻止了 Unity 重载。" +
+                        "此时生成会按【内存中的旧包】探测 API、却按【磁盘上的新包】校验编译——必然失败并浪费 AI 次数。" +
+                        "请先重启编辑器，再重新生成。")
+                });
+                return;
+            }
             string raw = SafeReadAllText(filePath);
             if (raw == null)
             {
@@ -682,12 +799,32 @@ namespace PerfLint.Llm
                 return;
             }
 
+            // A package change mid-loop (or one that predates the loop and was only now noticed) makes every
+            // further round a guaranteed loss — the probes describe the old loaded packages. Stop, don't burn credits.
+            bool staleNow;
+            try { staleNow = DomainStaleProbe != null && DomainStaleProbe(); }
+            catch { staleNow = false; }
+            if (staleNow)
+            {
+                PendingRetry.Remove(key);
+                Debug.LogWarning("[PerfLint] " + L.Tr(
+                    "AI Migrate: stopping the retry loop — the editor is running pre-change code (packages/plugin changed on disk but compile errors block reloading). Restart the editor, then run AI Migrate again.",
+                    "AI 迁移：停止自动重试——编辑器正在运行变更前的代码（包/插件已在磁盘上变更，但编译错误阻止了重载）。请重启编辑器后重新执行 AI Migrate。"));
+                return;
+            }
+
             st.Attempt++;
             Debug.Log("[PerfLint] " + L.Tr(
                 $"AI Migrate: compile failed — automatic retry {st.Attempt}/{MaxRetries}, feeding the compiler errors back to the model…",
                 $"AI 迁移：编译未通过——自动重试第 {st.Attempt}/{MaxRetries} 轮，把编译错误喂回模型重生成…"));
 
-            string user = BuildRetryUser(st.FailedMigrated, errorSummary);
+            // Re-inject the environment probe facts: the first round had them in its user message, but a retry
+            // round without them lets the model drift back to the pass shape its training data prefers.
+            string facts = null;
+            try { facts = st.Recipe.ProbeEnvironment?.Invoke(); }
+            catch { /* probe failure just means fewer facts */ }
+
+            string user = BuildRetryUser(st.FailedMigrated, errorSummary, facts);
             LlmClient.Send(LlmSettings.FixModel, st.Recipe.SystemPrompt, new[] { new LlmMessage("user", user) }, st.Recipe.MaxTokens, r =>
             {
                 if (!r.Success)
@@ -716,10 +853,11 @@ namespace PerfLint.Llm
             }, disableThinking: true);
         }
 
-        /// <summary>Retry-round user message: the rejected output plus the compiler errors it produced.</summary>
-        internal static string BuildRetryUser(string failedMigrated, string errorSummary) =>
+        /// <summary>Retry-round user message: the rejected output plus the compiler errors it produced (and the probe facts, re-stated).</summary>
+        internal static string BuildRetryUser(string failedMigrated, string errorSummary, string facts = null) =>
             "你上一轮输出的迁移文件应用后产生了编译错误，已被回滚。请修复这些错误后重新输出完整文件——" +
             "仍然遵守 system 提示中的全部对照表、硬性要求与输出格式（<<<FILE>>>…<<<END>>>）。\n\n" +
+            (string.IsNullOrEmpty(facts) ? "" : facts + "\n\n") +
             "【你上一轮的输出（含错误）】\n" + failedMigrated + "\n\n" +
             "【它产生的编译错误】\n" + errorSummary;
 

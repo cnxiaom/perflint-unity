@@ -104,11 +104,12 @@ namespace PerfLint.Scanners
                 Detail = () => L.Tr("Object.GetInstanceID() is marked obsolete on this Unity version (newer Unity 6 releases; compile error where obsolete-as-error). " +
                               "Migrate to GetEntityId() — but note this is NOT a plain rename: the EntityId→int implicit conversion is also obsolete there, " +
                               "so every int variable/field/dictionary key that receives the id must change type to EntityId as well (EntityId is comparable " +
-                              "and works as a dictionary key). Rewrite the id's whole flow by hand; no one-click fix.",
+                              "and works as a dictionary key). PerfLint's Migration Assistant can rewrite the file for you (AI Migrate; it decides per " +
+                              "call site between a local unique-key counter and the full EntityId migration), or rewrite the id's flow by hand.",
                               "Object.GetInstanceID() 在当前 Unity 版本已标记废弃（较新的 Unity 6 版本；error 级废弃时直接编译失败）。" +
                               "迁移到 GetEntityId()——但注意这不是单纯改名：EntityId→int 的隐式转换在该版本同样废弃，" +
                               "接收该 id 的所有 int 变量/字段/字典 key 都要连带改为 EntityId 类型（EntityId 可比较、可作字典 key）。" +
-                              "需人工改写该 id 的整条流转，不提供一键修复。"),
+                              "可用迁移助手整体重写此文件（AI Migrate，按调用点在「本地唯一键计数器」与「完整 EntityId 迁移」间取舍），或手动改写该 id 的整条流转。"),
                 // Reflect over the CURRENT engine: report only where GetInstanceID actually carries [Obsolete]
                 // (real case: CS0619 on 6000.5 while 2022.3 is perfectly fine — a version threshold would be a guess).
                 ActiveWhen = () => GetInstanceIdIsObsolete,
@@ -124,11 +125,12 @@ namespace PerfLint.Scanners
                 RuleId = "MIG.RenderTargetHandle", Title = () => L.Tr("Deprecated API: RenderTargetHandle (URP)", "废弃 API：RenderTargetHandle（URP）"),
                 Detail = () => L.Tr("URP's RenderTargetHandle is deprecated since Unity 2022.1 (URP 13) and removed in Unity 6 — custom render passes that use it no longer compile there "
                          + "(a top blocker when upgrading older URP assets). Migrate to RTHandle: allocate in OnCameraSetup via RTHandles.Alloc / RenderingUtils.ReAllocateIfNeeded, "
-                         + "pass the handle itself instead of .Identifier()/.id, and release it explicitly (Dispose). This changes the pass's whole resource lifecycle, "
-                         + "so it must be rewritten by hand; no one-click fix.",
+                         + "pass the handle itself instead of .Identifier()/.id, and release it explicitly (Dispose). This changes the pass's whole resource lifecycle; "
+                         + "PerfLint's Migration Assistant can rewrite the file for you (AI Migrate, probing the pass shape your URP actually exposes), or migrate it by hand.",
                          "URP 的 RenderTargetHandle 自 Unity 2022.1（URP 13）废弃、Unity 6 已移除——使用它的自定义 render pass 在 Unity 6 无法编译"
                          + "（老 URP 资产升级的头号阻塞点）。迁移到 RTHandle：在 OnCameraSetup 用 RTHandles.Alloc / RenderingUtils.ReAllocateIfNeeded 分配，"
-                         + "直接传句柄（不再用 .Identifier()/.id），并需显式释放（Dispose）。整个 pass 的资源生命周期都要改，需人工整体改写，不提供一键修复。"),
+                         + "直接传句柄（不再用 .Identifier()/.id），并需显式释放（Dispose）。整个 pass 的资源生命周期都要改；"
+                         + "可用迁移助手整体重写此文件（AI Migrate，按你的 URP 实际提供的 pass 形态迁移），或人工整体改写。"),
                 RequiresUnity2022_1 = true,
                 AllowAiFix = false,
                 // #breakingFrom(2023.1): error-level (blocks compilation) on 2023.1+/6 → Critical there; warning-level obsolete on 2022 → Warning.

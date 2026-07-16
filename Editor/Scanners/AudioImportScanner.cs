@@ -14,7 +14,7 @@ namespace PerfLint.Scanners
     ///   PERF.AUD003 — Uses uncompressed PCM format (largest size; almost never necessary on mobile).
     ///   PERF.AUD005 — Multi-channel clip without Force To Mono (a mono-source SFX shipped as stereo doubles its memory). Info, because forcing mono on genuinely stereo music/ambience degrades it — the user decides.
     /// </summary>
-    public sealed class AudioImportScanner : IScanner
+    public sealed class AudioImportScanner : IScanner, IFileScanner
     {
         public string Name => "Audio Import Settings";
         public Domain Domain => Domain.Performance;
@@ -22,6 +22,10 @@ namespace PerfLint.Scanners
         // Empirical thresholds: > 5s should not be fully decompressed; > 30s is typically music and should stream.
         private const float DecompressLengthThreshold = 5f;
         private const float StreamingLengthThreshold = 30f;
+
+        // GPU/native reclaim throttle counter (see ScannerUtil.ThrottleReclaim). Instance field so ScanClip (shared by the
+        // full Scan loop and single-file ScanFile) updates it; reset at the start of each Scan / ScanFile. Main-thread only.
+        private int _loadsSinceReclaim;
 
         public IEnumerable<Finding> Scan(ScanContext context)
         {
@@ -32,12 +36,11 @@ namespace PerfLint.Scanners
             // force it to AAC (the greyed-out AAC shown on the platform page in the Inspector is the effective value).
             // Reporting "uncompressed PCM" in that case would be a false positive; suggesting Streaming would likewise
             // be an invalid recommendation. Therefore both of those rules are skipped when targeting WebGL.
-            string platform = !string.IsNullOrEmpty(context.TargetPlatform)
-                ? context.TargetPlatform
-                : BuildPipeline.GetBuildTargetGroup(EditorUserBuildSettings.activeBuildTarget).ToString();
+            string platform = ResolvePlatform(context);
             bool isWebGL = platform == "WebGL";
 
             var guids = AssetDatabase.FindAssets("t:AudioClip", new[] { "Assets" });
+            _loadsSinceReclaim = 0;
             for (int i = 0; i < guids.Length; i++)
             {
                 context.CancellationToken.ThrowIfCancellationRequested();
@@ -45,83 +48,135 @@ namespace PerfLint.Scanners
 
                 string path = AssetDatabase.GUIDToAssetPath(guids[i]);
                 if (AssetImporter.GetAtPath(path) is not AudioImporter importer) continue;
-
-                var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(path);
-                float length = clip != null ? clip.length : 0f;
-                string file = Path.GetFileName(path);
-                var settings = EffectiveSettings(importer, platform);
-
-                // PERF.AUD002 — Long clip not using Streaming (checked before AUD001 to avoid double-reporting the same file; WebGL does not support Streaming, so skip).
-                if (!isWebGL && length >= StreamingLengthThreshold && settings.loadType != AudioClipLoadType.Streaming)
-                {
-                    yield return new Finding(
-                        ruleId: "PERF.AUD002",
-                        domain: Domain.Performance,
-                        severity: Severity.Info,
-                        title: L.Tr("Long audio clip not using Streaming", "长音频未使用 Streaming"),
-                        detail: L.Tr($"'{file}' ({length:0.0}s) is long and likely background music. Set Load Type to Streaming " +
-                                "so it decodes while playing instead of staying resident in memory.",
-                                $"'{file}'（{length:0.0}s）较长，多为背景音乐，建议 Load Type 设为 Streaming，" +
-                                "边播边解码，避免常驻内存。"),
-                        targetPath: path,
-                        ping: () => ScannerUtil.PingAsset(path),
-                        fix: new AudioLoadTypeFix(path, AudioClipLoadType.Streaming, platform));
-                }
-                // PERF.AUD001 — Moderately long clip uses Decompress On Load.
-                else if (length >= DecompressLengthThreshold && settings.loadType == AudioClipLoadType.DecompressOnLoad)
-                {
-                    yield return new Finding(
-                        ruleId: "PERF.AUD001",
-                        domain: Domain.Performance,
-                        severity: Severity.Warning,
-                        title: L.Tr("Audio clip uses Decompress On Load", "音频使用 Decompress On Load"),
-                        detail: L.Tr($"'{file}' ({length:0.0}s) uses Decompress On Load, which decompresses the whole clip to PCM resident in memory, " +
-                                "a large footprint. Switch to Compressed In Memory (decode on playback). Decompress On Load only fits short, frequently-played SFX.",
-                                $"'{file}'（{length:0.0}s）使用 Decompress On Load，会整段解压为 PCM 常驻内存，占用大。" +
-                                "建议改为 Compressed In Memory（播放时解码）。短促高频音效才适合 Decompress On Load。"),
-                        targetPath: path,
-                        ping: () => ScannerUtil.PingAsset(path),
-                        fix: new AudioLoadTypeFix(path, AudioClipLoadType.CompressedInMemory, platform));
-                }
-
-                // PERF.AUD003 — Uncompressed PCM format (evaluated independently of load type; largest size; almost never necessary on mobile; always AAC on WebGL, so skip).
-                if (!isWebGL && settings.compressionFormat == AudioCompressionFormat.PCM)
-                {
-                    yield return new Finding(
-                        ruleId: "PERF.AUD003",
-                        domain: Domain.Performance,
-                        severity: Severity.Warning,
-                        title: L.Tr("Audio clip uses uncompressed PCM format", "音频使用未压缩 PCM 格式"),
-                        detail: L.Tr($"'{file}' ({length:0.0}s) has Compression Format PCM (uncompressed), the largest on disk and in memory. " +
-                                "On mobile, prefer Vorbis (good for both SFX and music); short, frequent SFX (footsteps, gunshots) can use ADPCM, which is much smaller than PCM and decodes fast. " +
-                                "Only very short SFX needing zero decode latency justify keeping PCM.",
-                                $"'{file}'（{length:0.0}s）的 Compression Format 为 PCM（未压缩），磁盘与内存占用最大。" +
-                                "移动端建议改为 Vorbis（音效/音乐通用）；短促高频音效（脚步、枪声）可用 ADPCM——比 PCM 小很多且解码快。" +
-                                "仅极短、追求零解码延迟的音效才有保留 PCM 的理由。"),
-                        targetPath: path,
-                        ping: () => ScannerUtil.PingAsset(path),
-                        fix: new AudioCompressionFix(path, AudioCompressionFormat.Vorbis, platform));
-                }
-
-                // PERF.AUD005 — Multi-channel clip not forced to mono. forceToMono is a global import setting (not per-platform).
-                // Info only: many sound effects are mono at the source but authored/exported as stereo, wasting half their memory;
-                // but genuinely stereo music/ambience must stay stereo, so the call is left to the user.
-                if (clip != null && clip.channels > 1 && !importer.forceToMono)
-                {
-                    yield return new Finding(
-                        ruleId: "PERF.AUD005",
-                        domain: Domain.Performance,
-                        severity: Severity.Info,
-                        title: L.Tr("Stereo clip without Force To Mono", "立体声音频未开 Force To Mono"),
-                        detail: L.Tr($"'{file}' ({clip.channels} channels) does not have Force To Mono enabled. If the source is effectively mono (most SFX: " +
-                                "footsteps, gunshots, UI clicks), enabling Force To Mono halves its memory and size. Leave it off for music or ambience where stereo width matters.",
-                                $"'{file}'（{clip.channels} 声道）未开启 Force To Mono。若音源本质上是单声道（多数音效：脚步、枪声、UI 点击），" +
-                                "开启 Force To Mono 可把内存与体积减半。需要立体声声场的音乐/环境声请保持关闭。"),
-                        targetPath: path,
-                        ping: () => ScannerUtil.PingAsset(path),
-                        fix: new AudioForceMonoFix(path));
-                }
+                foreach (var f in ScanClip(path, importer, platform, isWebGL, bulk: true)) yield return f;
             }
+        }
+
+        /// <summary>Path-based (extension) gate for incremental re-scan — see the note on TextureImportScanner.Handles (deletions need path-only recognition). ScanFile does the precise importer check.</summary>
+        public bool Handles(string assetPath)
+        {
+            if (string.IsNullOrEmpty(assetPath)) return false;
+            switch (Path.GetExtension(assetPath).ToLowerInvariant())
+            {
+                case ".wav": case ".mp3": case ".ogg": case ".aif": case ".aiff":
+                case ".flac": case ".mod": case ".it": case ".s3m": case ".xm":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>Incremental single-file scan: the same per-clip rules as the full Scan, for one asset. Empty for non-audio assets.</summary>
+        public IEnumerable<Finding> ScanFile(string assetPath, ScanContext context)
+        {
+            if (AssetImporter.GetAtPath(assetPath) is not AudioImporter importer) return System.Array.Empty<Finding>();
+            string platform = ResolvePlatform(context);
+            _loadsSinceReclaim = 0;
+            // bulk:false — a single-file rescan loads one clip; force-unloading it would evict the asset the user just
+            // edited (blanking its Inspector). Only the full Scan needs the per-clip unload to bound peak memory.
+            return ScanClip(assetPath, importer, platform, platform == "WebGL", bulk: false);
+        }
+
+        private static string ResolvePlatform(ScanContext context)
+            => !string.IsNullOrEmpty(context.TargetPlatform)
+                ? context.TargetPlatform
+                : BuildPipeline.GetBuildTargetGroup(EditorUserBuildSettings.activeBuildTarget).ToString();
+
+        /// <summary>
+        /// All AUD00x rules for a single clip, in the original order (AUD002/001 exclusive, then AUD003, then AUD005). Shared
+        /// by the full Scan loop and single-file ScanFile so the two are identical per asset (asserted by
+        /// ScanFile_MatchesFullScan_PerClip). Preserves the original ordering, incl. reading clip.channels after the unload.
+        /// </summary>
+        private List<Finding> ScanClip(string path, AudioImporter importer, string platform, bool isWebGL, bool bulk)
+        {
+            var findings = new List<Finding>();
+
+            var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(path);
+            float length = clip != null ? clip.length : 0f;
+            // Only a BULK scan force-unloads: loading every clip in an audio-heavy project accumulates until memory is
+            // exhausted, so the full Scan frees each immediately (+ a throttled sweep). A single-file (incremental) rescan
+            // loads one clip — force-unloading it would evict the asset the user just edited and blank its Inspector — so
+            // we leave it for Unity's normal asset management. (clip.channels is still read below either way.)
+            if (clip != null && bulk)
+            {
+                Resources.UnloadAsset(clip);
+                _loadsSinceReclaim = ScannerUtil.ThrottleReclaim(_loadsSinceReclaim);
+            }
+            string file = Path.GetFileName(path);
+            var settings = EffectiveSettings(importer, platform);
+
+            // PERF.AUD002 — Long clip not using Streaming (checked before AUD001 to avoid double-reporting the same file; WebGL does not support Streaming, so skip).
+            if (!isWebGL && length >= StreamingLengthThreshold && settings.loadType != AudioClipLoadType.Streaming)
+            {
+                findings.Add(new Finding(
+                    ruleId: "PERF.AUD002",
+                    domain: Domain.Performance,
+                    severity: Severity.Info,
+                    title: L.Tr("Long audio clip not using Streaming", "长音频未使用 Streaming"),
+                    detail: L.Tr($"'{file}' ({length:0.0}s) is long and likely background music. Set Load Type to Streaming " +
+                            "so it decodes while playing instead of staying resident in memory.",
+                            $"'{file}'（{length:0.0}s）较长，多为背景音乐，建议 Load Type 设为 Streaming，" +
+                            "边播边解码，避免常驻内存。"),
+                    targetPath: path,
+                    ping: () => ScannerUtil.PingAsset(path),
+                    fix: new AudioLoadTypeFix(path, AudioClipLoadType.Streaming, platform)));
+            }
+            // PERF.AUD001 — Moderately long clip uses Decompress On Load.
+            else if (length >= DecompressLengthThreshold && settings.loadType == AudioClipLoadType.DecompressOnLoad)
+            {
+                findings.Add(new Finding(
+                    ruleId: "PERF.AUD001",
+                    domain: Domain.Performance,
+                    severity: Severity.Warning,
+                    title: L.Tr("Audio clip uses Decompress On Load", "音频使用 Decompress On Load"),
+                    detail: L.Tr($"'{file}' ({length:0.0}s) uses Decompress On Load, which decompresses the whole clip to PCM resident in memory, " +
+                            "a large footprint. Switch to Compressed In Memory (decode on playback). Decompress On Load only fits short, frequently-played SFX.",
+                            $"'{file}'（{length:0.0}s）使用 Decompress On Load，会整段解压为 PCM 常驻内存，占用大。" +
+                            "建议改为 Compressed In Memory（播放时解码）。短促高频音效才适合 Decompress On Load。"),
+                    targetPath: path,
+                    ping: () => ScannerUtil.PingAsset(path),
+                    fix: new AudioLoadTypeFix(path, AudioClipLoadType.CompressedInMemory, platform)));
+            }
+
+            // PERF.AUD003 — Uncompressed PCM format (evaluated independently of load type; largest size; almost never necessary on mobile; always AAC on WebGL, so skip).
+            if (!isWebGL && settings.compressionFormat == AudioCompressionFormat.PCM)
+            {
+                findings.Add(new Finding(
+                    ruleId: "PERF.AUD003",
+                    domain: Domain.Performance,
+                    severity: Severity.Warning,
+                    title: L.Tr("Audio clip uses uncompressed PCM format", "音频使用未压缩 PCM 格式"),
+                    detail: L.Tr($"'{file}' ({length:0.0}s) has Compression Format PCM (uncompressed), the largest on disk and in memory. " +
+                            "On mobile, prefer Vorbis (good for both SFX and music); short, frequent SFX (footsteps, gunshots) can use ADPCM, which is much smaller than PCM and decodes fast. " +
+                            "Only very short SFX needing zero decode latency justify keeping PCM.",
+                            $"'{file}'（{length:0.0}s）的 Compression Format 为 PCM（未压缩），磁盘与内存占用最大。" +
+                            "移动端建议改为 Vorbis（音效/音乐通用）；短促高频音效（脚步、枪声）可用 ADPCM——比 PCM 小很多且解码快。" +
+                            "仅极短、追求零解码延迟的音效才有保留 PCM 的理由。"),
+                    targetPath: path,
+                    ping: () => ScannerUtil.PingAsset(path),
+                    fix: new AudioCompressionFix(path, AudioCompressionFormat.Vorbis, platform)));
+            }
+
+            // PERF.AUD005 — Multi-channel clip not forced to mono. forceToMono is a global import setting (not per-platform).
+            // Info only: many sound effects are mono at the source but authored/exported as stereo, wasting half their memory;
+            // but genuinely stereo music/ambience must stay stereo, so the call is left to the user.
+            if (clip != null && clip.channels > 1 && !importer.forceToMono)
+            {
+                findings.Add(new Finding(
+                    ruleId: "PERF.AUD005",
+                    domain: Domain.Performance,
+                    severity: Severity.Info,
+                    title: L.Tr("Stereo clip without Force To Mono", "立体声音频未开 Force To Mono"),
+                    detail: L.Tr($"'{file}' ({clip.channels} channels) does not have Force To Mono enabled. If the source is effectively mono (most SFX: " +
+                            "footsteps, gunshots, UI clicks), enabling Force To Mono halves its memory and size. Leave it off for music or ambience where stereo width matters.",
+                            $"'{file}'（{clip.channels} 声道）未开启 Force To Mono。若音源本质上是单声道（多数音效：脚步、枪声、UI 点击），" +
+                            "开启 Force To Mono 可把内存与体积减半。需要立体声声场的音乐/环境声请保持关闭。"),
+                    targetPath: path,
+                    ping: () => ScannerUtil.PingAsset(path),
+                    fix: new AudioForceMonoFix(path)));
+            }
+
+            return findings;
         }
 
         /// <summary>

@@ -1,18 +1,16 @@
 {
-  "name": "PerfLint.Editor",
+  "name": "PerfLint.Runtime",
   "rootNamespace": "PerfLint",
-  "references": [
-    "PerfLint.Runtime"
-  ],
-  "includePlatforms": [
-    "Editor"
-  ],
+  "references": [],
+  "includePlatforms": [],
   "excludePlatforms": [],
   "allowUnsafeCode": false,
   "overrideReferences": false,
   "precompiledReferences": [],
-  "autoReferenced": true,
-  "defineConstraints": [],
+  "autoReferenced": false,
+  "defineConstraints": [
+    "UNITY_EDITOR || DEVELOPMENT_BUILD"
+  ],
   "versionDefines": [],
   "noEngineReferences": false
 }

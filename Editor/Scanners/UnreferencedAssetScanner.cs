@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text.RegularExpressions;
 using PerfLint.Core;
 using PerfLint.L10n;
 using UnityEditor;
@@ -24,11 +25,17 @@ namespace PerfLint.Scanners
 
         public IEnumerable<Finding> Scan(ScanContext context)
         {
-            // Reference roots: enabled Build scenes + all assets under Resources (always reachable at runtime).
+            // Reference roots: enabled Build scenes + all assets under Resources (always reachable at runtime)
+            // + assets referenced from ProjectSettings/ (preloaded assets, always-included shaders, SRP asset,
+            // Input System project-wide actions, …). The last group is invisible to GetDependencies but ships in
+            // the build, so omitting it produces false positives (e.g. InputSystem_Actions.inputactions).
             var roots = new List<string>();
             foreach (var s in EditorBuildSettings.scenes)
                 if (s.enabled && !string.IsNullOrEmpty(s.path)) roots.Add(s.path);
 
+            // hasScenes: whether the build has an actual scene graph to walk. ProjectSettings-referenced assets
+            // are added regardless but must NOT, on their own, make us believe a scene graph exists — otherwise a
+            // project with zero build scenes would silently run the (meaningless) unreferenced check.
             bool hasScenes = roots.Count > 0;
 
             foreach (var p in AssetDatabase.GetAllAssetPaths())
@@ -50,6 +57,10 @@ namespace PerfLint.Scanners
                     targetPath: null);
                 yield break;
             }
+
+            // ProjectSettings-referenced assets (preloaded/graphics/quality/input) enter the build outside the
+            // scene graph — add them only once we know there's a scene graph worth analyzing.
+            roots.AddRange(GatherProjectSettingsRoots());
 
             context.ReportProgress(Name, 0.2f);
             var referenced = new HashSet<string>(
@@ -78,6 +89,55 @@ namespace PerfLint.Scanners
                             "⚠️ 注意：经 Addressables / AssetBundle / 代码字符串路径 / 反射动态加载的资源会被误报，删除前务必确认。"),
                     targetPath: p,
                     ping: () => ScannerUtil.PingAsset(p));
+            }
+        }
+
+        /// <summary>
+        /// Resolves the Assets/ asset paths referenced by any text file under the project's ProjectSettings/ folder
+        /// (preloaded assets, GraphicsSettings always-included shaders, QualitySettings SRP assets, Input System
+        /// project-wide actions, …). These enter the build without appearing in any scene/Resources dependency graph.
+        /// Guids that don't resolve to an Assets/ path (built-in/package resources) are dropped.
+        /// </summary>
+        private static IEnumerable<string> GatherProjectSettingsRoots()
+        {
+            // Application.dataPath is "<project>/Assets"; ProjectSettings is its sibling.
+            string projectRoot = Path.GetDirectoryName(UnityEngine.Application.dataPath);
+            if (string.IsNullOrEmpty(projectRoot)) yield break;
+            string dir = Path.Combine(projectRoot, "ProjectSettings");
+            if (!Directory.Exists(dir)) yield break;
+
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var file in Directory.GetFiles(dir, "*.asset", SearchOption.TopDirectoryOnly))
+            {
+                string text;
+                try { text = File.ReadAllText(file); }
+                catch { continue; }
+
+                foreach (var guid in ExtractGuids(text))
+                {
+                    if (!seen.Add(guid)) continue;
+                    string p = AssetDatabase.GUIDToAssetPath(guid);
+                    if (!string.IsNullOrEmpty(p) && p.StartsWith("Assets/"))
+                        yield return p;
+                }
+            }
+        }
+
+        private static readonly Regex GuidRegex = new Regex(
+            @"guid:\s*([0-9a-fA-F]{32})", RegexOptions.Compiled);
+
+        /// <summary>
+        /// Pure helper (unit-tested): extracts every <c>guid: &lt;32-hex&gt;</c> token from a YAML settings blob.
+        /// The all-zero guid (Unity's "no reference" sentinel) is filtered out.
+        /// </summary>
+        public static IEnumerable<string> ExtractGuids(string yaml)
+        {
+            if (string.IsNullOrEmpty(yaml)) yield break;
+            foreach (Match m in GuidRegex.Matches(yaml))
+            {
+                string g = m.Groups[1].Value.ToLowerInvariant();
+                if (g != "00000000000000000000000000000000")
+                    yield return g;
             }
         }
 

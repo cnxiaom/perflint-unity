@@ -48,6 +48,28 @@ namespace PerfLint.Core
             return found;
         }
 
+        private static List<IFileScanner> _fileScanners;
+
+        /// <summary>
+        /// The discovered file-level scanners (those implementing <see cref="IFileScanner"/>), cached for the domain.
+        /// Used by the change tracker to decide, cheaply and per asset, whether an imported/deleted/moved path is one
+        /// PerfLint can incrementally re-scan. Reset naturally on domain reload (static field).
+        /// </summary>
+        public static IReadOnlyList<IFileScanner> FileScanners()
+            => _fileScanners ??= DiscoverScanners().OfType<IFileScanner>().ToList();
+
+        /// <summary>Whether any file-level scanner claims this path (via its path-based <see cref="IFileScanner.Handles"/>). True also for deleted paths, so their stale findings can be cleared.</summary>
+        public static bool IsFileScannable(string assetPath)
+        {
+            if (string.IsNullOrEmpty(assetPath)) return false;
+            foreach (var fs in FileScanners())
+            {
+                try { if (fs.Handles(assetPath)) return true; }
+                catch { /* a scanner's Handles must never break change tracking */ }
+            }
+            return false;
+        }
+
         /// <summary>Discovers and instantiates all non-abstract IScanner implementations that have a parameterless constructor, via reflection.</summary>
         public static List<IScanner> DiscoverScanners()
         {
@@ -109,6 +131,17 @@ namespace PerfLint.Core
             var sw = Stopwatch.StartNew();
             int total = Math.Max(1, scanners.Count);
 
+            // Defense-in-depth: watch graphics/native memory once per asset (via the wrapped ReportProgress) and force a
+            // reclaim before a runaway scan can OOM-crash the editor. Per-scanner ThrottleReclaim keeps healthy runs far
+            // below the threshold; this only fires if something slips through. See ScanMemoryWatchdog.
+            var watchdog = new ScanMemoryWatchdog();
+            var watched = WrapWithWatchdog(context, watchdog);
+
+            // Per-scanner wall-clock, so a slow scan can be diagnosed (which scanner ate the time) instead of guessed at.
+            // Collected here and dumped as one sorted summary after the loop; kept lightweight (a Stopwatch per scanner).
+            var timings = new List<(string name, long ms, int count)>();
+            var scanSw = new Stopwatch();
+
             for (int i = 0; i < scanners.Count; i++)
             {
                 context.CancellationToken.ThrowIfCancellationRequested();
@@ -116,12 +149,15 @@ namespace PerfLint.Core
                 var scanner = scanners[i];
                 context.ReportProgress(scanner.Name, (float)i / total);
 
+                scanSw.Restart();
                 try
                 {
-                    var produced = (scanner.Scan(context) ?? Enumerable.Empty<Finding>()).ToList();
+                    var produced = (scanner.Scan(watched) ?? Enumerable.Empty<Finding>()).ToList();
+                    scanSw.Stop();
                     findings.AddRange(produced);
                     // Record the set of RuleIds produced by this scanner so that post-fix group incremental re-scans can look up ownership.
                     ruleMap[scanner.Name] = produced.Select(f => f.RuleId).Distinct().ToList();
+                    timings.Add((scanner.Name, scanSw.ElapsedMilliseconds, produced.Count));
                 }
                 catch (OperationCanceledException)
                 {
@@ -129,11 +165,20 @@ namespace PerfLint.Core
                 }
                 catch (Exception ex)
                 {
+                    scanSw.Stop();
+                    timings.Add((scanner.Name, scanSw.ElapsedMilliseconds, -1)); // -1 = failed
                     UnityEngine.Debug.LogError("[PerfLint] " + L.Tr($"Scanner '{scanner.Name}' failed: {ex}", $"Scanner '{scanner.Name}' 执行出错: {ex}"));
                 }
             }
 
             sw.Stop();
+
+            LogTimingSummary(timings, sw.Elapsed);
+
+            if (watchdog.SweepCount > 0)
+                UnityEngine.Debug.LogWarning("[PerfLint] " + L.Tr(
+                    $"Memory watchdog intervened {watchdog.SweepCount}× this scan (last during '{watchdog.LastSweptScanner}') to keep the editor from running out of graphics memory. The scan completed correctly; if this recurs, that scanner needs periodic reclaim.",
+                    $"内存看门狗本次扫描介入了 {watchdog.SweepCount} 次（最后一次在 '{watchdog.LastSweptScanner}'），以防编辑器显存耗尽。扫描结果正确；若反复出现，说明该扫描器需要周期性回收。"));
 
             // Centralized filtering: discard findings whose path matches an ignored path (third-party directories, etc.) —
             // applied in one place so every rule benefits automatically.
@@ -146,6 +191,48 @@ namespace PerfLint.Core
                 .ToList();
 
             return new ScanResult(ordered, sw.Elapsed, ruleMap);
+        }
+
+        /// <summary>
+        /// Dumps one sorted (slowest-first) per-scanner timing table to the Console after a full scan, so a slow scan can be
+        /// diagnosed with data instead of guessed at. Diagnostic only — no effect on results. Kept to a single Debug.Log so it
+        /// is one collapsible Console entry rather than N lines.
+        /// </summary>
+        private static void LogTimingSummary(List<(string name, long ms, int count)> timings, TimeSpan total)
+        {
+            if (timings == null || timings.Count == 0) return;
+
+            var sb = new System.Text.StringBuilder();
+            sb.Append("[PerfLint] ").Append(L.Tr(
+                $"Scan timing — total {total.TotalSeconds:0.0}s across {timings.Count} scanners (slowest first):",
+                $"扫描耗时 — 共 {total.TotalSeconds:0.0}s，{timings.Count} 个扫描器（按耗时降序）："));
+
+            double totalMs = Math.Max(1.0, total.TotalMilliseconds);
+            foreach (var t in timings.OrderByDescending(t => t.ms))
+            {
+                double pct = 100.0 * t.ms / totalMs;
+                string countStr = t.count < 0
+                    ? L.Tr("failed", "执行失败")
+                    : L.Tr($"{t.count} findings", $"{t.count} 条");
+                sb.Append($"\n  {t.ms,7} ms  ({pct,4:0.0}%)  {t.name}  [{countStr}]");
+            }
+
+            UnityEngine.Debug.Log(sb.ToString());
+        }
+
+        /// <summary>
+        /// Returns a ScanContext identical to <paramref name="context"/> but whose ReportProgress also pumps the memory
+        /// watchdog. Scanners call ReportProgress once per asset inside their loops, so this gives the watchdog per-asset
+        /// sampling for free without any scanner change.
+        /// </summary>
+        private static ScanContext WrapWithWatchdog(ScanContext context, ScanMemoryWatchdog watchdog)
+        {
+            var inner = context.ReportProgress;
+            return new ScanContext(
+                context.CancellationToken,
+                (name, frac) => { watchdog.Tick(name); inner(name, frac); },
+                context.TargetUnityVersion,
+                context.TargetPlatform);
         }
 
         /// <summary>
@@ -181,6 +268,9 @@ namespace PerfLint.Core
 
             var owners = scanners.Where(s => ownerNames.Contains(s.Name)).ToList();
 
+            // Same memory watchdog as the full Run — a group re-scan re-runs whole load-heavy scanners over the project.
+            var watched = WrapWithWatchdog(context, new ScanMemoryWatchdog());
+
             // Re-run the owning scanners and collect fresh findings along with each scanner's new RuleId set.
             var fresh = new List<Finding>();
             var freshRuleSets = new Dictionary<string, IReadOnlyList<string>>();
@@ -191,7 +281,7 @@ namespace PerfLint.Core
                 context.ReportProgress(scanner.Name, (float)i / Math.Max(1, owners.Count));
                 try
                 {
-                    var produced = (scanner.Scan(context) ?? Enumerable.Empty<Finding>()).ToList();
+                    var produced = (scanner.Scan(watched) ?? Enumerable.Empty<Finding>()).ToList();
                     fresh.AddRange(produced);
                     freshRuleSets[scanner.Name] = produced.Select(f => f.RuleId).Distinct().ToList();
                 }
