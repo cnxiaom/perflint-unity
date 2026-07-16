@@ -204,6 +204,63 @@ namespace PerfLint.Llm
             EditorApplication.update += Tick;
         }
 
+        /// <summary>
+        /// Best-effort, non-consuming sync of the real remaining credit balance from the proxy's /llm/balance route
+        /// (reads server-side KV without spending a credit), so the UI shows the true number the moment the LLM panel
+        /// opens or the license tier flips — instead of the optimistic "5000/month · ready" standby label that only
+        /// gets corrected after the next actual /llm call. No-op in BYO mode (that path bypasses credits entirely).
+        /// Silent on any failure (network/offline): the standby label + server 429 backstop remain.
+        /// </summary>
+        public static void SyncHostedBalance()
+        {
+            if (LlmSettings.Mode != LlmMode.Hosted) return;
+
+            string url = LlmSettings.ProxyBalanceEndpoint;
+            var req = new UnityWebRequest(new Uri(url), "POST")
+            {
+                uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(BuildIdentityBody())),
+                downloadHandler = new DownloadHandlerBuffer()
+            };
+            req.SetRequestHeader("content-type", "application/json");
+
+            var op = req.SendWebRequest();
+
+            void Tick()
+            {
+                if (!op.isDone) return;
+                EditorApplication.update -= Tick;
+                try
+                {
+                    // Only trust a clean 200 with the balance headers; on any error leave the cached/standby state as-is.
+                    if (req.result == UnityWebRequest.Result.Success && req.responseCode == 200)
+                    {
+                        CreditService.UpdateFromHeaders(
+                            req.GetResponseHeader("X-PerfLint-Credits-Remaining"),
+                            req.GetResponseHeader("X-PerfLint-Credits-Reset"));
+                    }
+                }
+                finally
+                {
+                    req.Dispose();
+                }
+            }
+
+            EditorApplication.update += Tick;
+        }
+
+        /// <summary>Auth/billing identity body ({key, instance_id}) shared by the hosted call and the balance query — no code snippet, no model.</summary>
+        private static string BuildIdentityBody()
+        {
+            var sb = new StringBuilder(128);
+            sb.Append('{');
+            string instance = LicenseSettings.InstanceId;
+            if (string.IsNullOrEmpty(instance)) instance = LlmSettings.AnonClientId;
+            sb.Append("\"key\":").Append(JsonStr(LicenseSettings.Key)).Append(',');
+            sb.Append("\"instance_id\":").Append(JsonStr(instance));
+            sb.Append('}');
+            return sb.ToString();
+        }
+
         private static string BuildHostedBody(int maxTokens, string system, IReadOnlyList<LlmMessage> messages, bool disableThinking)
         {
             var sb = new StringBuilder(512);

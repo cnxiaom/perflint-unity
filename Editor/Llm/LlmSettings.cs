@@ -54,6 +54,10 @@ namespace PerfLint.Llm
         public static string ProxyLlmEndpoint =>
             Licensing.LicenseSettings.Endpoint.TrimEnd('/') + "/llm";
 
+        /// <summary>Non-consuming balance read (same Worker, /llm/balance): syncs the real remaining credits without spending one.</summary>
+        public static string ProxyBalanceEndpoint =>
+            Licensing.LicenseSettings.Endpoint.TrimEnd('/') + "/llm/balance";
+
         private const string KAnonId = "PerfLint.Client.AnonId";
 
         /// <summary>Current invocation mode. Defaults to Hosted (zero-config).</summary>

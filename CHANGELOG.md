@@ -4,6 +4,14 @@ User-facing changes to PerfLint for Unity. This project follows [Semantic Versio
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-07-16
+
+A small fix release: the AI credits counter now shows your true remaining balance up front.
+
+### Fixed
+- **The AI credits counter now shows your real remaining balance the moment you open the LLM panel.** Previously the credits line read the plan's standby allowance (e.g. "5000/month · ready") until your next actual AI call returned the true count — so after some credits were already spent, it briefly looked like a full balance. PerfLint now fetches your real remaining balance when the LLM settings panel opens (and whenever your license tier changes), without spending a credit, so the number is correct up front. Free/offline behavior is unchanged: if the balance can't be fetched, the standby label still shows and the server remains the final authority.
+- **A routine background license re-check no longer briefly resets the credits counter.** For Pro users who had been offline past the license grace window, the automatic re-validation on startup could momentarily look like a plan change and reset the cached balance back to the "5000/month" standby until the next AI call. The counter now ignores that grace-period flap — it only resets on a genuine Free↔Pro change — so your real balance survives across restarts.
+
 ## [1.2.0] — 2026-07-16
 
 The "one-click cleanup, verified" release — disable unused built-in modules and XR/AI-Navigation packages with a compile-verified auto-rollback safety net, catch GPU-Instancing flags that do nothing (or hurt), tighten WebGL/IL2CPP build size, and capture the shader variants your shipped players actually compile.

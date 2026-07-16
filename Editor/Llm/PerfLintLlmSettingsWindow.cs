@@ -25,13 +25,24 @@ namespace PerfLint.Llm
         private void OnEnable()
         {
             Licensing.CreditService.Changed += Rebuild;
-            Licensing.LicenseService.Changed += Rebuild;
+            Licensing.LicenseService.Changed += OnLicenseChanged;
+            // Fetch the true remaining balance on open (no credit spent) so the panel shows the real number
+            // immediately, instead of the "5000/month · ready" standby that only self-corrects after the next call.
+            LlmClient.SyncHostedBalance();
         }
 
         private void OnDisable()
         {
             Licensing.CreditService.Changed -= Rebuild;
-            Licensing.LicenseService.Changed -= Rebuild;
+            Licensing.LicenseService.Changed -= OnLicenseChanged;
+        }
+
+        // A tier flip (Free↔Pro, incl. dev unlock toggle) drops the cached balance (different server pool);
+        // re-fetch the new tier's real balance so the panel doesn't linger on the standby allowance.
+        private void OnLicenseChanged()
+        {
+            Rebuild();
+            LlmClient.SyncHostedBalance();
         }
 
         // Provider changes affect available options and copy, so the entire panel is rebuilt.

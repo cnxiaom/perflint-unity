@@ -29,10 +29,13 @@ namespace PerfLint.Licensing
         /// <summary>Fired whenever the remaining balance changes, so the UI can refresh its display.</summary>
         public static event Action Changed;
 
-        // Pro entitlement at the last seen change, so a Free↔Pro flip can drop the now-stale balance:
-        // Free (daily) and Pro (monthly) are two separate server-side pools, so a count from one pool is
-        // meaningless for the other. Initialized on first access to the current state (no spurious reset).
-        private static bool _lastIsPro = LicenseService.IsPro;
+        // Paid-entitlement identity at the last seen change, so a real Free↔Pro switch can drop the now-stale
+        // balance: Free (daily) and Pro (monthly) are two separate server-side pools, so a count from one pool is
+        // meaningless for the other. Tracks HasActivePaidLicense — which IGNORES the offline grace window — NOT
+        // IsPro, so a grace-period flap (IsPro true→false→true on the same license: offline past grace, then a
+        // background re-validation restores it) does not look like a tier switch and does not wrongly wipe the
+        // still-valid Pro balance. Initialized on first access to the current state (no spurious reset).
+        private static bool _lastPaid = LicenseService.HasActivePaidLicense;
 
         public static bool Known => EditorPrefs.GetBool(KKnown, false);
         public static int Remaining => EditorPrefs.GetInt(KRemaining, -1);
@@ -88,17 +91,19 @@ namespace PerfLint.Licensing
         }
 
         /// <summary>
-        /// Called by <see cref="LicenseService"/> on any license change. If Pro entitlement just flipped
-        /// (Free↔Pro), the cached balance belongs to the wrong pool, so drop it — <see cref="RemainingText"/>
-        /// then shows the new tier's standby allowance ("5000/month · ready" / "10/day free · ready") until
-        /// the next /llm call returns the real balance. No-op when the tier is unchanged, so background
-        /// re-validations don't wipe a known balance.
+        /// Called by <see cref="LicenseService"/> on any license change. If the paid entitlement just flipped
+        /// (a real Free↔Pro switch — activation / expiry / deactivation), the cached balance belongs to the wrong
+        /// pool, so drop it — <see cref="RemainingText"/> then shows the new tier's standby allowance
+        /// ("5000/month · ready" / "10/day free · ready") until the next /llm call returns the real balance.
+        /// Tracks <see cref="LicenseService.HasActivePaidLicense"/> (grace-window–independent), NOT IsPro, so an
+        /// offline grace-period flap on the SAME license does not wipe a valid balance. No-op when unchanged, so
+        /// background re-validations don't wipe a known balance.
         /// </summary>
         internal static void OnLicenseChanged()
         {
-            bool now = LicenseService.IsPro;
-            if (now == _lastIsPro) return;
-            _lastIsPro = now;
+            bool now = LicenseService.HasActivePaidLicense;
+            if (now == _lastPaid) return;
+            _lastPaid = now;
             ResetCache();
         }
 

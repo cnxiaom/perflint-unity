@@ -49,6 +49,27 @@ namespace PerfLint.Licensing
             }
         }
 
+        /// <summary>
+        /// Whether this machine holds an active, non-expired paid entitlement — <b>ignoring the offline grace window</b>.
+        /// This is the billing-pool identity signal (Pro monthly vs Free daily) used by <see cref="CreditService"/> to
+        /// decide when the cached credit balance must be dropped. Unlike <see cref="IsPro"/> it does NOT flip during a
+        /// grace-period flap (offline past the grace window makes IsPro false, then a background re-validation restores
+        /// it) — that flap is the SAME license on the SAME server pool, so dropping the cached balance there would
+        /// wrongly discard a still-valid Pro balance. Same active/expiry criteria as IsPro minus the GraceDays check;
+        /// the dev unlock still counts, kept in step with IsPro.
+        /// </summary>
+        internal static bool HasActivePaidLicense
+        {
+            get
+            {
+                if (DevUnlockHook != null && DevUnlockHook()) return true;
+                if (string.IsNullOrEmpty(LicenseSettings.Key)) return false;
+                if (LicenseSettings.Status != "active") return false;
+                if (IsExpired()) return false;
+                return true;
+            }
+        }
+
         /// <summary>Human-readable status line for display in the UI.</summary>
         public static string StatusLine()
         {
