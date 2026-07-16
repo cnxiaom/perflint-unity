@@ -45,6 +45,13 @@ namespace PerfLint.Llm
             LlmClient.SyncHostedBalance();
         }
 
+        // Re-pull whenever the panel regains focus. The credit balance is a per-machine snapshot taken at the
+        // last fetch; a spend on another machine (or another editor session) sharing the same Pro monthly pool
+        // isn't pushed to us, so an already-open panel would keep showing a stale count. Re-fetching on focus
+        // means the number is current whenever the user actually looks at it. No credit spent; Hosted-only
+        // (SyncHostedBalance no-ops in BYO mode).
+        private void OnFocus() => LlmClient.SyncHostedBalance();
+
         // Provider changes affect available options and copy, so the entire panel is rebuilt.
         private void Rebuild()
         {

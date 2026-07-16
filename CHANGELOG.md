@@ -4,6 +4,11 @@ User-facing changes to PerfLint for Unity. This project follows [Semantic Versio
 
 ## [Unreleased]
 
+## [1.2.2] — 2026-07-16
+
+### Changed
+- **The AI credits counter now refreshes whenever you return to the LLM panel.** The balance is a per-machine snapshot, so if you use the same Pro license on two machines (or two editor sessions), a spend on one wouldn't update an already-open panel on the other. The counter now re-fetches your real remaining balance each time the LLM panel regains focus (no credit spent), so the number is current whenever you actually look at it. Two panels left open side-by-side still won't tick in real time — that would need polling — but clicking back onto a panel always shows the latest.
+
 ## [1.2.1] — 2026-07-16
 
 A small fix release: the AI credits counter now shows your true remaining balance up front.
