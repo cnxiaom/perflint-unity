@@ -139,7 +139,14 @@ namespace PerfLint.Scanners
                                                        "无法修改该设置（此 Unity 版本内部 API 不可用）——请在 Player Settings > Other Settings 手动关闭。"));
                         AssetDatabase.SaveAssets();
                         return FixResult.Ok(L.Tr($"Static Batching disabled for {target}.", $"已关闭 {target} 平台的 Static Batching。"));
-                    }));
+                    }),
+                // The same estimate the title states — disabling reclaims most of the combined-mesh copies.
+                // Filled for BOTH dimensions: the combined meshes live in runtime memory AND get baked into the
+                // player (where the Build Report can't show them — engine-generated, no category). One scene's
+                // CPU-side estimate is conservative for both: measured 2026-07 (3D Gamekit) memory reclaimed ~2×
+                // this figure (CPU+GPU copies) and build size shrank ~600-660MB against a ~554MB estimate.
+                estimatedMemorySavingsBytes: totalBytes,
+                estimatedBuildSavingsBytes: totalBytes);
         }
 
         /// <summary>

@@ -89,6 +89,48 @@ namespace PerfLint.Core
         /// </summary>
         public bool IgnoreExempt { get; }
 
+        /// <summary>
+        /// Estimated RUNTIME MEMORY reclaimed if this finding is resolved, in bytes; 0 = no honest estimate exists.
+        /// Filled only by rules whose savings are deterministically computable from import metadata / measured sizes
+        /// (e.g. texture Read/Write CPU copy, mip overhead, static-batching combined meshes). Always an estimate —
+        /// UI/aggregation must present it as "~"/"est.", never as a promise. Rules where the figure would depend on a
+        /// user decision (e.g. TEX003 downscale target) leave it at 0 rather than fabricate a number.
+        /// </summary>
+        public long EstimatedMemorySavingsBytes { get; }
+
+        /// <summary>
+        /// Estimated BUILD SIZE reclaimed if this finding is resolved, in bytes; 0 = no honest estimate exists.
+        /// Filled by the duplication rules (source file size × extra copies — verifiable on disk). Deliberately kept
+        /// out of per-finding text for the bundle-dup rules (their "no exact wasted-MB claim" wording stands: archive
+        /// compression makes the true delta inexact); the aggregate layer labels it "up to ~X (est.)".
+        /// </summary>
+        public long EstimatedBuildSavingsBytes { get; }
+
+        /// <summary>
+        /// True when the savings figures are an OPPORTUNITY CEILING rather than a firm reclaim estimate — e.g. the
+        /// Mipmap Streaming eligible pool, where the real runtime saving depends on camera distance and may be near
+        /// zero. Ceiling findings still count into the "up to ~X" potential line, but must NEVER be tallied into the
+        /// verified "optimized ~X for you" claim (a real device A/B immediately disproves that; happened 2026-07-17).
+        /// </summary>
+        public bool SavingsAreCeiling { get; }
+
+        /// <summary>
+        /// One labelled Locate action. Unlike the single <see cref="Ping"/> (rendered as one "Locate" button on the title row),
+        /// these are rendered as a per-row list inside the finding body — each row shows its own label and its own Locate button.
+        /// Used when a finding names several distinct targets the user may want to reveal independently (e.g. RUN.GPU002's Top-N
+        /// heaviest meshes, each selecting its own group of GameObjects). Editor-only: the Ping selects live scene objects, so a
+        /// static HTML report simply omits the buttons (the same targets are still described in <see cref="Detail"/>).
+        /// </summary>
+        public readonly struct LocateTarget
+        {
+            public readonly string Label;
+            public readonly Action Ping;
+            public LocateTarget(string label, Action ping) { Label = label; Ping = ping; }
+        }
+
+        /// <summary>Per-target Locate actions rendered as their own rows/buttons in the finding body. Null/empty = none (the title-row <see cref="Ping"/> is the only Locate).</summary>
+        public IReadOnlyList<LocateTarget> LocateTargets { get; }
+
         public Finding(
             string ruleId,
             Domain domain,
@@ -105,7 +147,11 @@ namespace PerfLint.Core
             string groupTitle = null,
             bool wasAutoFixable = false,
             bool wasActionable = false,
-            bool ignoreExempt = false)
+            bool ignoreExempt = false,
+            long estimatedMemorySavingsBytes = 0,
+            long estimatedBuildSavingsBytes = 0,
+            bool savingsAreCeiling = false,
+            IReadOnlyList<LocateTarget> locateTargets = null)
         {
             if (string.IsNullOrEmpty(ruleId)) throw new ArgumentException("ruleId is required", nameof(ruleId));
             if (string.IsNullOrEmpty(title)) throw new ArgumentException("title is required", nameof(title));
@@ -126,6 +172,10 @@ namespace PerfLint.Core
             WasAutoFixable = wasAutoFixable;
             WasActionable = wasActionable;
             IgnoreExempt = ignoreExempt;
+            EstimatedMemorySavingsBytes = estimatedMemorySavingsBytes > 0 ? estimatedMemorySavingsBytes : 0;
+            EstimatedBuildSavingsBytes = estimatedBuildSavingsBytes > 0 ? estimatedBuildSavingsBytes : 0;
+            SavingsAreCeiling = savingsAreCeiling;
+            LocateTargets = locateTargets;
         }
     }
 }

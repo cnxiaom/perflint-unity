@@ -1,6 +1,6 @@
 {
   "name": "com.perflint.unity",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "displayName": "PerfLint for Unity",
   "description": "One-click scan your project inside the editor to locate performance bottlenecks and version-migration blockers, with actionable fixes. All analysis runs locally — your code and art assets are never uploaded.",
   "unity": "2021.3",

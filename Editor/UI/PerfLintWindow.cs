@@ -25,6 +25,14 @@ namespace PerfLint.UI
         private Label _scoreLabel;
         private Label _gradeLabel;     // "Grade C" next to the big score number
         private Label _fixableLabel;   // "80 one-click-fixable · 1.4s" subtext
+        private Label _savingsLabel;   // "Est. potential savings: up to ~X build · ~Y memory" — hidden when no rule produced an estimate
+        private VisualElement _savingsRow;      // savings label + the per-dimension one-click optimize buttons
+        private Button _optimizeMemButton;      // shown only when the memory dimension has an executable plan
+        private Button _optimizeBuildButton;    // same for build size
+        private Label _optimizedLabel;          // "Optimized ~X for you (est.)" — session tally, verified by rescan deltas
+        private long _optimizedMemBytes;        // session accumulators behind _optimizedLabel
+        private long _optimizedBuildBytes;
+        private OptimizePlan _lastMemoryPlan;   // scene-scoped memory plan from the last RenderHeader — shared by the savings line's one-click note and the button
         private Label _critPill;       // rounded severity-count badges (Critical / Warning / Info)
         private Label _warnPill;
         private Label _infoPill;
@@ -244,6 +252,14 @@ namespace PerfLint.UI
             llmButton.style.marginLeft = 6;
             toolbar.Add(llmButton);
 
+            var cliButton = new Button(PerfLintCliHelpWindow.Open) { text = "CLI" };
+            cliButton.style.height = 26;
+            cliButton.style.marginLeft = 6;
+            cliButton.tooltip = L.Tr(
+                "Run PerfLint from the terminal / CI — 'unity command perflint_*' against this editor, or headless batchmode",
+                "从终端 / CI 运行 PerfLint —— 用 'unity command perflint_*' 对着本编辑器跑，或无头 batchmode");
+            toolbar.Add(cliButton);
+
             // English-only by default. A dev-only EN/中 switch is injected into the toolbar ONLY in a PERFLINT_DEV
             // editor (no-op in release — see L.InjectDevLangSwitch). CreateGUI appends without clearing, so a flip
             // must wipe root before rebuilding to avoid stacking a second copy of the whole panel.
@@ -257,11 +273,14 @@ namespace PerfLint.UI
             root.Add(toolbar);
 
             // ── Health score card ──────────────────────────────
+            // Two-row card: row 1 = score / grade / severity pills / ring; row 2 = the savings + optimized lines,
+            // full-width so their (long, wrapping) text can never squeeze the pills into a vertical stack under
+            // the ring (real layout break once the savings line grew buttons and the scene-scoped clause).
             var header = new VisualElement
             {
                 style =
                 {
-                    flexDirection = FlexDirection.Row, alignItems = Align.Center, marginBottom = 6,
+                    flexDirection = FlexDirection.Column, marginBottom = 6,
                     paddingTop = 10, paddingBottom = 10, paddingLeft = 14, paddingRight = 14,
                     backgroundColor = new Color(1f, 1f, 1f, 0.03f),
                     borderTopLeftRadius = 10, borderTopRightRadius = 10,
@@ -270,6 +289,10 @@ namespace PerfLint.UI
                 }
             };
             SetBorderColor(header, new Color(1f, 1f, 1f, 0.07f));
+            var headerTop = new VisualElement
+            {
+                style = { flexDirection = FlexDirection.Row, alignItems = Align.Center }
+            };
 
             // Big score number. The grade column sits flush beside it, so trim the number's own line box (no extra
             // top/bottom leading) and let the row's center-alignment line the two up cleanly.
@@ -277,7 +300,7 @@ namespace PerfLint.UI
             {
                 style = { fontSize = 42, unityFontStyleAndWeight = FontStyle.Bold, marginRight = 14, flexShrink = 0 }
             };
-            header.Add(_scoreLabel);
+            headerTop.Add(_scoreLabel);
 
             var gradeCol = new VisualElement { style = { marginRight = 18, flexShrink = 0, justifyContent = Justify.Center } };
             _gradeLabel = new Label(L.Tr("Not scanned", "尚未扫描"))
@@ -290,7 +313,7 @@ namespace PerfLint.UI
             };
             gradeCol.Add(_gradeLabel);
             gradeCol.Add(_fixableLabel);
-            header.Add(gradeCol);
+            headerTop.Add(gradeCol);
 
             // Rounded severity-count badges; hidden until the first scan fills in real numbers.
             _pillRow = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, flexWrap = Wrap.Wrap, flexGrow = 1, minWidth = 0, display = DisplayStyle.None } };
@@ -300,10 +323,49 @@ namespace PerfLint.UI
             _pillRow.Add(_critPill);
             _pillRow.Add(_warnPill);
             _pillRow.Add(_infoPill);
-            header.Add(_pillRow);
+            headerTop.Add(_pillRow);
 
             _scoreRing = new ScoreRing { style = { flexShrink = 0, marginLeft = 8 } };
-            header.Add(_scoreRing);
+            headerTop.Add(_scoreRing);
+            header.Add(headerTop);
+
+            // Row 2 (full card width): estimated optimization effect, aggregated from per-finding savings estimates.
+            // Green = opportunity, not alarm; "up to ~" wording is load-bearing (every input is a ceiling estimate).
+            // The per-dimension optimize buttons only appear when that dimension actually has an executable plan
+            // (never a button that can't do anything). Label shrinks/wraps; buttons never shrink.
+            _savingsRow = new VisualElement
+            {
+                style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, flexWrap = Wrap.Wrap, marginTop = 6, display = DisplayStyle.None }
+            };
+            _savingsLabel = new Label
+            {
+                style =
+                {
+                    fontSize = 11, whiteSpace = WhiteSpace.Normal, flexShrink = 1,
+                    color = new Color(0.45f, 0.80f, 0.50f)
+                }
+            };
+            _optimizeMemButton = MakeOptimizeButton(SavingsDimension.Memory);
+            _optimizeBuildButton = MakeOptimizeButton(SavingsDimension.Build);
+            // Both buttons live in one non-shrinking group so a wrap moves them together — without this the row
+            // wrap could strand one button at the end of the text line and drop the other alone onto the next.
+            var optimizeButtons = new VisualElement { style = { flexDirection = FlexDirection.Row, flexShrink = 0, alignItems = Align.Center } };
+            optimizeButtons.Add(_optimizeMemButton);
+            optimizeButtons.Add(_optimizeBuildButton);
+            _savingsRow.Add(_savingsLabel);
+            _savingsRow.Add(optimizeButtons);
+            header.Add(_savingsRow);
+            // Session tally of what one-click optimize has verifiably reclaimed (before-minus-after across rescans).
+            _optimizedLabel = new Label
+            {
+                style =
+                {
+                    fontSize = 11, whiteSpace = WhiteSpace.Normal, marginTop = 2,
+                    color = new Color(0.45f, 0.80f, 0.50f), unityFontStyleAndWeight = FontStyle.Bold,
+                    display = DisplayStyle.None
+                }
+            };
+            header.Add(_optimizedLabel);
 
             root.Add(header);
 
@@ -572,6 +634,10 @@ namespace PerfLint.UI
             _ruleFocus = null;
             _ruleFocusLabel = null;
             _focusedScriptNoFindings = null;
+            // The "optimized for you" tally is bound to one report generation: a full scan starts a new one, and a
+            // stale brag line hovering over a fresh report reads as a claim about it (user-reported confusion).
+            _optimizedMemBytes = 0;
+            _optimizedBuildBytes = 0;
             if (_staleBanner != null) _staleBanner.style.display = DisplayStyle.None; // Once refreshed, clear the stale prompt
             _scanButton.SetEnabled(false);
             _fixAllButton.SetEnabled(false);
@@ -932,6 +998,70 @@ namespace PerfLint.UI
             _gradeLabel.style.color = scoreColor;
             _fixableLabel.text =
                 $"{result.AutoFixableCount} {L.Tr("one-click-fixable", "项可一键修复")} · {result.Duration.TotalSeconds:0.0}s";
+
+            // Estimated optimization effect line — shown only when at least one rule produced an honest estimate.
+            // Biggest number first so the line never leads with its weakest figure.
+            // The scene-scoped memory plan is built ONCE here and shared by the "(~X one-click)" note and the
+            // button visibility — the line, the button and the dialog must all describe the same plan.
+            _lastMemoryPlan = OptimizePlan.Build(result.Findings, SavingsDimension.Memory, GetOpenSceneDependencies());
+            var savings = SavingsSummary.Compute(result.Findings);
+            if (savings.HasAny)
+            {
+                var parts = new List<string>(2);
+                void AddBuild() { if (savings.BuildBytes > 0) parts.Add(L.Tr($"~{ScannerUtil.Human(savings.BuildBytes)} build size", $"包体约 {ScannerUtil.Human(savings.BuildBytes)}")); }
+                void AddMem() { if (savings.MemoryBytes > 0) parts.Add(L.Tr($"~{ScannerUtil.Human(savings.MemoryBytes)} memory", $"内存约 {ScannerUtil.Human(savings.MemoryBytes)}")); }
+                if (savings.BuildBytes >= savings.MemoryBytes) { AddBuild(); AddMem(); } else { AddMem(); AddBuild(); }
+                // Project-wide by construction (scanners walk all of Assets/) — say so, or a single-scene device
+                // snapshot can never match the figure (real museum lesson, 2026-07-17). The scene-scoped clause
+                // gives the number a same-scene Memory Profiler A/B CAN validate: firm estimates whose assets are
+                // in the open scenes' dependency set.
+                string text = L.Tr($"Potential savings found: up to {string.Join(" · ", parts)} (est., project-wide)",
+                                   $"发现可优化空间：最多 {string.Join("、", parts)}（估算，全项目资产口径）");
+                if (savings.MemoryBytes > 0)
+                {
+                    long sceneMem = SavingsSummary.ComputeSceneScopedMemory(result.Findings, GetOpenSceneDependencies());
+                    if (sceneMem > 0)
+                    {
+                        text += L.Tr($" — ~{ScannerUtil.Human(sceneMem)} of firm memory savings in the open scene(s)",
+                                     $"，其中当前场景相关内存约 {ScannerUtil.Human(sceneMem)}");
+                        // Expectation-setting for the button next to this line: say up front how much of the scene
+                        // figure is one-click-deliverable — the rest is manual work the dialog itemizes. Without
+                        // this, "29.8 MB on the line, 0.27 MB in the dialog" reads as a broken button.
+                        long oneClick = _lastMemoryPlan?.FirmActionableSavingsBytes ?? 0;
+                        if (oneClick > 0 && oneClick < sceneMem)
+                            text += L.Tr($" (~{ScannerUtil.Human(oneClick)} one-click, the rest manual)",
+                                         $"（可一键约 {ScannerUtil.Human(oneClick)}，其余需手动）");
+                    }
+                }
+                _savingsLabel.text = text;
+                _savingsRow.style.display = DisplayStyle.Flex;
+            }
+            else
+            {
+                _savingsRow.style.display = DisplayStyle.None;
+            }
+
+            // Optimize buttons: only when the dimension has an executable plan (auto fixes or opt-in actions).
+            // Memory uses the scene-scoped plan — the button and the dialog must agree on what's offered.
+            _optimizeMemButton.style.display =
+                _lastMemoryPlan != null && !_lastMemoryPlan.IsEmpty ? DisplayStyle.Flex : DisplayStyle.None;
+            _optimizeBuildButton.style.display =
+                !OptimizePlan.Build(result.Findings, SavingsDimension.Build).IsEmpty ? DisplayStyle.Flex : DisplayStyle.None;
+
+            // Session tally of verified one-click reclaims.
+            if (_optimizedMemBytes > 0 || _optimizedBuildBytes > 0)
+            {
+                var done = new List<string>(2);
+                if (_optimizedMemBytes > 0) done.Add(L.Tr($"~{ScannerUtil.Human(_optimizedMemBytes)} memory", $"内存约 {ScannerUtil.Human(_optimizedMemBytes)}"));
+                if (_optimizedBuildBytes > 0) done.Add(L.Tr($"~{ScannerUtil.Human(_optimizedBuildBytes)} build size", $"包体约 {ScannerUtil.Human(_optimizedBuildBytes)}"));
+                _optimizedLabel.text = L.Tr($"Optimized for you: {string.Join(" · ", done)} (est.)",
+                                            $"已为您优化：{string.Join("、", done)}（估算）");
+                _optimizedLabel.style.display = DisplayStyle.Flex;
+            }
+            else
+            {
+                _optimizedLabel.style.display = DisplayStyle.None;
+            }
 
             // A zero count is good news (e.g. "0 Critical"), so dim it to grey instead of flashing its severity color as if it were an alarm.
             StylePill(_critPill, result.CriticalCount, "Critical", SeverityColor(Severity.Critical));
@@ -1896,6 +2026,131 @@ namespace PerfLint.UI
             ApplyFixes(_lastResult.Findings.Where(f => f.CanAutoFix).ToList(), L.Tr("All", "全部"));
         }
 
+        // ── One-click optimize (dimension-oriented: memory / build size) ─────────────────────────
+        // The savings-line buttons open a plan dialog; its auto tier reuses the Fix All loop and its decision tier
+        // dispatches through the SAME per-action flows as the finding rows (each with its own confirmation), so no
+        // consent wording is bypassed. The "optimized ~X" figure is before-minus-after of the aggregate estimate,
+        // i.e. verified by the incremental rescan rather than tallied from what we merely attempted.
+
+        /// <summary>Opens the optimize plan dialog for one dimension. No-op when the current result has no executable savings.</summary>
+        private void OpenOptimizeDialog(SavingsDimension dimension)
+        {
+            if (_lastResult == null) return;
+            // Memory plans are scene-scoped: only work whose effect a build of the open scene(s) can show.
+            var plan = OptimizePlan.Build(_lastResult.Findings, dimension,
+                dimension == SavingsDimension.Memory ? GetOpenSceneDependencies() : null);
+            if (plan.IsEmpty) { ShowNotification(new GUIContent(L.Tr("Nothing executable for this dimension", "该维度暂无可执行项"))); return; }
+            PerfLintOptimizeWindow.Open(this, plan);
+        }
+
+        /// <summary>Executes an optimize plan: auto tier in one batch, then each chosen decision group through its normal (confirming) flow.</summary>
+        internal void RunOptimizePlan(OptimizePlan plan, IReadOnlyList<OptimizePlan.DecisionGroup> chosenGroups)
+        {
+            if (plan == null || _lastResult == null) return;
+            if (!Entitlements.RequirePro(L.Tr("One-click optimize", "一键优化"))) return;
+
+            // FIRM totals only: the ceiling portion (Mipmap Streaming pool — camera-dependent) must never enter
+            // the "optimized ~X for you" claim. Tracked separately so the run can still SAY streaming was enabled.
+            var beforeTotals = SavingsSummary.Compute(_lastResult.Findings);
+            long before = DimensionFirmTotal(beforeTotals, plan.Dimension);
+            long beforeCeiling = plan.Dimension == SavingsDimension.Memory ? beforeTotals.MemoryCeilingBytes : 0;
+
+            if (plan.AutoItems.Count > 0)
+            {
+                ApplyFixesCore(plan.AutoItems, out _, out _);
+                RescanRules(plan.AutoItems.Select(f => f.RuleId));
+            }
+
+            if (chosenGroups != null)
+            {
+                foreach (var g in chosenGroups)
+                {
+                    if (g == null || g.Findings == null || g.Findings.Count == 0) continue;
+                    // Same dispatch as the finding rows — each path shows its own confirmation and rescans its rule.
+                    if (g.RuleId == "ASSET.DUP001") RunMergeAllForDuplicates(g.Findings);
+                    else if (g.Findings.Count == 1) RunAction(g.Findings[0]);
+                    else if (g.Findings[0].Action != null && !g.Findings[0].Action.AllowRuleBatch)
+                        // Defensive: actions marked not-batchable (per-item domain reload etc.) run one by one with
+                        // per-item consent. No such rule carries a savings estimate today, but if one ever does this
+                        // must not silently loop through RunActionsForRule's single-confirm batch.
+                        foreach (var f in g.Findings) RunAction(f);
+                    else RunActionsForRule(g.Findings);
+                }
+            }
+
+            var afterTotals = _lastResult != null ? SavingsSummary.Compute(_lastResult.Findings) : beforeTotals;
+            long after = DimensionFirmTotal(afterTotals, plan.Dimension);
+            long reclaimed = Math.Max(0, before - after);
+            // The ceiling that stopped being reported = the opportunity the run switched on (e.g. streaming enabled).
+            long afterCeiling = plan.Dimension == SavingsDimension.Memory ? afterTotals.MemoryCeilingBytes : 0;
+            long ceilingClaimed = Math.Max(0, beforeCeiling - afterCeiling);
+            // Diagnostic breadcrumb: the tally only ever grows here, so any surprising "Optimized for you" figure
+            // can be traced to the exact run (and its firm/ceiling split) in the Console.
+            Debug.Log($"[PerfLint] Optimize run ({plan.Dimension}): firm {before} → {after} (claimed {reclaimed}), ceiling delta {ceilingClaimed}");
+            if (plan.Dimension == SavingsDimension.Memory) _optimizedMemBytes += reclaimed;
+            else _optimizedBuildBytes += reclaimed;
+            if (_lastResult != null) RenderHeader(_lastResult);
+
+            string dimWord = plan.Dimension == SavingsDimension.Memory ? L.Tr("memory", "内存") : L.Tr("build size", "包体");
+            string body;
+            if (reclaimed > 0)
+                body = L.Tr($"Optimized ~{ScannerUtil.Human(reclaimed)} of {dimWord} for you (estimate; the re-scan no longer reports that space).",
+                            $"已为您优化约 {ScannerUtil.Human(reclaimed)} {dimWord}（估算口径；重扫后这部分空间不再出现）。");
+            else if (ceilingClaimed > 0)
+                // Only opportunity-type items ran — nothing failed, there is just no firm reclaim to tally.
+                // The old "cancelled or failed" wording here read as an error for a perfectly successful run.
+                body = L.Tr("The items you ran are opportunity-type, so no firm figure is tallied.",
+                            "本次执行的是机会型优化，无确定性战绩入账。");
+            else
+                body = L.Tr("No verified change — steps may have been cancelled or failed (see the notifications above).",
+                            "没有可验证的变化——操作可能被取消或执行失败（见前面的提示）。");
+            // Opportunity-type work is reported separately and NEVER as a reclaim figure: the pool is an upper
+            // bound and real savings depend on the camera/scene — a device A/B would disprove a merged claim.
+            // Streaming specifics: it only evicts mips once demand exceeds the Memory Budget, so on small scenes
+            // the (512MB-default) budget can mean exactly zero effect — say so with the LIVE budget value and point
+            // at the tuning deck, or the first same-scene A/B a user takes reads as "it did nothing" (real case).
+            // DisplayDialog truncates around ~500 chars, so the full budget explanation only ships in the
+            // ceiling-only case; when a firm figure is also present, the ceiling note stays short.
+            if (ceilingClaimed > 0 && reclaimed == 0)
+                body += L.Tr($"\n\nEnabled (e.g. Mipmap Streaming): pool ceiling ~{ScannerUtil.Human(ceilingClaimed)}. Actual savings depend on camera, scene AND the streaming Memory Budget — currently {QualitySettings.streamingMipmapsMemoryBudget:0} MB; scenes whose texture demand stays under it will see no change. Tune it in Runtime Profiler > Texture Streaming (lower the budget until the over-budget line appears, then back off).",
+                             $"\n\n已启用（如 Mipmap Streaming）：池子上限约 {ScannerUtil.Human(ceilingClaimed)}。实际节省取决于相机、场景和串流 Memory Budget——当前 {QualitySettings.streamingMipmapsMemoryBudget:0} MB；纹理需求低于预算的场景将看不到变化。请到 Runtime Profiler > Texture Streaming 调参（把预算往下调到出现超额提示再回退）。");
+            else if (ceilingClaimed > 0)
+                body += L.Tr($"\n\nAlso enabled opportunity optimizations: pool ceiling ~{ScannerUtil.Human(ceilingClaimed)} — actual savings depend on camera/scene/Memory Budget (tune in Runtime Profiler > Texture Streaming).",
+                             $"\n\n另启用了机会型优化：池子上限约 {ScannerUtil.Human(ceilingClaimed)}，实际取决于相机/场景/Memory Budget（Runtime Profiler > Texture Streaming 可调参）。");
+            if (reclaimed > 0)
+                body += L.Tr("\n\nTo verify on device: take two Memory Profiler snapshots at the SAME scene and moment (before/after), and compare the Texture2D/Mesh categories or the specific assets — not the total (audio/RTs/native fluctuate on their own).",
+                             "\n\n真机复测姿势：同一场景同一时点各拍一张 Memory Profiler 快照对比，看 Texture2D/Mesh 类别或具体资产——别看总量（音频/RT/原生分配会自己波动）。");
+            EditorUtility.DisplayDialog(L.Tr("PerfLint — Optimize complete", "PerfLint — 优化完成"), body, "OK");
+        }
+
+        private static long DimensionFirmTotal(SavingsSummary.Totals t, SavingsDimension d) =>
+            d == SavingsDimension.Memory ? t.FirmMemoryBytes : t.BuildBytes;
+
+        // Open scenes' recursive dependency set, cached by the loaded-scene-paths key: GetDependencies over big
+        // scenes is too slow for every RenderHeader, but the set only changes when the open scene set changes.
+        private string _sceneDepsKey;
+        private HashSet<string> _sceneDeps;
+
+        private HashSet<string> GetOpenSceneDependencies()
+        {
+            var scenePaths = new List<string>();
+            for (int i = 0; i < UnityEngine.SceneManagement.SceneManager.sceneCount; i++)
+            {
+                var sc = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                if (sc.isLoaded && !string.IsNullOrEmpty(sc.path)) scenePaths.Add(sc.path);
+            }
+            string key = string.Join(";", scenePaths);
+            if (key == _sceneDepsKey && _sceneDeps != null) return _sceneDeps;
+
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var p in scenePaths)
+                foreach (var d in AssetDatabase.GetDependencies(p, true))
+                    set.Add(d);
+            _sceneDepsKey = key;
+            _sceneDeps = set;
+            return set;
+        }
+
         /// <summary>Batch-apply fixes to a given fixable set, using Start/StopAssetEditing to batch the reimports.</summary>
         private void ApplyFixes(IReadOnlyList<Finding> fixables, string label)
         {
@@ -1916,7 +2171,20 @@ namespace PerfLint.UI
                 $"{L.Tr("Fix", "修复")} ({fixables.Count})", L.Tr("Cancel", "取消"));
             if (!confirm) return;
 
-            int success = 0, failed = 0;
+            ApplyFixesCore(fixables, out int success, out int failed);
+
+            ShowNotification(new GUIContent(L.Tr($"Batch fix done: {success} succeeded, {failed} failed", $"批量修复完成：成功 {success}，失败 {failed}")));
+            RescanRules(fixables.Select(f => f.RuleId));
+        }
+
+        /// <summary>
+        /// The batch-fix execution loop WITHOUT gating/confirmation/rescan — shared by ApplyFixes (which confirms via
+        /// its own dialog) and the one-click optimize flow (where the plan dialog is the single confirmation).
+        /// Callers are responsible for the Pro gate, user consent, and the follow-up rescan.
+        /// </summary>
+        private void ApplyFixesCore(IReadOnlyList<Finding> fixables, out int success, out int failed)
+        {
+            success = 0; failed = 0;
             var failures = new List<string>();
 
             AssetDatabase.StartAssetEditing();
@@ -1953,9 +2221,6 @@ namespace PerfLint.UI
             if (failed > 0)
                 Debug.LogWarning($"[PerfLint] " + L.Tr($"Batch fix done: {success} succeeded, {failed} failed.\n", $"批量修复完成：成功 {success}，失败 {failed}。\n") +
                                  string.Join("\n", failures.Take(20)));
-
-            ShowNotification(new GUIContent(L.Tr($"Batch fix done: {success} succeeded, {failed} failed", $"批量修复完成：成功 {success}，失败 {failed}")));
-            RescanRules(fixables.Select(f => f.RuleId));
         }
 
         /// <summary>
@@ -2390,6 +2655,28 @@ namespace PerfLint.UI
             e.style.borderBottomColor = c;
             e.style.borderLeftColor = c;
             e.style.borderRightColor = c;
+        }
+
+        /// <summary>Small green action button on the savings line: opens the one-click optimize plan for one dimension.</summary>
+        private Button MakeOptimizeButton(SavingsDimension dimension)
+        {
+            var c = new Color(0.45f, 0.80f, 0.50f);
+            var b = new Button(() => OpenOptimizeDialog(dimension))
+            {
+                text = dimension == SavingsDimension.Memory
+                    ? L.Tr("Optimize memory (this scene)…", "一键优化内存（当前场景）…")
+                    : L.Tr("Optimize build size…", "一键优化包体…"),
+                style =
+                {
+                    fontSize = 10, marginLeft = 6, marginTop = 0, marginBottom = 0,
+                    paddingLeft = 7, paddingRight = 7, paddingTop = 1, paddingBottom = 1,
+                    color = c, backgroundColor = new Color(c.r, c.g, c.b, 0.12f),
+                    flexShrink = 0,
+                    display = DisplayStyle.None
+                }
+            };
+            SetBorderColor(b, new Color(c.r, c.g, c.b, 0.55f));
+            return b;
         }
 
         /// <summary>A rounded "pill" badge (severity-count chip): colored text + a faint same-hue fill and border.</summary>

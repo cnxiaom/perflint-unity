@@ -146,7 +146,11 @@ namespace PerfLint.Scanners
                     // Duplication findings bypass the ignore-path filter (see Finding.IgnoreExempt): third-party
                     // duplication bloats the user's build, and the fix (explicit bundle assignment) doesn't edit the asset.
                     ignoreExempt: true,
-                    ping: () => ScannerUtil.PingAsset(d.Path));
+                    ping: () => ScannerUtil.PingAsset(d.Path),
+                    // Estimate only, kept OUT of the finding text (the "no exact wasted-MB claim" wording above
+                    // stands — bundle compression makes the true delta inexact). Source bytes × extra copies feeds
+                    // the panel's aggregate "up to ~X (est.)" line.
+                    estimatedBuildSavingsBytes: d.Size * (d.Copies - 1));
             }
         }
 

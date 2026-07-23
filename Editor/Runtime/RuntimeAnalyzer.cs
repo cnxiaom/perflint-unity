@@ -529,6 +529,14 @@ namespace PerfLint.Runtime
             }
             if (lines.Count == 0) return;
 
+            // Locate can only reveal *project* assets (Project window / import settings). When the biggest consumers are runtime render targets
+            // (deferred G-buffer, temp pools, camera targets — no asset path, not GameObjects), there is nothing to select, so we gate the button
+            // off and swap the "Click Locate" line for RT-appropriate guidance (resolution / Release) — never point at a button that isn't there.
+            bool canLocate = sb.HasTopMemoryAssets;
+            string closingLine = canLocate
+                ? L.Tr("Click Locate to select the project textures/meshes above (opens their import settings). Runtime render targets in the list have no project location to reveal.", "点 Locate 选中上面的工程纹理/网格（会打开其导入设置）。列表中的运行时渲染目标没有可打开的工程位置。")
+                : L.Tr("These biggest consumers are runtime render targets (created by the rendering path / post-processing, not project assets), so there's nothing to Locate — their size is driven by render resolution and pipeline settings: lower the resolution or enable Dynamic Resolution, and Release() the ones you no longer need.", "这些最大消耗是运行时渲染目标（由渲染路径/后处理创建，非工程资产），没有可 Locate 的对象——其大小由渲染分辨率与管线设置决定：降低分辨率或开启动态分辨率，并 Release() 不再需要的目标。");
+
             findings.Add(new Finding(
                 ruleId: "RUN.MEM004",
                 domain: Domain.Runtime,
@@ -537,8 +545,8 @@ namespace PerfLint.Runtime
                 detail: L.Tr("The biggest textures / render targets / meshes currently loaded (by runtime memory):\n  • ", "当前加载的最大纹理/渲染目标/网格（按运行时内存）：\n  • ") + string.Join("\n  • ", lines) + "\n\n" +
                         L.Tr("Check whether each needs its current resolution/format: compress textures (ASTC / BCn) instead of RGBA32, lower an oversized import Max Size, generate mipmaps only where needed, and Release() runtime RenderTextures you no longer use. Whether a size is 'too big' depends on your platform's VRAM budget. ", "逐个确认是否需要当前分辨率/格式：纹理用压缩格式（ASTC / BCn）而非 RGBA32、调低过大的导入 Max Size、按需生成 mipmap，运行时不再用的 RenderTexture 及时 Release()。是否『过大』取决于目标平台显存预算。") +
                         L.Tr("(Editor-only render targets — Game/Scene view, editor windows, gizmos — are filtered out; an occasional editor-internal asset may still slip through.) ", "（编辑器专用渲染目标——Game/Scene 视图、编辑器窗口、Gizmo——已过滤；个别编辑器内部资源仍可能漏网。）") +
-                        L.Tr("Click Locate to select them (project textures open their import settings).", "点 Locate 选中它们（工程纹理会打开导入设置）。"),
-                ping: sb.HasTopMemoryAssets ? (System.Action)sb.SelectTopMemoryAssets : null));
+                        closingLine,
+                ping: canLocate ? (System.Action)sb.SelectTopMemoryAssets : null));
         }
 
         private static void DrawCallsAndSetPass(RuntimeProfileResult r, List<Finding> findings)
@@ -652,20 +660,27 @@ namespace PerfLint.Runtime
             // not equal to the post-cull per-frame counter above, but they name the concrete models worth investigating first.
             var sb = r.SceneBatching;
             string breakdown = "";
-            System.Action ping = null;
+            // One Locate per listed mesh — each reveals its own group of GameObjects (users expect to jump to each cluster separately, not just the heaviest one).
+            List<Finding.LocateTarget> locateTargets = null;
             if (sb != null && sb.HasData && sb.TopTriangleMeshes != null && sb.TopTriangleMeshes.Count > 0)
             {
                 breakdown = L.Tr("\n\nHeaviest geometry loaded in the scene (authored triangle counts; the per-frame counter above is post-cull, but these are the usual suspects):\n", "\n\n场景中最重的几何（建模三角面数；上面的每帧计数是剔除后的，而这些是首要排查对象）：\n");
-                foreach (var m in sb.TopTriangleMeshes)
+                for (int i = 0; i < sb.TopTriangleMeshes.Count; i++)
                 {
+                    var m = sb.TopTriangleMeshes[i];
                     breakdown += m.InstanceCount > 1
                         ? L.Tr($"  • {m.MeshName}: {m.TrianglesPerInstance / 1000.0:0.0}K tris × {m.InstanceCount} = {m.TotalTriangles / 1000.0:0.0}K\n", $"  • {m.MeshName}：{m.TrianglesPerInstance / 1000.0:0.0}K 面 × {m.InstanceCount} = {m.TotalTriangles / 1000.0:0.0}K\n")
                         : L.Tr($"  • {m.MeshName}: {m.TotalTriangles / 1000.0:0.0}K tris\n", $"  • {m.MeshName}：{m.TotalTriangles / 1000.0:0.0}K 面\n");
-                }
-                if (sb.HasTopMeshExamples)
-                {
-                    breakdown += L.Tr("Click Locate to select the GameObjects using the heaviest mesh.", "点 Locate 选中使用最重网格的 GameObject。");
-                    ping = sb.SelectTopTriangleMeshExamples;
+
+                    if (sb.HasMeshExamples(i))
+                    {
+                        int rank = i; // capture per iteration for the closure
+                        string label = m.InstanceCount > 1
+                            ? L.Tr($"{m.MeshName} (×{m.InstanceCount})", $"{m.MeshName}（×{m.InstanceCount}）")
+                            : m.MeshName;
+                        (locateTargets ??= new List<Finding.LocateTarget>()).Add(
+                            new Finding.LocateTarget(label, () => sb.SelectMeshExamples(rank)));
+                    }
                 }
             }
 
@@ -681,7 +696,7 @@ namespace PerfLint.Runtime
                         L.Tr("2. Check visibility culling: is Occlusion Culling baked, and is the camera's Far Clip too large;\n", "2. 检查可见性剔除：Occlusion Culling 是否已烘焙，相机 Far Clip 是否过大；\n") +
                         L.Tr("3. For high-poly characters/foliage instanced in large numbers, consider GPU Instancing + simplified LODs.\n", "3. 高面数角色/植被若大量实例化，考虑 GPU Instancing + 简化 LOD。\n") +
                         L.Tr("Reference baselines: <50K for mobile, <200K for mid-range PC scenes, up to 500K+ on high-end PC/console.", "参考基准：移动端建议 <50K，PC 中档场景 <200K，高端 PC/Console 可至 500K+。"),
-                ping: ping));
+                locateTargets: locateTargets));
         }
 
         private static void BatchingEfficiency(RuntimeProfileResult r, List<Finding> findings)

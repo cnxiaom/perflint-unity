@@ -80,8 +80,9 @@ namespace PerfLint.Runtime
         /// <summary>Sum of authored triangles across all enabled mesh Renderers in the scene (for sizing the top contributors against the whole).</summary>
         public long TotalSceneTriangles { get; }
 
-        /// <summary>GameObjects using the single heaviest mesh (for Locate, up to 12). Valid only within Play Mode; stale references filtered at Ping time.</summary>
-        public IReadOnlyList<GameObject> TopMeshExamples { get; }
+        /// <summary>GameObjects using each of the top meshes, indexed parallel to <see cref="TopTriangleMeshes"/> (rank 0 = heaviest). For RUN.GPU002's per-mesh Locate — each rank selects its own group.
+        /// Valid only within Play Mode; stale references filtered at Ping time.</summary>
+        public IReadOnlyList<IReadOnlyList<GameObject>> TopMeshExamplesByRank { get; }
 
         /// <summary>Largest loaded graphics assets by runtime memory (textures / render targets / meshes), descending. For RUN.MEM004 VRAM localization.</summary>
         public IReadOnlyList<AssetMemStat> TopMemoryAssets { get; }
@@ -93,7 +94,7 @@ namespace PerfLint.Runtime
             bool hasData, bool isSrp, int rendererCount, int uniqueMaterialCount,
             int instancedRendererCount, IReadOnlyList<GameObject> instancedExamples,
             IReadOnlyList<MeshTriangleStat> topTriangleMeshes, long totalSceneTriangles,
-            IReadOnlyList<GameObject> topMeshExamples,
+            IReadOnlyList<IReadOnlyList<GameObject>> topMeshExamplesByRank,
             IReadOnlyList<AssetMemStat> topMemoryAssets,
             RtLeakGroup suspectRtLeak)
         {
@@ -106,7 +107,7 @@ namespace PerfLint.Runtime
             InstancedExamples = instancedExamples ?? new List<GameObject>();
             TopTriangleMeshes = topTriangleMeshes ?? new List<MeshTriangleStat>();
             TotalSceneTriangles = totalSceneTriangles;
-            TopMeshExamples = topMeshExamples ?? new List<GameObject>();
+            TopMeshExamplesByRank = topMeshExamplesByRank ?? new List<IReadOnlyList<GameObject>>();
             TopMemoryAssets = topMemoryAssets ?? new List<AssetMemStat>();
         }
 
@@ -117,11 +118,14 @@ namespace PerfLint.Runtime
         /// feed explicit topology (pipeline / renderer + material counts / instancing / top meshes) into RuntimeAnalyzer's logic headlessly.</summary>
         internal static SceneBatchingSnapshot ForTests(bool isSrp, int rendererCount, int uniqueMaterialCount, int instancedRendererCount,
             IReadOnlyList<MeshTriangleStat> topTriangleMeshes = null, long totalSceneTriangles = 0,
-            IReadOnlyList<AssetMemStat> topMemoryAssets = null, RtLeakGroup suspectRtLeak = null) =>
-            new SceneBatchingSnapshot(true, isSrp, rendererCount, uniqueMaterialCount, instancedRendererCount, null, topTriangleMeshes, totalSceneTriangles, null, topMemoryAssets, suspectRtLeak);
+            IReadOnlyList<AssetMemStat> topMemoryAssets = null, RtLeakGroup suspectRtLeak = null,
+            IReadOnlyList<IReadOnlyList<GameObject>> topMeshExamplesByRank = null) =>
+            new SceneBatchingSnapshot(true, isSrp, rendererCount, uniqueMaterialCount, instancedRendererCount, null, topTriangleMeshes, totalSceneTriangles, topMeshExamplesByRank, topMemoryAssets, suspectRtLeak);
 
-        /// <summary>True when there's at least one GameObject to Locate for the heaviest mesh.</summary>
-        public bool HasTopMeshExamples => TopMeshExamples != null && TopMeshExamples.Count > 0;
+        /// <summary>True when rank <paramref name="rank"/> (parallel to <see cref="TopTriangleMeshes"/>) has at least one GameObject to Locate.</summary>
+        public bool HasMeshExamples(int rank) =>
+            TopMeshExamplesByRank != null && rank >= 0 && rank < TopMeshExamplesByRank.Count
+            && TopMeshExamplesByRank[rank] != null && TopMeshExamplesByRank[rank].Count > 0;
 
         /// <summary>Material reuse ratio: Renderer count / unique material count. The closer to 1 this is, the less materials are being shared (one material per object = hard to batch).</summary>
         public double MaterialReuseRatio =>
@@ -193,7 +197,10 @@ namespace PerfLint.Runtime
                     }
                     acc.Count++;
                     totalSceneTris += acc.PerInstanceTris;
-                    if (acc.Examples.Count < 12) acc.Examples.Add(r.gameObject);
+                    // Locate should select *every* instance of the heaviest mesh, not just a handful. We don't know which mesh is heaviest
+                    // until after the loop, so collect up to MaxTopMeshExamples per mesh; the top one then already has its full instance set.
+                    // Total memory stays bounded by the renderer count (each renderer joins exactly one mesh's list, each list capped).
+                    if (acc.Examples.Count < MaxTopMeshExamples) acc.Examples.Add(r.gameObject);
                 }
             }
 
@@ -203,14 +210,14 @@ namespace PerfLint.Runtime
             var ordered = new List<MeshAcc>(meshAcc.Values);
             ordered.Sort((a, b) => (b.PerInstanceTris * b.Count).CompareTo(a.PerInstanceTris * a.Count));
             var topMeshes = new List<MeshTriangleStat>();
-            List<GameObject> topMeshExamples = null;
+            var topMeshExamplesByRank = new List<IReadOnlyList<GameObject>>(); // parallel to topMeshes — each rank keeps its own mesh's GameObjects for its own Locate
             for (int i = 0; i < ordered.Count && i < 5; i++)
             {
                 var a = ordered[i];
                 long total = a.PerInstanceTris * a.Count;
                 if (total <= 0) break; // nothing meaningful past here
                 topMeshes.Add(new MeshTriangleStat(string.IsNullOrEmpty(a.Name) ? "(unnamed mesh)" : a.Name, a.PerInstanceTris, a.Count, total));
-                if (i == 0) topMeshExamples = a.Examples;
+                topMeshExamplesByRank.Add(a.Examples);
             }
 
             return new SceneBatchingSnapshot(
@@ -222,7 +229,7 @@ namespace PerfLint.Runtime
                 instancedExamples: instancedExamples,
                 topTriangleMeshes: topMeshes,
                 totalSceneTriangles: totalSceneTris,
-                topMeshExamples: topMeshExamples,
+                topMeshExamplesByRank: topMeshExamplesByRank,
                 topMemoryAssets: CaptureTopMemoryAssets(),
                 suspectRtLeak: CaptureRtLeak());
         }
@@ -305,6 +312,9 @@ namespace PerfLint.Runtime
             public List<GameObject> Examples;
         }
 
+        /// <summary>Upper bound on how many GameObjects RUN.GPU002's Locate selects for the heaviest mesh. High enough to cover normal instance counts (e.g. a few hundred foliage), capped so a pathological scene (tens of thousands) can't stall the editor selecting them all.</summary>
+        private const int MaxTopMeshExamples = 512;
+
         /// <summary>Whether a graphics object's name marks it as an editor-only render target/texture (Game/Scene view, editor windows, gizmos, handles) — these consume VRAM in the editor but are never shipped, so they shouldn't be attributed to the game.</summary>
         private static bool IsEditorInternalGfxName(string name)
         {
@@ -348,31 +358,38 @@ namespace PerfLint.Runtime
             if (alive.Count > 0) Selection.objects = alive.ToArray();
         }
 
-        /// <summary>Selects the GameObjects using the heaviest mesh (filtering out already-destroyed ones). Intended for RUN.GPU002's Locate.</summary>
-        public void SelectTopTriangleMeshExamples()
+        /// <summary>Selects the GameObjects using the mesh at <paramref name="rank"/> (0 = heaviest), filtering out already-destroyed ones. Intended for RUN.GPU002's per-mesh Locate — each rank reveals its own group.</summary>
+        public void SelectMeshExamples(int rank)
         {
+            if (!HasMeshExamples(rank)) return;
             var alive = new List<Object>();
-            foreach (var go in TopMeshExamples)
+            foreach (var go in TopMeshExamplesByRank[rank])
                 if (go != null) alive.Add(go);
             if (alive.Count > 0) Selection.objects = alive.ToArray();
         }
 
-        /// <summary>True when there's at least one biggest-memory asset with a live object to Locate.</summary>
+        /// <summary>A memory asset is "locatable" only if it's a project asset with an AssetDatabase path — those reveal in the Project window / import settings.
+        /// Runtime render targets (deferred G-buffer, temp pools, camera targets) have no asset path and aren't GameObjects, so putting them in Selection
+        /// produces no visible effect — offering a Locate button for them is a dead button. Gate both the button and the selection on this.</summary>
+        private static bool IsLocatable(Object asset) =>
+            asset != null && !string.IsNullOrEmpty(AssetDatabase.GetAssetPath(asset));
+
+        /// <summary>True when at least one biggest-memory asset is a locatable project asset (so Locate does something visible). Runtime RTs alone → false → no button.</summary>
         public bool HasTopMemoryAssets
         {
             get
             {
-                foreach (var a in TopMemoryAssets) if (a.Asset != null) return true;
+                foreach (var a in TopMemoryAssets) if (IsLocatable(a.Asset)) return true;
                 return false;
             }
         }
 
-        /// <summary>Selects the biggest-memory graphics assets (filtering out destroyed ones). Project assets ping their import settings; runtime objects are selected. Intended for RUN.MEM004's Locate.</summary>
+        /// <summary>Selects the biggest-memory project assets (textures/meshes) so they reveal in the Project window / import settings. Runtime render targets are skipped — they have no location to reveal. Intended for RUN.MEM004's Locate.</summary>
         public void SelectTopMemoryAssets()
         {
             var alive = new List<Object>();
             foreach (var a in TopMemoryAssets)
-                if (a.Asset != null) alive.Add(a.Asset);
+                if (IsLocatable(a.Asset)) alive.Add(a.Asset);
             if (alive.Count > 0) Selection.objects = alive.ToArray();
         }
 

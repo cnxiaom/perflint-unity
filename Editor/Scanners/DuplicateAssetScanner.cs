@@ -93,6 +93,9 @@ namespace PerfLint.Scanners
                 sb.Append(L.Tr("\nMerge them into a single asset, update the references, and delete the extra copies to reduce build size.", "\n建议合并为单一资源并更新引用，删除多余副本以减小包体。"));
 
                 int extraCopies = group.Count - 1;
+                // Byte-identical copies grouped by (size, hash): the group's shared file size is the size-group key.
+                // Dedup deletes the extras, so the on-disk (and shipped, if referenced) saving is exact per copy.
+                long groupFileSize = long.Parse(kv.Key.Substring(0, kv.Key.IndexOf(':')));
                 yield return new Finding(
                     ruleId: "ASSET.DUP001",
                     domain: Domain.Assets,
@@ -112,7 +115,8 @@ namespace PerfLint.Scanners
                             L.Tr("Every reference across the project (scenes, prefabs, materials, .meta) is redirected to the kept copy, then the redundant files are deleted.\n", "全工程的引用（场景、预制体、材质、.meta）都会重定向到保留副本，随后删除多余文件。\n") +
                             L.Tr("Requires Asset Serialization = Force Text. ", "要求 Asset Serialization = Force Text。") + PerfLintWarnings.Irreversible,
                         run: () => DuplicateAssetMerger.Merge(group),
-                        runWithChoice: keep => DuplicateAssetMerger.Merge(group, keep)));
+                        runWithChoice: keep => DuplicateAssetMerger.Merge(group, keep)),
+                    estimatedBuildSavingsBytes: groupFileSize * extraCopies);
             }
         }
 

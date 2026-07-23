@@ -144,7 +144,10 @@ namespace PerfLint.Core
             // would disappear permanently).
             hadFix = f.CanAutoFix || f.WasAutoFixable,
             hadAction = f.HasAction || f.WasActionable,
-            ignoreExempt = f.IgnoreExempt
+            ignoreExempt = f.IgnoreExempt,
+            memSavings = f.EstimatedMemorySavingsBytes,
+            buildSavings = f.EstimatedBuildSavingsBytes,
+            savingsCeiling = f.SavingsAreCeiling
         };
 
         private static Finding FromDto(FindingDto d)
@@ -193,7 +196,12 @@ namespace PerfLint.Core
                 wasActionable: d.hadAction,
                 // Preserved so ignored-path-exempt duplication findings don't get filtered away by the
                 // post-restore rescan merges (the filter runs again in RescanRules/RescanFile).
-                ignoreExempt: d.ignoreExempt);
+                ignoreExempt: d.ignoreExempt,
+                // Savings estimates survive the roundtrip so the panel's aggregate line doesn't blank out
+                // after a domain reload (missing fields in an old file deserialize as 0 = "no estimate").
+                estimatedMemorySavingsBytes: d.memSavings,
+                estimatedBuildSavingsBytes: d.buildSavings,
+                savingsAreCeiling: d.savingsCeiling);
         }
 
         private static bool LooksLikeAssetPath(string p) =>
@@ -239,6 +247,9 @@ namespace PerfLint.Core
             public bool hadFix;
             public bool hadAction;
             public bool ignoreExempt;
+            public long memSavings;
+            public long buildSavings;
+            public bool savingsCeiling;
         }
 
         [Serializable]

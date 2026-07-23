@@ -28,7 +28,10 @@ namespace PerfLint.Scanners
     /// After enabling, tuning/verification (Memory Budget etc.) lives in the Runtime Profiler window's Texture
     /// Streaming section — SRP has no built-in mip debug view, which is exactly why the panel exists.
     /// </summary>
-    public sealed class TextureStreamingScanner : IScanner
+    // ISceneScoped: the finding itself is project-wide (eligibility pool), but its actionable number — the
+    // perceivable ceiling — reflects the OPEN scene(s) since the 2026-07-17 scene-scoping of memory optimization,
+    // so the "open your heaviest scene and re-scan" notice applies to this scanner too.
+    public sealed class TextureStreamingScanner : IScanner, ISceneScoped
     {
         public string Name => "Texture Streaming";
         public Domain Domain => Domain.Performance;
@@ -45,6 +48,8 @@ namespace PerfLint.Scanners
             public List<string> Candidates = new List<string>(); // eligible but not flagged Stream Mip Maps
             public long CandidateBytes;
             public int FlaggedCount;                             // textures already flagged Stream Mip Maps
+            /// <summary>Per-candidate byte estimate — feeds the per-scene pools (scene deps ∩ candidates).</summary>
+            public Dictionary<string, long> CandidateBytesByPath = new Dictionary<string, long>(System.StringComparer.Ordinal);
         }
 
         internal Pool CollectPool(ScanContext context)
@@ -79,7 +84,9 @@ namespace PerfLint.Scanners
                 if (Mathf.Max(w, h) < MinDim) continue;
 
                 pool.Candidates.Add(path);
-                pool.CandidateBytes += EstimateBytes(w, h, TextureImportScanner.IsEffectivelyUncompressed(importer, platform));
+                long bytes = EstimateBytes(w, h, TextureImportScanner.IsEffectivelyUncompressed(importer, platform));
+                pool.CandidateBytes += bytes;
+                pool.CandidateBytesByPath[path] = bytes;
             }
             return pool;
         }
@@ -124,6 +131,39 @@ namespace PerfLint.Scanners
                 string poolHuman = ScannerUtil.Human(candidateBytes);
                 bool needsQuality = !streamingActive;
                 var capturedCandidates = candidates;
+                // The savings ceiling is what the user can PERCEIVE in a build of what they're looking at
+                // (product rule 2026-07-17: memory optimization is scene-scoped — "build it and feel it").
+                // Only a scene's own loads are resident at any moment, so the ceiling = the OPEN scene(s)'
+                // eligible pool − budget; the heaviest build scene is offered as guidance ("open it and
+                // re-scan"), the same mental model as the scene-scope notice. A zero here also keeps the
+                // finding OUT of the scene-scoped optimize plan (nothing perceivable to offer). Only when
+                // there is no scene information at all does the figure degrade to the project-wide bound.
+                long budgetBytes = (long)(QualitySettings.streamingMipmapsMemoryBudget * 1024f * 1024f);
+                string budgetMb = $"{QualitySettings.streamingMipmapsMemoryBudget:0}";
+                var openDeps = OpenSceneDependencyUnion();
+                var buildScenePools = CollectBuildScenePools(pool.CandidateBytesByPath, context);
+                long reclaimCeiling;
+                string ceilingLocEn, ceilingLocCn;
+                if (openDeps.Count == 0 && buildScenePools.Count == 0)
+                {
+                    reclaimCeiling = CeilingAfterBudget(candidateBytes, budgetBytes);
+                    ceilingLocEn = $"project-wide bound at the current {budgetMb} MB budget (no saved open scene or build scenes to attribute it to)";
+                    ceilingLocCn = $"按全项目口径与当前 {budgetMb} MB 预算估（无已保存的打开场景或 build 场景可归因）";
+                }
+                else
+                {
+                    long openScenePool = ScenePoolBytes(openDeps, pool.CandidateBytesByPath);
+                    reclaimCeiling = CeilingAfterBudget(openScenePool, budgetBytes);
+                    ceilingLocEn = $"the open scene(s)' eligible pool is ~{ScannerUtil.Human(openScenePool)} vs the {budgetMb} MB budget";
+                    ceilingLocCn = $"打开场景的可串流池约 {ScannerUtil.Human(openScenePool)}，预算 {budgetMb} MB";
+                    if (TryBestSceneCeiling(buildScenePools, budgetBytes, out string bestScene, out long bestPool, out long bestCeiling)
+                        && bestCeiling > reclaimCeiling)
+                    {
+                        string sceneName = System.IO.Path.GetFileNameWithoutExtension(bestScene);
+                        ceilingLocEn += $"; your heaviest build scene '{sceneName}' (pool ~{ScannerUtil.Human(bestPool)}) could unlock up to ~{ScannerUtil.Human(bestCeiling)} — open it and re-scan";
+                        ceilingLocCn += $"；最重的 build 场景「{sceneName}」（池约 {ScannerUtil.Human(bestPool)}）可解锁至约 {ScannerUtil.Human(bestCeiling)}——打开它重扫即可";
+                    }
+                }
 
                 string stateLine = needsQuality
                     ? L.Tr("Texture Streaming is OFF in Quality Settings and these textures lack the Stream Mip Maps flag — enabling means both.",
@@ -141,13 +181,18 @@ namespace PerfLint.Scanners
                                  "but not participating. With streaming, Unity loads only the mip levels the current camera needs instead of every texture at full size — " +
                                  "a little CPU for a lot of texture memory (a real measured case went 280MB → 176MB with default settings). " +
                                  $"{stateLine}\n" +
-                                 "Notes: savings depend on camera distance/scene layout, so treat the figure as the eligible pool, not a promise; the default Memory Budget " +
-                                 "applies until tuned; set per-camera behaviour via Streaming Controller if needed. After enabling, verify visuals and tune Memory Budget / " +
+                                 "Notes: savings depend on camera distance/scene layout, so treat the figure as the eligible pool, not a promise. " +
+                                 $"The streaming Memory Budget caps the effect per moment, and only one scene's textures are resident at a time — the realistic savings ceiling is ~{ScannerUtil.Human(reclaimCeiling)}: {ceilingLocEn}. " +
+                                 "Scenes whose pool stays under the budget see no change; lowering the budget raises the ceiling; additive multi-scene loading can exceed a single scene's pool (the estimate is conservative there). " +
+                                 "Set per-camera behaviour via Streaming Controller if needed. After enabling, verify visuals and tune Memory Budget / " +
                                  "Max Level Reduction in the PerfLint Runtime Profiler's Texture Streaming section (SRP has no built-in mip debug view).",
                                  $"{candidates.Count} 个带 Mipmap 的场景纹理（合计约 {poolHuman}，按导入元数据估算）符合 Mipmap Streaming 条件但未参与。" +
                                  "开启串流后 Unity 只加载当前相机需要的 Mip 级别、不再整张全尺寸加载——用少量 CPU 换大量纹理内存（实测案例默认参数 280MB → 176MB）。" +
                                  $"{stateLine}\n" +
-                                 "注意：实际节省取决于相机距离与场景布局，此数字是「可参与的池子」而非承诺值；开启后先用默认 Memory Budget；如需按相机差异化可加 Streaming Controller。" +
+                                 "注意：实际节省取决于相机距离与场景布局，此数字是「可参与的池子」而非承诺值。" +
+                                 $"串流 Memory Budget 决定单一时刻的效果上限，且同一时刻只有一个场景的纹理驻留——现实可省上限约 {ScannerUtil.Human(reclaimCeiling)}：{ceilingLocCn}。" +
+                                 "场景池低于预算的场景看不到变化；调低预算可抬高上限；additive 多场景叠加加载可能超过单场景池（此估算对其偏保守）。" +
+                                 "如需按相机差异化可加 Streaming Controller。" +
                                  "开启后请检查画质，并在 PerfLint Runtime Profiler 的 Texture Streaming 区调 Memory Budget / Max Level Reduction 验证（SRP 没有内置的 Mip 调试视图）。"),
                     targetPath: null,
                     group: candidates.Count > 1 ? candidates : null,
@@ -184,7 +229,13 @@ namespace PerfLint.Scanners
                             AssetDatabase.SaveAssets();
                             return FixResult.Ok(L.Tr($"Stream Mip Maps enabled on {changed} texture(s)" + (needsQuality ? "; Texture Streaming enabled for all quality levels." : "."),
                                                       $"已为 {changed} 个纹理开启 Stream Mip Maps" + (needsQuality ? "；并为所有质量级别开启 Texture Streaming。" : "。")));
-                        }));
+                        }),
+                    // Budget-aware ceiling, NOT the raw pool (see reclaimCeiling above), and NOT a promise either —
+                    // still camera/scene-dependent, so the ceiling flag keeps it OUT of the verified "optimized ~X
+                    // for you" tally. Zero when the pool fits the current budget (the finding still fires: the
+                    // eligibility story holds, there's just nothing to promise at this budget).
+                    estimatedMemorySavingsBytes: reclaimCeiling,
+                    savingsAreCeiling: true);
             }
         }
 
@@ -217,14 +268,95 @@ namespace PerfLint.Scanners
         }
 
         /// <summary>
-        /// Rough imported-size estimate from metadata only (no texture load): pixels × bits-per-pixel ÷ 8 × 1.33 (mip
-        /// chain). Compressed formats vary 4–8bpp by family/platform — 6bpp is the deliberate middle; uncompressed is
-        /// 32bpp. Good enough to gate a 64MB threshold and label a pool "~X MB".
+        /// Savings ceiling of the streaming pool at a given Memory Budget: streaming only evicts mips once demand
+        /// exceeds the budget, so the honest potential is pool − budget, never negative (a pool that fits the budget
+        /// yields zero — verified by a real device A/B where a 97MB-textures scene under the 512MB default budget
+        /// measured exactly no change). Lowering the budget raises the ceiling; the finding text says so.
         /// </summary>
-        internal static long EstimateBytes(int w, int h, bool uncompressed)
+        internal static long CeilingAfterBudget(long poolBytes, long budgetBytes)
+            => poolBytes > budgetBytes ? poolBytes - budgetBytes : 0;
+
+        /// <summary>One scene's eligible streaming pool: the candidates that scene's dependency set actually pulls in.</summary>
+        internal static long ScenePoolBytes(IEnumerable<string> sceneDependencies, IReadOnlyDictionary<string, long> candidateBytesByPath)
+        {
+            long sum = 0;
+            if (sceneDependencies == null || candidateBytesByPath == null) return 0;
+            foreach (var d in sceneDependencies)
+                if (!string.IsNullOrEmpty(d) && candidateBytesByPath.TryGetValue(d, out long b)) sum += b;
+            return sum;
+        }
+
+        /// <summary>
+        /// Picks the scene whose budget-capped ceiling is largest — for scene-based games that scene bounds what any
+        /// single runtime moment can save. All-under-budget still succeeds (biggest pool, ceiling 0: an honest zero,
+        /// distinct from "no scene information at all" which returns false and falls back to the project-wide bound).
+        /// </summary>
+        internal static bool TryBestSceneCeiling(IReadOnlyList<KeyValuePair<string, long>> scenePools, long budgetBytes,
+            out string scenePath, out long poolBytes, out long ceilingBytes)
+        {
+            scenePath = null; poolBytes = 0; ceilingBytes = 0;
+            if (scenePools == null || scenePools.Count == 0) return false;
+            foreach (var sp in scenePools)
+            {
+                long c = CeilingAfterBudget(sp.Value, budgetBytes);
+                if (scenePath == null || c > ceilingBytes || (c == ceilingBytes && sp.Value > poolBytes))
+                {
+                    scenePath = sp.Key;
+                    poolBytes = sp.Value;
+                    ceilingBytes = c;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Union of the LOADED scene(s)' dependency paths — the assets resident in "what the user is looking at".
+        /// Union (not per-scene) because additively loaded scenes are resident together; deduping via the set also
+        /// prevents double-counting shared dependencies. Unsaved/untitled scenes have no path and contribute nothing.
+        /// </summary>
+        private static HashSet<string> OpenSceneDependencyUnion()
+        {
+            var set = new HashSet<string>(System.StringComparer.Ordinal);
+            for (int i = 0; i < UnityEngine.SceneManagement.SceneManager.sceneCount; i++)
+            {
+                var sc = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                if (!sc.isLoaded || string.IsNullOrEmpty(sc.path)) continue;
+                foreach (var d in AssetDatabase.GetDependencies(sc.path, true)) set.Add(d);
+            }
+            return set;
+        }
+
+        /// <summary>
+        /// Per-scene eligible pools for the enabled Build Settings scenes (path-level GetDependencies — no scene
+        /// opening). Feeds the "your heaviest scene could unlock ~X" guidance. Editor glue kept thin — the sum and
+        /// the pick are the pure, unit-tested parts above.
+        /// </summary>
+        private List<KeyValuePair<string, long>> CollectBuildScenePools(IReadOnlyDictionary<string, long> candidateBytesByPath, ScanContext context)
+        {
+            var scenePaths = new List<string>();
+            foreach (var s in EditorBuildSettings.scenes)
+                if (s.enabled && !string.IsNullOrEmpty(s.path)) scenePaths.Add(s.path);
+
+            var result = new List<KeyValuePair<string, long>>();
+            foreach (var sp in scenePaths.Distinct())
+            {
+                context.CancellationToken.ThrowIfCancellationRequested();
+                result.Add(new KeyValuePair<string, long>(sp,
+                    ScenePoolBytes(AssetDatabase.GetDependencies(sp, true), candidateBytesByPath)));
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Rough imported-size estimate from metadata only (no texture load): pixels × bits-per-pixel ÷ 8 × 1.33 (mip
+        /// chain; pass mips:false for textures without one). Compressed formats vary 4–8bpp by family/platform — 6bpp
+        /// is the deliberate middle; uncompressed is 32bpp. Good enough to gate a 64MB threshold and label a pool
+        /// "~X MB". Shared bpp convention for every texture-memory savings estimate (TEX001/002/004/005 reuse it).
+        /// </summary>
+        internal static long EstimateBytes(int w, int h, bool uncompressed, bool mips = true)
         {
             double bpp = uncompressed ? 32.0 : 6.0;
-            return (long)((double)w * h * bpp / 8.0 * 1.33);
+            return (long)((double)w * h * bpp / 8.0 * (mips ? 1.33 : 1.0));
         }
     }
 }

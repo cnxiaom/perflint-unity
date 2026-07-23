@@ -194,7 +194,10 @@ namespace PerfLint.Scanners
                             L.Tr($"Marks each asset as Addressable in \"{AddressableSharedGroup.SharedGroupName}\", so bundles share one copy instead of baking their own. No references are modified; read-only package assets are skipped. The result dialog shows the duplicate count before vs. after.\n" +
                                  "Not undoable via Edit > Undo — commit to version control first. Roll back: Tools > PerfLint > Revert \"PerfLint Shared\" Extraction.",
                                  $"把每个资源设为 Addressable 并入「{AddressableSharedGroup.SharedGroupName}」——bundle 将共享一份、不再各自烘焙。不修改任何引用；只读包资源自动跳过。结果框会显示重复数的前后对比。\n" +
-                                 "无法用 Edit > Undo 撤销——请先提交版本控制。回退：Tools > PerfLint > Revert「PerfLint Shared」Extraction。")));
+                                 "无法用 Edit > Undo 撤销——请先提交版本控制。回退：Tools > PerfLint > Revert「PerfLint Shared」Extraction。")),
+                    // Estimate only, kept OUT of the finding text (the "no exact wasted-MB claim" wording above
+                    // stands). Source bytes × extra bundle copies feeds the panel's aggregate "up to ~X (est.)" line.
+                    estimatedBuildSavingsBytes: d.Size > 0 ? d.Size * (d.BundleCount - 1) : 0);
             }
         }
 

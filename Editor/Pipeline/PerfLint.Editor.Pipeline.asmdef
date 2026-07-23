@@ -1,0 +1,27 @@
+{
+  "name": "PerfLint.Editor.Pipeline",
+  "rootNamespace": "PerfLint.Ci.Pipeline",
+  "references": [
+    "PerfLint.Editor",
+    "Unity.Pipeline"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [
+    "PERFLINT_PIPELINE"
+  ],
+  "versionDefines": [
+    {
+      "name": "com.unity.pipeline",
+      "expression": "",
+      "define": "PERFLINT_PIPELINE"
+    }
+  ],
+  "noEngineReferences": false
+}

@@ -113,6 +113,14 @@ namespace PerfLint.Scanners
             int maxDim = Mathf.Max(w, h);
             string file = Path.GetFileName(path);
 
+            // Shared inputs for the memory-savings estimates below (TextureStreamingScanner.EstimateBytes convention:
+            // 32bpp uncompressed / 6bpp compressed middle / ×1.33 mip chain). Estimates only — they feed the panel's
+            // aggregate "up to ~X (est.)" line, never per-finding promises.
+            bool effectivelyUncompressed = IsEffectivelyUncompressed(importer, platform);
+            bool hasMips = importer.mipmapEnabled;
+            long uncompressedBytes = TextureStreamingScanner.EstimateBytes(w, h, true, hasMips);
+            long compressedBytes = TextureStreamingScanner.EstimateBytes(w, h, false, hasMips);
+
             // PERF.TEX001 — Read/Write
             if (importer.isReadable && maxDim >= ReadWriteSizeThreshold)
             {
@@ -127,11 +135,14 @@ namespace PerfLint.Scanners
                             "（约翻倍占用）。除非运行时需要 GetPixels/Texture2D.Apply，否则应关闭。"),
                     targetPath: path,
                     ping: () => ScannerUtil.PingAsset(path),
-                    fix: new TextureToggleFix(path, readable: false)));
+                    fix: new TextureToggleFix(path, readable: false),
+                    // The CPU-side copy mirrors the imported representation, so turning Read/Write off reclaims
+                    // roughly one imported-texture's worth of memory.
+                    estimatedMemorySavingsBytes: TextureStreamingScanner.EstimateBytes(w, h, effectivelyUncompressed, hasMips)));
             }
 
             // PERF.TEX002 — Uncompressed format (resolves the effective compression state per active platform)
-            if (IsEffectivelyUncompressed(importer, platform) && maxDim >= UncompressedSizeThreshold)
+            if (effectivelyUncompressed && maxDim >= UncompressedSizeThreshold)
             {
                 findings.Add(new Finding(
                     ruleId: "PERF.TEX002",
@@ -146,7 +157,10 @@ namespace PerfLint.Scanners
                             "对色带敏感的图，可改用 CompressedHQ。"),
                     targetPath: path,
                     ping: () => ScannerUtil.PingAsset(path),
-                    fix: new TextureToggleFix(path, compression: TextureImporterCompression.Compressed, platform: platform)));
+                    fix: new TextureToggleFix(path, compression: TextureImporterCompression.Compressed, platform: platform),
+                    // Uncompressed − compressed under the shared bpp convention. Memory only: the build-size delta
+                    // is muddied by the archive's own LZ4/LZMA pass, so no build figure is claimed here.
+                    estimatedMemorySavingsBytes: uncompressedBytes - compressedBytes));
             }
 
             // PERF.TEX003 — Oversized texture (reporting-only; downscaling is a judgment call, not auto-fixed)
@@ -180,7 +194,11 @@ namespace PerfLint.Scanners
                             "屏幕空间 UI 通常不需要 Mipmap；仅世界空间或会大幅缩放的精灵才需要。"),
                     targetPath: path,
                     ping: () => ScannerUtil.PingAsset(path),
-                    fix: new TextureToggleFix(path, mipmap: false)));
+                    fix: new TextureToggleFix(path, mipmap: false),
+                    // Exactly the mip-chain overhead: with-mips minus without-mips at this texture's compression state.
+                    estimatedMemorySavingsBytes:
+                        TextureStreamingScanner.EstimateBytes(w, h, effectivelyUncompressed, true)
+                        - TextureStreamingScanner.EstimateBytes(w, h, effectivelyUncompressed, false)));
             }
 
             // PERF.TEX005 — Compression requested but the imported texture is actually uncompressed (silent fallback).
@@ -220,7 +238,10 @@ namespace PerfLint.Scanners
                                 "常见原因是尺寸不满足块压缩要求：ETC/ETC2 要求宽高均为 4 的倍数，PVRTC 要求正方形且为 2 的幂。" +
                                 "请改为兼容尺寸（4 的倍数，最好是 2 的幂），或改用允许该尺寸的格式（如 ASTC）。"),
                         targetPath: path,
-                        ping: () => ScannerUtil.PingAsset(path)));
+                        ping: () => ScannerUtil.PingAsset(path),
+                        // The texture actually imported uncompressed; fixing the fallback gets it to a compressed
+                        // format — same uncompressed-minus-compressed delta as TEX002.
+                        estimatedMemorySavingsBytes: uncompressedBytes - compressedBytes));
                 }
             }
 

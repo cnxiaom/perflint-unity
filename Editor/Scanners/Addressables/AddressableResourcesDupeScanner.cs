@@ -123,7 +123,10 @@ namespace PerfLint.Scanners
                     // Bypass the ignore-path filter — the real offenders live in ignored third-party folders
                     // (TMP fonts under Dependencies/), and the fix never edits the third-party asset itself.
                     ignoreExempt: true,
-                    ping: () => ScannerUtil.PingAsset(path));
+                    ping: () => ScannerUtil.PingAsset(path),
+                    // The Resources copy always ships, so the baked Addressables copies are the removable part:
+                    // source bytes × duplicate rows. Estimate only — feeds the aggregate "up to ~X (est.)" line.
+                    estimatedBuildSavingsBytes: d.Size > 0 ? d.Size * d.Rows : 0);
             }
         }
     }

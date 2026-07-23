@@ -461,6 +461,22 @@ namespace PerfLint.UI
             if (!string.IsNullOrEmpty(f.Detail))
                 card.Add(new Label(f.Detail) { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.85f, marginTop = 2, fontSize = 11 } });
 
+            // Per-target Locate rows (e.g. RUN.GPU002's Top-N meshes): each row names one target and has its own Locate button that reveals just that group.
+            if (f.LocateTargets != null && f.LocateTargets.Count > 0)
+            {
+                foreach (var t in f.LocateTargets)
+                {
+                    var row = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginTop = 3 } };
+                    row.Add(new Label(t.Label) { style = { flexGrow = 1, whiteSpace = WhiteSpace.Normal, opacity = 0.85f, fontSize = 11 } });
+                    var target = t; // capture for the closure
+                    var locateOne = new Button(() => target.Ping?.Invoke()) { text = "Locate" };
+                    locateOne.style.marginLeft = 4;
+                    locateOne.style.flexShrink = 0;
+                    row.Add(locateOne);
+                    card.Add(row);
+                }
+            }
+
             col.Add(card);
             return col;
         }
