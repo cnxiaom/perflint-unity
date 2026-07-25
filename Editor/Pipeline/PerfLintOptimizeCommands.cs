@@ -43,7 +43,7 @@ namespace PerfLint.Ci.Pipeline
             var scan = LiveOrScan();
             var scope = dim == SavingsDimension.Memory ? OpenSceneDependencies() : null;
             var plan = OptimizePlan.Build(scan.Findings, dim, scope);
-            return OptimizePlanDto.From(plan, dim, MemoryScopeNote(dim, plan, scan));
+            return OptimizePlanDto.From(plan, dim, MemoryScopeNote(dim, plan, scan), scan.AutoFixableCount);
         }
 
         [CliCommand("perflint_optimize_apply",
@@ -94,6 +94,28 @@ namespace PerfLint.Ci.Pipeline
         }
 
         internal static string DimName(SavingsDimension d) => d == SavingsDimension.Memory ? "memory" : "build";
+
+        /// <summary>
+        /// The "this goal is empty, but the project isn't" pointer, appended wherever a dimension's auto tier
+        /// doesn't cover everything one click could fix.
+        ///
+        /// A goal's auto tier can be legitimately empty while the project has hundreds of one-click fixes: BUILD
+        /// is structurally empty (build savings come from dedup <see cref="FindingAction"/>s, not <see cref="IFix"/>es,
+        /// and the wire only applies IFix), and MEMORY is scoped to the open scene. Saying "nothing to apply"
+        /// without naming the command that DOES reach them makes an agent either stop ("nothing to fix") or call
+        /// perflint_optimize_apply and get nothing back — observed live 2026-07-24, where an agent relayed
+        /// "perflint_optimize_apply handles the auto tier" to the user about 204 fixes it cannot reach.
+        /// This is CLAUDE.md's cross-reference rule: never point at a capability that won't fire.
+        ///
+        /// <paramref name="coveredHere"/> is a subset of <paramref name="projectAutoFixable"/> by construction
+        /// (AutoItems = CanAutoFix ∧ savings in this dimension), so empty output means this plan covers everything.
+        /// </summary>
+        internal static string FixPointer(int projectAutoFixable, int coveredHere) =>
+            projectAutoFixable > coveredHere
+                ? $" The project has {projectAutoFixable} one-click-fixable finding(s) in total, of which this goal's "
+                  + $"auto tier covers {coveredHere}; the rest are applied with perflint_fix (narrowable with "
+                  + "--rule_id / --domain / --min_severity), not with perflint_optimize_apply."
+                : "";
 
         /// <summary>
         /// The scan to plan/apply against. Prefers the OPEN window's live result — it carries the Fix instances
@@ -187,7 +209,8 @@ namespace PerfLint.Ci.Pipeline
         public string editorHint;
         public string privacy;
 
-        public static OptimizePlanDto From(OptimizePlan plan, SavingsDimension dim, string sceneScopeNote = null)
+        public static OptimizePlanDto From(OptimizePlan plan, SavingsDimension dim, string sceneScopeNote = null,
+            int projectAutoFixableCount = 0)
         {
             return new OptimizePlanDto
             {
@@ -224,12 +247,29 @@ namespace PerfLint.Ci.Pipeline
                     human = ScannerUtil.Human(m.SavingsBytes)
                 }).ToArray(),
                 sceneScopeNote = sceneScopeNote,
-                editorHint = "perflint_optimize_apply applies the auto tier for you. Everything under decideInEditor is a "
-                    + "judgment call left to you — open Tools > PerfLint in the editor and use the one-click Optimize dialog; "
-                    + "each item shows its own confirmation (irreversible ones warn to commit to version control first).",
+                editorHint = EditorHint(plan, projectAutoFixableCount),
                 privacy = "Findings include file paths and line numbers, which are returned to the agent you connected. "
                     + "The scan runs locally and uploads no code or assets."
             };
+        }
+
+        /// <summary>
+        /// The agent's next-step pointer, gated to what this plan can ACTUALLY do. Both clauses used to ship
+        /// unconditionally and both could dangle: "perflint_optimize_apply applies the auto tier" when that tier is
+        /// empty (see <see cref="PerfLintOptimizeCommands.FixPointer"/>), and the decideInEditor sentence when there
+        /// is nothing under decideInEditor.
+        /// </summary>
+        internal static string EditorHint(OptimizePlan plan, int projectAutoFixableCount)
+        {
+            string hint = plan.AutoItems.Count > 0
+                ? "perflint_optimize_apply applies this goal's auto tier for you."
+                : "Nothing in this plan can be applied over the wire — this goal's auto tier is empty.";
+            hint += PerfLintOptimizeCommands.FixPointer(projectAutoFixableCount, plan.AutoItems.Count);
+            if (plan.DecisionGroups.Count > 0)
+                hint += " Everything under decideInEditor is a judgment call left to you — open Tools > PerfLint in the "
+                    + "editor and use the one-click Optimize dialog; each item shows its own confirmation (irreversible "
+                    + "ones warn to commit to version control first).";
+            return hint;
         }
     }
 
@@ -289,17 +329,22 @@ namespace PerfLint.Ci.Pipeline
             var dto = Base(before, plan, dim, "dry_run");
             dto.message = $"Dry run — nothing changed. Would apply {plan.AutoItems.Count} safe {dto.dimension} fixes "
                 + $"(~{ScannerUtil.Human(plan.AutoSavingsBytes)}). {plan.DecisionGroups.Count} trade-off group(s) "
-                + $"(~{ScannerUtil.Human(plan.DecisionSavingsBytes)}) are left for you to run in the editor.";
+                + $"(~{ScannerUtil.Human(plan.DecisionSavingsBytes)}) are left for you to run in the editor."
+                + PerfLintOptimizeCommands.FixPointer(before.AutoFixableCount, plan.AutoItems.Count);
             return dto;
         }
 
         public static OptimizeApplyDto Nothing(ScanResult before, OptimizePlan plan, SavingsDimension dim)
         {
             var dto = Base(before, plan, dim, "nothing");
-            dto.message = plan.DecisionGroups.Count > 0
+            // Never let "nothing for this goal" read as "nothing anywhere" — the build goal's auto tier is
+            // structurally empty and memory's is scene-scoped, while the project may have hundreds of one-click
+            // fixes that only perflint_fix reaches.
+            dto.message = (plan.DecisionGroups.Count > 0
                 ? $"No auto-applicable {dto.dimension} waste. {plan.DecisionGroups.Count} trade-off group(s) "
                     + $"(~{ScannerUtil.Human(plan.DecisionSavingsBytes)}) remain — do those in the editor."
-                : $"Nothing to optimize for {dto.dimension} — no safe waste and no trade-offs found.";
+                : $"No safe {dto.dimension} waste and no trade-offs found for this goal.")
+                + PerfLintOptimizeCommands.FixPointer(before.AutoFixableCount, plan.AutoItems.Count);
             return dto;
         }
 

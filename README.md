@@ -4,6 +4,8 @@
 > bottlenecks and version-migration blockers, and hands you fixes you can actually apply — the safe ones in one click.
 >
 > **Local-first · Zero telemetry · Your code and art assets are never uploaded.**
+>
+> **Runs in the editor, from the CLI, in CI — and from your AI agent over MCP.**
 
 **[perflint.dev](https://perflint.dev)** · [Docs](https://perflint.dev/docs) · [Blog](https://perflint.dev/blog)
 
@@ -56,6 +58,35 @@ Detection runs on a rule engine — reproducible, offline, zero tokens. The LLM 
 
 **Pro — apply fixes at project scale.** One-click, batch, and optimize-by-goal fixes, the whole-file Migration Assistant, more AI credits, and bring-your-own key. → [See plans on perflint.dev](https://perflint.dev/#pricing)
 
+## Your AI agent can run it
+
+PerfLint registers its diagnosis as Unity Pipeline commands, so they show up as tools in Unity's own MCP server — **there is no separate MCP server to install**. Point your agent at it and ask in plain English; it reads measurements instead of guessing from your files.
+
+```
+unity mcp configure claude-code
+#        ...or: cursor | codex | copilot-cli | windsurf | zed
+```
+
+A real session on Unity's Viking Village sample, unedited:
+
+> **&gt;** Apply the safe fixes with PerfLint.
+>
+> `perflint_scan` → score 42 · grade D · 852 findings · 204 auto-fixable
+>
+> *"One check before I touch 95 model importers — disabling Read/Write breaks any script that reads mesh data at runtime. […] Only hit is `WaterSystemFeature.cs` **writing** to a procedurally-built mesh — that's a runtime Mesh, unaffected by import Read/Write. Nothing reads imported model geometry, so disabling it on the 95 FBXs is safe."*
+>
+> `perflint_fix` → **204 applied · 0 failed · grade D → C (score 42 → 63)**
+>
+> Three findings handed back as judgment calls — a duplicate normal map whose merge rewires references, a material with a missing shader, one deprecated call. All undoable via `Edit ▸ Undo`.
+
+Total: **1 minute 41 seconds.**
+
+**That middle step is the point.** The editor's *Fix All* applies the same 204 changes and is quicker to click — but a button can't read your code, so it assumes nothing reads mesh data at runtime. The agent checked before it touched anything.
+
+Six commands your agent gets: `perflint_scan`, `perflint_list_findings`, `perflint_optimize_plan`, `perflint_optimize_apply`, `perflint_fix`, `perflint_gate`. Scanning stays local and uploads nothing — but the findings your agent receives include asset paths and line numbers, and those go to whichever agent you connect.
+
+→ [Setup, the six tools, and the gotchas that cost us time](https://perflint.dev/docs#agent)
+
 ## Diagnostic domains
 
 Every finding has a severity, an exact location, the impact, and a fix.
@@ -87,11 +118,14 @@ Drive PerfLint from the terminal. With Unity's Pipeline package it runs against 
 
 ```
 unity command perflint_scan               # health score, grade, finding counts
+unity command perflint_list_findings      # the itemized problems (filter by rule / domain / severity)
 unity command perflint_gate --min_score 60
 unity command perflint_fix                # apply the safe fixes   (--dry_run to preview)
 ```
 
-**Your AI agent can call these too.** They're Unity Pipeline commands, so they surface as tools in Unity's MCP server — run `unity mcp configure claude` (or `cursor` / `codex` / `copilot`) and your agent can invoke `perflint_scan` / `perflint_gate` / `perflint_fix` itself. Nothing extra to install from us.
+A full run on a project that wouldn't compile: **0 → 42 → 63, F to C** — the upgrade blockers fixed in the editor (they're code changes the CLI won't touch), then `perflint_fix` applying 204 with 0 failures, and an independent re-scan to confirm it rather than trusting the apply command's own report. → [The whole transcript](https://perflint.dev/docs#ci)
+
+**Your AI agent can call these too** — see [Your AI agent can run it](#your-ai-agent-can-run-it) above.
 
 And headless in CI — a gate that fails the build on a health regression, with a real exit code you can trust:
 
