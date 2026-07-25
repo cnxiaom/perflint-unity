@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using PerfLint.Core;
 using UnityEditor;
 using UnityEngine;
@@ -26,9 +27,19 @@ namespace PerfLint.Ci
         /// trade-off actions or AI fixes. Reports (done, total) per fix. Returns (applied, failed).
         /// </summary>
         public static (int applied, int failed) ApplyFixes(FixPlan plan, Action<int, int> onProgress = null)
+            => ApplyFixList(plan.AutoFixable, onProgress);
+
+        /// <summary>
+        /// Apply a specific list of auto-fixable findings in one batch — the shared core behind <see cref="ApplyFixes"/>
+        /// and the goal-targeted optimize command (which passes a dimension-filtered subset). Every finding must carry a
+        /// live <see cref="Finding.Fix"/> instance (a result restored from disk has none). Same Start/StopAssetEditing
+        /// batching and Undo behaviour as the editor's "Fix All". Returns (applied, failed).
+        /// </summary>
+        public static (int applied, int failed) ApplyFixList(IReadOnlyList<Finding> autoFixable, Action<int, int> onProgress = null)
         {
             int applied = 0, failed = 0;
-            var list = plan.AutoFixable;
+            var list = autoFixable ?? Array.Empty<Finding>();
+            if (list.Count == 0) return (0, 0);
             AssetDatabase.StartAssetEditing();
             try
             {

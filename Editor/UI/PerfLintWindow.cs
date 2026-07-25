@@ -131,6 +131,9 @@ namespace PerfLint.UI
             // Register as the live-result authority: while open, asset-edit incremental updates come to this window (which
             // holds Fix instances) instead of overwriting the Fix-less on-disk baseline. See PerfLintAutoRescan.
             PerfLintAutoRescan.WindowRefresh = IncrementalRefresh;
+            // Expose the live result (with Fix instances) to the Pipeline/MCP optimize commands, so an agent driving an
+            // OPEN editor gets instant, correctly-tiered plans instead of the Fix-less on-disk baseline. See PerfLintLiveResult.
+            PerfLintLiveResult.Provider = LiveResultForExternal;
             // Load persisted filter state here (NOT in field initializers — EditorPrefs is disallowed from a ScriptableObject
             // constructor). OnEnable runs before CreateGUI/BuildFilterBar, so the toggles render with the restored values.
             _showCritical = EditorPrefs.GetBool(PrefCritical, true);
@@ -144,8 +147,18 @@ namespace PerfLint.UI
             LicenseService.Changed -= RefreshLicenseButton;
             PerfLintScriptFixVerifier.FixRolledBack -= OnAiChangeRolledBack;
             if (PerfLintAutoRescan.WindowRefresh == (System.Action)IncrementalRefresh) PerfLintAutoRescan.WindowRefresh = null;
+            if (PerfLintLiveResult.Provider == (System.Func<ScanResult>)LiveResultForExternal) PerfLintLiveResult.Provider = null;
             StopEnablingPoll(); // don't leak the EditorApplication.update subscription if the window is closed mid-enable
         }
+
+        /// <summary>Live result accessor published to <see cref="PerfLintLiveResult"/> while open — the Pipeline/MCP optimize
+        /// commands read this so an agent gets the window's Fix-carrying result (instant, correctly tiered) instead of scanning.
+        /// Guard: after a domain reload the report is restored from disk with the Fix/Action instances stripped (tracked in
+        /// <see cref="_restoredFixableRuleIds"/>). Handing that out would collapse EVERY finding into OptimizePlan's manual
+        /// tier — the optimize commands would falsely report "nothing to optimize" while real waste sits under an "Enable fix".
+        /// So we only publish a fully-live result; while any rule is still restored we return null → the command does a fresh
+        /// scan (which rebuilds the instances) instead of trusting a Fix-less baseline.</summary>
+        private ScanResult LiveResultForExternal() => _restoredFixableRuleIds.Count == 0 ? _lastResult : null;
 
         /// <summary>
         /// Background auto-pump hand-off (registered in <see cref="OnEnable"/> while the window is open): consume the pending

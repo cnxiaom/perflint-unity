@@ -178,14 +178,24 @@ namespace PerfLint.Ci
 
         FixPlan(IReadOnlyList<Finding> autoFixable, int needsReview) { AutoFixable = autoFixable; NeedsReview = needsReview; }
 
-        public static FixPlan From(ScanResult scan)
+        public static FixPlan From(ScanResult scan) => FromFindings(scan?.Findings);
+
+        /// <summary>
+        /// Same split over an arbitrary finding list — used when a command narrows the run to a subset
+        /// (e.g. perflint_fix --rule_id / --domain), so both the applied batch and the "needs review" tally
+        /// describe the SAME scope the caller asked for. Deliberately NOT an overload of <see cref="From"/>:
+        /// a same-named pair makes <c>From(null)</c> ambiguous, and a distinct name makes a scoped call
+        /// visible at the call site — exactly where scope correctness matters.
+        /// </summary>
+        public static FixPlan FromFindings(IReadOnlyList<Finding> findings)
         {
             var auto = new List<Finding>();
             int review = 0;
-            if (scan != null)
+            if (findings != null)
             {
-                foreach (var f in scan.Findings)
+                foreach (var f in findings)
                 {
+                    if (f == null) continue;
                     if (f.Fix != null) auto.Add(f);
                     else if (f.Action != null || f.AiFixable) review++;
                 }

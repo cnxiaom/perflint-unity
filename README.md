@@ -91,6 +91,8 @@ unity command perflint_gate --min_score 60
 unity command perflint_fix                # apply the safe fixes   (--dry_run to preview)
 ```
 
+**Your AI agent can call these too.** They're Unity Pipeline commands, so they surface as tools in Unity's MCP server — run `unity mcp configure claude` (or `cursor` / `codex` / `copilot`) and your agent can invoke `perflint_scan` / `perflint_gate` / `perflint_fix` itself. Nothing extra to install from us.
+
 And headless in CI — a gate that fails the build on a health regression, with a real exit code you can trust:
 
 ```

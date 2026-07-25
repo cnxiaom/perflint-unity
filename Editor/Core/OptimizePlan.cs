@@ -37,6 +37,9 @@ namespace PerfLint.Core
             public string Label;
             /// <summary>One-line plain-language trade-off warning; empty when the rule has no special caution.</summary>
             public string Caution;
+            /// <summary>True when this action cannot be undone via Edit &gt; Undo (see <see cref="OptimizePlan.IsIrreversible"/>).
+            /// Advisory — surfaced so an agent can warn honestly; execution is editor-only for every decision item regardless.</summary>
+            public bool Irreversible;
         }
 
         /// <summary>
@@ -113,7 +116,8 @@ namespace PerfLint.Core
                             RuleId = f.RuleId,
                             Findings = new List<Finding>(),
                             Label = f.Action.Label,
-                            Caution = CautionFor(f.RuleId)
+                            Caution = CautionFor(f.RuleId),
+                            Irreversible = IsIrreversible(f.RuleId)
                         };
                         decisionByRule[f.RuleId] = g;
                     }
@@ -173,5 +177,14 @@ namespace PerfLint.Core
                     return "";
             }
         }
+
+        /// <summary>
+        /// Decision-tier rules whose action cannot be undone via Edit &gt; Undo (deletes files / redirects references
+        /// project-wide). ADVISORY only — it lets a caller warn honestly ("not undoable"). It does NOT gate execution:
+        /// no decision-tier action is ever run over the CLI/MCP wire regardless (the agent surface applies only the
+        /// auto/waste tier; every trade-off, reversible or not, is left for the user to run in the editor where its
+        /// own confirmation dialog carries the full warning). Single source of truth, unit-tested.
+        /// </summary>
+        internal static bool IsIrreversible(string ruleId) => ruleId == "ASSET.DUP001";
     }
 }
