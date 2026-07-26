@@ -15,12 +15,17 @@ namespace PerfLint.Scanners
 
         /// <summary>
         /// Memory-reclaim throttle for scan loops that <c>LoadAssetAtPath</c> heavy assets (textures, materials, audio clips).
-        /// A scan runs synchronously in one call stack and never yields a frame, so <c>Resources.UnloadAsset</c> does NOT flush
-        /// the editor's deferred GPU release — every loaded asset stays resident until the scan returns. On a large project the
-        /// loads accumulate in graphics/native memory until the driver can't allocate and the editor hard-crashes
-        /// (d3d11 E_OUTOFMEMORY, observed on an ~12k-texture project 2026-07-05). Call once per load with the running counter;
-        /// every <see cref="LoadReclaimInterval"/> loads it forces a synchronous sweep, bounding peak memory to a small constant.
-        /// Returns the updated counter (reset to 0 on a sweep). The sweep cost is negligible (~1 per 64 loads).
+        /// A scan runs synchronously in one call stack and never yields a frame, so every loaded asset stays resident until
+        /// the scan returns. On a large project the loads accumulate in graphics/native memory until the driver can't
+        /// allocate and the editor hard-crashes (d3d11 E_OUTOFMEMORY, observed on an ~12k-texture project 2026-07-05).
+        /// Call once per load with the running counter; every <see cref="LoadReclaimInterval"/> loads it forces a
+        /// synchronous sweep, bounding peak memory to a small constant. Returns the updated counter (reset to 0 on a
+        /// sweep). The sweep cost is negligible (~1 per 64 loads).
+        ///
+        /// This sweep is the ONLY reclaim a scan loop may use. <c>Resources.UnloadAsset</c> looks like a cheaper, more
+        /// targeted alternative but is not reference-aware: it drops an asset's payload even while the open scene is
+        /// rendering with it, blacking the scene out until a reimport (bisected to TEX005 on 2026-07-25). The sweep,
+        /// by contrast, reclaims only what nothing references — exactly the scan's own leftovers.
         /// </summary>
         public static int ThrottleReclaim(int loadsSinceReclaim)
         {

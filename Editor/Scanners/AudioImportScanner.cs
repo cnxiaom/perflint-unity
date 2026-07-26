@@ -93,15 +93,12 @@ namespace PerfLint.Scanners
 
             var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(path);
             float length = clip != null ? clip.length : 0f;
-            // Only a BULK scan force-unloads: loading every clip in an audio-heavy project accumulates until memory is
-            // exhausted, so the full Scan frees each immediately (+ a throttled sweep). A single-file (incremental) rescan
-            // loads one clip — force-unloading it would evict the asset the user just edited and blank its Inspector — so
-            // we leave it for Unity's normal asset management. (clip.channels is still read below either way.)
+            // NEVER Resources.UnloadAsset here — same reason as TextureImportScanner: it ignores live references, so a
+            // clip the open scene holds gets its payload dropped out from under it and only a reimport brings it back.
+            // The throttled sweep alone bounds memory and is reference-aware. Bulk-only: a single-file rescan loads one
+            // clip and can't accumulate. (clip.channels is still read below either way.)
             if (clip != null && bulk)
-            {
-                Resources.UnloadAsset(clip);
                 _loadsSinceReclaim = ScannerUtil.ThrottleReclaim(_loadsSinceReclaim);
-            }
             string file = Path.GetFileName(path);
             var settings = EffectiveSettings(importer, platform);
 

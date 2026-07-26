@@ -88,8 +88,8 @@ namespace PerfLint.Scanners
         {
             if (AssetImporter.GetAtPath(assetPath) is not TextureImporter importer) return System.Array.Empty<Finding>();
             _loadsSinceReclaim = 0;
-            // bulk:false — a single-file rescan loads exactly one texture (no OOM risk), so it must NOT force-unload it:
-            // Resources.UnloadAsset on the asset the user just edited evicts it from memory and blanks its open Inspector.
+            // bulk:false — a single-file rescan loads exactly one texture, so there is nothing to reclaim and no reason
+            // to run a sweep in the middle of the user's edit-inspect loop.
             return ScanTexture(assetPath, importer, ResolvePlatform(context), ScannerUtil.ActivePlatformName(), bulk: false);
         }
 
@@ -213,17 +213,16 @@ namespace PerfLint.Scanners
                 var tex = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
                 bool fellBack = tex != null && IsSilentCompressionFallback(true, tex.format);
                 TextureFormat actualFormat = tex != null ? tex.format : default;
-                // Only a BULK scan force-unloads: a full project scan loads thousands of textures and must release each
-                // immediately (+ a throttled sweep) or the graphics driver OOM-crashes. A single-file (incremental) rescan
-                // loads exactly one texture — force-unloading it would evict an asset the user may be inspecting and blank
-                // its Inspector — so we leave it for Unity's normal asset management.
+                // NEVER Resources.UnloadAsset here. It force-unloads regardless of live references, so a texture the
+                // OPEN SCENE is rendering with (lightmaps, albedo, reflection data) has its payload ripped out from
+                // under the renderer: the scene goes black and stays black until a reimport or editor restart —
+                // Unity's lazy reload only rescues it if nothing else disturbs the emptied object first, which is why
+                // this reproduced on a full scan but never when this scanner ran alone (bisected 2026-07-25).
+                // Peak memory is bounded by the throttled sweep alone, and that sweep is reference-aware: it reclaims
+                // this loop's own leftovers and leaves in-use assets untouched. Bulk-only because a single-file rescan
+                // loads exactly one texture and can't accumulate.
                 if (tex != null && bulk)
-                {
-                    Resources.UnloadAsset(tex); // release the CPU pixel buffer immediately
-                    // ...but the GPU upload isn't reclaimed until a sweep runs; throttle one every N loads so peak VRAM/native
-                    // memory stays bounded on large projects instead of climbing until the graphics driver OOM-crashes.
                     _loadsSinceReclaim = ScannerUtil.ThrottleReclaim(_loadsSinceReclaim);
-                }
                 if (fellBack)
                 {
                     findings.Add(new Finding(
