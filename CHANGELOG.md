@@ -2,6 +2,13 @@
 
 User-facing changes to PerfLint for Unity. This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] — 2026-07-25
+
+### Fixed
+- **A scan no longer leaves hundreds of megabytes sitting in memory afterwards.** Scanning has to load assets to inspect them, and it reclaims them periodically as it goes — but whatever it loaded since the last reclaim was still resident when the scan finished, and the editor doesn't collect that on its own. On a large project that came to 143 MB of textures and 168 MB of graphics memory left over, held until something else happened to trigger a cleanup. Scans now reclaim once more on the way out, which took 77 ms there — under a tenth of a percent of that scan. In practice a scan now tends to leave the editor using *less* memory than before it started, because the same passes also collect what was already sitting unreferenced.
+- **Icons no longer render as empty boxes on Unity 2021 / 2022.** The editor font on those versions carries no emoji glyphs, so the Getting Started guide's section markers came out as tofu boxes — and an emoji written with a variation selector showed up as two. The guide now draws its markers instead of typing them; the two finding notes that used a decorated warning sign (unreferenced assets, intermittent stutter spikes) use the plain one the rest of the UI already uses; and the per-rule "apply all" button drops its lightning bolt. Unity 6 was unaffected, which is how it went unnoticed.
+- **The Getting Started guide no longer gets used up by a project that was never going to show it.** The guide shows once per machine, and it skips projects you've already scanned — but skipping used to also count as showing. So if PerfLint updated first in a project with an existing scan report, that project quietly spent the one showing, and the next project you installed into — including a brand-new one — never got the guide at all. Skipping is now silent in both directions: an already-scanned project (and any headless/CI run) leaves the guide pending, so the first project where you're actually new still gets it. It remains available at any time under **Tools ▸ PerfLint ▸ Getting Started**.
+
 ## [1.5.0] — 2026-07-25
 
 The release that lets your agent repair a broken shader — and then shows you, line by line, what it actually changed. Plus a first-run guide so the package stops installing in silence, and a fix for scans dimming the scene you have open.

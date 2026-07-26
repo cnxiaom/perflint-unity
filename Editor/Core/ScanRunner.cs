@@ -173,6 +173,14 @@ namespace PerfLint.Core
 
             sw.Stop();
 
+            // Collect the tail. ScannerUtil.ThrottleReclaim sweeps every 64 loads, so each loading scanner ends with
+            // up to 63 assets' worth of residue (materials are the amplifier — loading one pulls in every texture it
+            // references), and the editor never reclaims that on its own; it just sits there until something else
+            // happens to trigger a sweep. Measured on a large project: 143 MB of textures and 168 MB of graphics
+            // memory still resident when the scan returned, cleared by a single 77 ms sweep — 0.07% of that scan's
+            // runtime. Reference-aware, same call the throttle uses, so nothing the open scene is using is touched.
+            UnityEditor.EditorUtility.UnloadUnusedAssetsImmediate();
+
             LogTimingSummary(timings, sw.Elapsed);
 
             if (watchdog.SweepCount > 0)

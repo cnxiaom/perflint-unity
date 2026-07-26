@@ -84,9 +84,9 @@ namespace PerfLint.Scanners
                     severity: Severity.Info,
                     title: L.Tr("Asset may not be referenced by the build", "资源可能未被构建引用"),
                     detail: L.Tr("Not referenced by any enabled build scene or Resources asset; it may be dead weight in the build. " +
-                            "⚠️ Note: assets loaded via Addressables / AssetBundle / code string paths / reflection are reported as false positives, so confirm before deleting.",
+                            "⚠ Note: assets loaded via Addressables / AssetBundle / code string paths / reflection are reported as false positives, so confirm before deleting.",
                             "未被任何启用的 Build 场景或 Resources 资源引用，可能是死资源、白占包体。" +
-                            "⚠️ 注意：经 Addressables / AssetBundle / 代码字符串路径 / 反射动态加载的资源会被误报，删除前务必确认。"),
+                            "⚠ 注意：经 Addressables / AssetBundle / 代码字符串路径 / 反射动态加载的资源会被误报，删除前务必确认。"),
                     targetPath: p,
                     ping: () => ScannerUtil.PingAsset(p));
             }

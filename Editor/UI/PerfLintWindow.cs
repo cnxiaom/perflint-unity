@@ -1383,7 +1383,9 @@ namespace PerfLint.UI
                 // re-scanning per group (500 groups would otherwise be 500 full scans); others run one-by-one.
                 bool batchChoice = actionItems[0].Action.SupportsTargetChoice;
                 var actAll = new Button(() => { if (batchChoice) RunMergeAllForDuplicates(actionItems); else RunActionsForRule(actionItems); })
-                { text = $"⚡ {label} {L.Tr("all", "全部")} ({actionItems.Count})" };
+                // No emoji in the label: U+26A1 defaults to emoji presentation, which the 2021/2022 editor font
+                // cannot render (it came out as an empty box) even though Unity 6 shows it fine.
+                { text = $"{label} {L.Tr("all", "全部")} ({actionItems.Count})" };
                 bar.Add(actAll);
                 foldout.Add(bar);
             }

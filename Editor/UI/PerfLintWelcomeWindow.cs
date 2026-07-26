@@ -69,16 +69,16 @@ namespace PerfLint.UI
             scroll.Add(Body(L.Tr(
                 "Click Scan Project and, in seconds, you get a project health score (0–100) and findings grouped by domain. Every finding carries a severity, a Locate button that jumps to the exact asset or line, what it costs you, and how to fix it — the safe ones in one click.",
                 "点击 Scan Project，几秒后得到工程健康分（0–100）和按域分组的问题清单。每条问题都带严重级别、可跳到具体资源或代码行的 Locate 按钮、它的实际代价，以及修复方法——安全的那些可一键修复。")));
-            scroll.Add(Bullet("🚀", L.Tr("Performance", "性能"), L.Tr(
+            scroll.Add(Bullet(DotPerformance, L.Tr("Performance", "性能"), L.Tr(
                 "Uncompressed or oversized textures, needless Read/Write, per-frame GC in Update (GetComponent / Camera.main / LINQ / string concat), Debug.Log shipping in builds, batching breakers, mesh and audio import settings.",
                 "未压缩/超大纹理、多余的 Read/Write、Update 里的每帧 GC（GetComponent / Camera.main / LINQ / 字符串拼接）、进 build 的 Debug.Log、破坏合批的用法、网格与音频导入设置。")));
-            scroll.Add(Bullet("📦", L.Tr("Assets", "资产"), L.Tr(
+            scroll.Add(Bullet(DotAssets, L.Tr("Assets", "资产"), L.Tr(
                 "Duplicate assets (content-hashed), the same asset double-packed across AssetBundles / Addressables, unreferenced assets dragged into the build, shader-variant blowups.",
                 "重复资源（按内容哈希）、被 AssetBundle / Addressables 重复打包的同一份资源、被拖进 build 的无引用资源、着色器变体爆炸。")));
-            scroll.Add(Bullet("⬆️", L.Tr("Migration", "迁移"), L.Tr(
+            scroll.Add(Bullet(DotMigration, L.Tr("Migration", "迁移"), L.Tr(
                 "Deprecated or removed APIs located to the line, old vs. new Input System mixing, package-version compatibility with your Unity, and Unity 6 upgrade blockers.",
                 "定位到行的废弃/移除 API、新旧 Input System 混用、包版本与你的 Unity 是否兼容、Unity 6 升级阻塞项。")));
-            scroll.Add(Bullet("⚙️", L.Tr("Project Settings", "工程设置"), L.Tr(
+            scroll.Add(Bullet(DotSettings, L.Tr("Project Settings", "工程设置"), L.Tr(
                 "Build, quality and player settings that quietly cost you frames or megabytes.",
                 "悄悄吃掉帧率或体积的 Build / Quality / Player 设置。")));
 
@@ -117,10 +117,10 @@ namespace PerfLint.UI
 
             // ── 5. Free vs Pro (no prices in-plugin: the landing page is the single source of truth) ──
             scroll.Add(Header(L.Tr("Free and Pro", "Free 与 Pro")));
-            scroll.Add(Bullet("✅", L.Tr("Free, forever", "免费，永久"), L.Tr(
+            scroll.Add(Bullet(DotFree, L.Tr("Free, forever", "免费，永久"), L.Tr(
                 "The full scan, every finding, the health score, the shareable HTML report, written fix guidance, and a daily allowance of AI Fix / Explain.",
                 "完整扫描、全部问题、健康分、可分享 HTML 报告、文字修复指引，以及每日一定次数的 AI Fix / Explain。")));
-            scroll.Add(Bullet("⭐", "Pro", L.Tr(
+            scroll.Add(Bullet(DotPro, "Pro", L.Tr(
                 "Applying fixes at project scale: one-click and batch fixes, optimize-by-goal, duplicate-asset de-duplication, the whole-file Migration Assistant, a much larger AI allowance, and bring-your-own API key.",
                 "在整个工程规模上执行修复：一键与批量修复、按目标优化、重复资源去重、整文件迁移助手、大得多的 AI 额度，以及自带 API key。")));
 
@@ -197,11 +197,37 @@ namespace PerfLint.UI
             return l;
         }
 
-        /// <summary>Icon + bold lead-in + wrapped description, laid out as a hanging indent.</summary>
-        static VisualElement Bullet(string icon, string name, string desc)
+        // Bullet colors, one per section. Drawn, not typed — see Bullet().
+        static readonly Color DotPerformance = new Color(0.30f, 0.60f, 0.95f);
+        static readonly Color DotAssets = new Color(0.65f, 0.50f, 0.90f);
+        static readonly Color DotMigration = new Color(0.95f, 0.70f, 0.30f);
+        static readonly Color DotSettings = new Color(0.45f, 0.75f, 0.70f);
+        static readonly Color DotFree = new Color(0.40f, 0.80f, 0.45f); // the green the main panel's Pro pill uses
+        static readonly Color DotPro = new Color(0.95f, 0.75f, 0.25f);
+
+        /// <summary>
+        /// Colored dot + bold lead-in + wrapped description, laid out as a hanging indent.
+        ///
+        /// The dot is a drawn element, not an emoji character: the editor font on 2021/2022 carries no emoji
+        /// glyphs, so the rocket / gear markers that used to be here came out as tofu boxes — and any emoji
+        /// written with a U+FE0F variation selector renders as *two* boxes. Unity 6 has the glyphs and looks
+        /// perfect, which is precisely how this ships broken unnoticed (observed 2026-07-25 on 2022.3).
+        /// A VisualElement can't miss a glyph. Enforced by EditorGlyphSafetyTests.
+        /// </summary>
+        static VisualElement Bullet(Color dot, string name, string desc)
         {
             var row = new VisualElement { style = { flexDirection = FlexDirection.Row, marginBottom = 6 } };
-            row.Add(new Label(icon) { style = { marginRight = 6, flexShrink = 0 } });
+            row.Add(new VisualElement
+            {
+                style =
+                {
+                    width = 8, height = 8, flexShrink = 0,
+                    marginRight = 8, marginTop = 5, // marginTop aligns the dot with the middle of the bold lead-in
+                    backgroundColor = dot,
+                    borderTopLeftRadius = 4, borderTopRightRadius = 4,
+                    borderBottomLeftRadius = 4, borderBottomRightRadius = 4
+                }
+            });
 
             var col = new VisualElement { style = { flexGrow = 1, flexShrink = 1, minWidth = 0 } };
             col.Add(new Label(name) { style = { unityFontStyleAndWeight = FontStyle.Bold, whiteSpace = WhiteSpace.Normal } });
@@ -229,10 +255,18 @@ namespace PerfLint.UI
     ///    installs PerfLint into their fifth project already knows the menu path and doesn't want the popup again.
     ///    Hence EditorPrefs (machine-global), keyed by a guide version we only bump on a real rewrite.
     ///  · <b>Never in batch mode.</b> CI, the EditMode test runs and headless `-executeMethod` entry points must
-    ///    never have a window thrown at them — and must not burn the flag either, or the first interactive launch
-    ///    would silently skip the guide.
+    ///    never have a window thrown at them.
     ///  · <b>Never for someone who already scanned this project.</b> Existing users updating the package are not
-    ///    first-time users; a persisted report means they've been here. They get the flag set quietly instead.
+    ///    first-time users; a persisted report means they've been here.
+    ///
+    /// <b>The flag is only ever written on the path that actually shows the guide.</b> Every suppression above
+    /// leaves it untouched, and that asymmetry is the whole point: the flag is machine-global while both
+    /// suppression signals are per-session or per-project, so writing it from a suppression path spends the one
+    /// and only showing on a project that was never going to see it. Measured, not theorised (2026-07-25): a dev
+    /// project carrying a saved report loaded the new build at 21:05 and quietly marked the guide seen; the
+    /// brand-new project opened 50 minutes later to test the feature got nothing at all. Same hazard with batch
+    /// mode — one headless CI run would eat the user's first interactive launch.
+    ///
     /// The open itself waits for an idle editor — the package's very first load is usually mid-import/compile,
     /// and a window opened in that window of time can be destroyed by the reload that follows.
     /// </summary>
@@ -244,22 +278,17 @@ namespace PerfLint.UI
         private const string SeenKey = "PerfLint.Welcome.SeenVersion";
         private const string GuideVersion = "1";
 
-        internal enum Decision
+        /// <summary>
+        /// Pure decision (unit-tested): the whole "should the popup happen" policy, with no editor state involved.
+        /// A plain bool on purpose — there is no "suppress and mark seen" outcome, because marking seen is exactly
+        /// what a suppression must never do (see the type comment).
+        /// </summary>
+        internal static bool ShouldShow(string seenVersion, string guideVersion, bool batchMode, bool projectAlreadyScanned)
         {
-            /// <summary>Open the guide now (and record that it was shown).</summary>
-            Show,
-            /// <summary>Don't open, but record it as seen — an existing user who's already scanned this project.</summary>
-            MarkSeenQuietly,
-            /// <summary>Do nothing at all, leaving the flag untouched for a future launch (already seen, or batch mode).</summary>
-            DoNothing
-        }
-
-        /// <summary>Pure decision (unit-tested): the whole "should the popup happen" policy, with no editor state involved.</summary>
-        internal static Decision Decide(string seenVersion, string guideVersion, bool batchMode, bool projectAlreadyScanned)
-        {
-            if (string.Equals(seenVersion, guideVersion, StringComparison.Ordinal)) return Decision.DoNothing;
-            if (batchMode) return Decision.DoNothing; // headless: no window, and don't consume the flag
-            return projectAlreadyScanned ? Decision.MarkSeenQuietly : Decision.Show;
+            if (string.Equals(seenVersion, guideVersion, StringComparison.Ordinal)) return false; // already shown on this machine
+            if (batchMode) return false;             // headless: no window to show it in
+            if (projectAlreadyScanned) return false; // not a first-time user *here* — but other projects still get their turn
+            return true;
         }
 
         static PerfLintFirstRun()
@@ -276,16 +305,12 @@ namespace PerfLint.UI
             if (!_decided)
             {
                 _decided = true;
-                switch (Decide(EditorPrefs.GetString(SeenKey, string.Empty), GuideVersion,
-                               Application.isBatchMode, ScanResultStore.Exists()))
+                // Disk is touched once, here — not every tick.
+                if (!ShouldShow(EditorPrefs.GetString(SeenKey, string.Empty), GuideVersion,
+                                Application.isBatchMode, ScanResultStore.Exists()))
                 {
-                    case Decision.DoNothing:
-                        Stop();
-                        return;
-                    case Decision.MarkSeenQuietly:
-                        MarkSeen();
-                        Stop();
-                        return;
+                    Stop(); // suppressed — and deliberately WITHOUT marking it seen
+                    return;
                 }
             }
 

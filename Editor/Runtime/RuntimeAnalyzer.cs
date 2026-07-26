@@ -861,7 +861,7 @@ namespace PerfLint.Runtime
                     ? L.Tr($"avg {h.SelfMsPerFrame:0.00} ms · peak {h.PeakMsPerFrame:0.0} ms/frame", $"平均 {h.SelfMsPerFrame:0.00} ms · 峰值 {h.PeakMsPerFrame:0.0} ms/帧")
                     : L.Tr($"{h.SelfMsPerFrame:0.00} ms/frame", $"{h.SelfMsPerFrame:0.00} ms/帧");
                 string spikeDetail = h.IsSpiky
-                    ? L.Tr($"\n\n⚠️ **Intermittent stutter spike**: the single-frame peak {h.PeakMsPerFrame:0.0} ms is far above the average {h.SelfMsPerFrame:0.00} ms — this isn't a sustained per-frame cost but a periodic/occasional burst on certain frames (e.g. scheduled recomputation, bursty loading, instantiation peaks). Optimization should focus on 'which frames, and why triggered', not treat it as a fixed per-frame cost.", $"\n\n⚠️ **偶发卡顿尖刺**：单帧峰值 {h.PeakMsPerFrame:0.0} ms 远高于平均 {h.SelfMsPerFrame:0.00} ms——它不是每帧持续耗时，而是周期性/偶发地在某些帧爆发（如定时重算、突发加载、实例化峰值）。优化应聚焦『哪些帧、为何触发』，而非当作每帧固定开销。")
+                    ? L.Tr($"\n\n⚠ **Intermittent stutter spike**: the single-frame peak {h.PeakMsPerFrame:0.0} ms is far above the average {h.SelfMsPerFrame:0.00} ms — this isn't a sustained per-frame cost but a periodic/occasional burst on certain frames (e.g. scheduled recomputation, bursty loading, instantiation peaks). Optimization should focus on 'which frames, and why triggered', not treat it as a fixed per-frame cost.", $"\n\n⚠ **偶发卡顿尖刺**：单帧峰值 {h.PeakMsPerFrame:0.0} ms 远高于平均 {h.SelfMsPerFrame:0.00} ms——它不是每帧持续耗时，而是周期性/偶发地在某些帧爆发（如定时重算、突发加载、实例化峰值）。优化应聚焦『哪些帧、为何触发』，而非当作每帧固定开销。")
                     : "";
 
                 if (h.IsScript && IsPackageScript(h.ScriptPath))
