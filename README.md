@@ -1,5 +1,7 @@
 # PerfLint for Unity
 
+[![中文文档](https://img.shields.io/badge/PerfLint-%E4%B8%AD%E6%96%87%E6%96%87%E6%A1%A3-red)](README_CN.md)
+
 > A senior tech lead, inside your Unity Editor. One click scans your project, pinpoints performance
 > bottlenecks and version-migration blockers, and hands you fixes you can actually apply — the safe ones in one click.
 >
@@ -7,7 +9,7 @@
 >
 > **Runs in the editor, from the CLI, in CI — and from your AI agent over MCP.**
 
-**[perflint.dev](https://perflint.dev)** · [Docs](https://perflint.dev/docs) · [Blog](https://perflint.dev/blog)
+**[perflint.dev](https://perflint.dev)** · [Docs](https://perflint.dev/docs/) · [Blog](https://perflint.dev/blog/)
 
 https://github.com/user-attachments/assets/0261ba42-09d8-437a-b083-539f3b3696b9
 
@@ -44,7 +46,7 @@ Not mockups — screenshots from a real Unity project after applying the fixes P
 | ![Unity Memory Profiler: graphics memory drops 227.9 MB](https://perflint.dev/before-after/memory-graphics.png?v=2) | ![Unity Memory Profiler: total resident memory falls from 1.48 GB to 0.92 GB](https://perflint.dev/before-after/memory-device.png?v=2) |
 | **−227.9 MB** graphics memory | **−0.55 GB** resident (1.48 GB → 0.92 GB) |
 
-→ [More case studies on the blog](https://perflint.dev/blog)
+→ [More case studies on the blog](https://perflint.dev/blog/)
 
 ## Deterministic diagnosis. AI only where it helps.
 
@@ -85,7 +87,7 @@ Total: **1 minute 41 seconds.**
 
 Six commands your agent gets: `perflint_scan`, `perflint_list_findings`, `perflint_optimize_plan`, `perflint_optimize_apply`, `perflint_fix`, `perflint_gate`. Scanning stays local and uploads nothing — but the findings your agent receives include asset paths and line numbers, and those go to whichever agent you connect.
 
-→ [Setup, the six tools, and the gotchas that cost us time](https://perflint.dev/docs#agent)
+→ [Setup, the six tools, and the gotchas that cost us time](https://perflint.dev/docs/#agent)
 
 ## Diagnostic domains
 
@@ -123,7 +125,7 @@ unity command perflint_gate --min_score 60
 unity command perflint_fix                # apply the safe fixes   (--dry_run to preview)
 ```
 
-A full run on a project that wouldn't compile: **0 → 42 → 63, F to C** — the upgrade blockers fixed in the editor (they're code changes the CLI won't touch), then `perflint_fix` applying 204 with 0 failures, and an independent re-scan to confirm it rather than trusting the apply command's own report. → [The whole transcript](https://perflint.dev/docs#ci)
+A full run on a project that wouldn't compile: **0 → 42 → 63, F to C** — the upgrade blockers fixed in the editor (they're code changes the CLI won't touch), then `perflint_fix` applying 204 with 0 failures, and an independent re-scan to confirm it rather than trusting the apply command's own report. → [The whole transcript](https://perflint.dev/docs/#ci)
 
 **Your AI agent can call these too** — see [Your AI agent can run it](#your-ai-agent-can-run-it) above.
 
@@ -133,7 +135,7 @@ And headless in CI — a gate that fails the build on a health regression, with 
 Unity -batchmode -projectPath . -executeMethod PerfLint.Ci.PerfLintCli.RunGate -perflintMinScore 60 -logFile -
 ```
 
-→ [Full CLI &amp; CI guide](https://perflint.dev/docs#ci)
+→ [Full CLI &amp; CI guide](https://perflint.dev/docs/#ci)
 
 ## Install (Unity Package Manager — Git URL)
 
@@ -185,8 +187,8 @@ AI Fix writes the change, triggers a compile, and automatically rolls back if co
 
 ## Learn more
 
-- **[Docs](https://perflint.dev/docs)** — install, first scan, CLI &amp; CI, privacy.
-- **[Blog](https://perflint.dev/blog)** — case studies, Unity 6 migration guides, and deep dives.
+- **[Docs](https://perflint.dev/docs/)** — install, first scan, CLI &amp; CI, privacy.
+- **[Blog](https://perflint.dev/blog/)** — case studies, Unity 6 migration guides, and deep dives.
 
 ## License
 
