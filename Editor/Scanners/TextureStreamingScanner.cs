@@ -165,6 +165,29 @@ namespace PerfLint.Scanners
                     }
                 }
 
+                // Whether acting on this NOW could change anything a build of these scenes would show.
+                //
+                // The rule triggers on the PROJECT-wide eligible pool (8.1 GB on the reference project) but its payoff
+                // is capped per scene, and streaming only evicts mips once a scene's demand exceeds the Memory Budget.
+                // With a 27.8 MB scene pool against a 512 MB budget the ceiling is a hard zero — and it was zero for
+                // that project's heaviest build scene too, so enabling the flags there changes nothing anyone can
+                // measure. Two口径, one finding: triggered by A, paid out by B.
+                //
+                // Reported by Tim, who read "could serve ~8.1 GB on demand" directly above "realistic ceiling ~0 B"
+                // and asked the obvious question. The executable-state audit rule covers exactly this: a configured
+                // state that makes the action a no-op should suppress the OFFER, not be discovered after the click.
+                //
+                // The finding itself stays — "lower the budget and this becomes real" is worth knowing, and the pool
+                // is worth knowing — but it drops its Action, which is what keeps it out of the round's executable
+                // lists and out of any optimize plan. The "Tune the budget" button is attached by rule id, not by
+                // action, so the one route that CAN change this outcome is still on the row. Lower the budget,
+                // re-scan, and the action comes back.
+                //
+                // Only when scene information exists: with none at all the ceiling falls back to the project-wide
+                // bound, where zero means "we could not attribute it", not "there is nothing there".
+                bool hasSceneInfo = openDeps.Count > 0 || buildScenePools.Count > 0;
+                bool noPerceivableGain = hasSceneInfo && reclaimCeiling == 0;
+
                 string stateLine = needsQuality
                     ? L.Tr("Texture Streaming is OFF in Quality Settings and these textures lack the Stream Mip Maps flag — enabling means both.",
                            "Quality Settings 的 Texture Streaming 未开，这些纹理也未设 Stream Mip Maps 标记——开启需两头一起。")
@@ -175,7 +198,13 @@ namespace PerfLint.Scanners
                     ruleId: "PERF.TEXSTR001",
                     domain: Domain.Performance,
                     severity: Severity.Info,
-                    title: L.Tr($"Mipmap Streaming could serve ~{poolHuman} of textures on demand", $"Mipmap Streaming 可让约 {poolHuman} 的纹理按需加载"),
+                    // The headline states what acting would GET you, so it cannot lead with the eligible pool when the
+                    // budget makes that pool unreachable — "could serve ~8.1 GB on demand" above "realistic ceiling
+                    // ~0 B" is one sentence contradicting the next.
+                    title: noPerceivableGain
+                        ? L.Tr($"Mipmap Streaming would save nothing at the current {budgetMb} MB budget (~{poolHuman} eligible)",
+                               $"当前 {budgetMb} MB 预算下 Mipmap Streaming 省不到内存（可参与池约 {poolHuman}）")
+                        : L.Tr($"Mipmap Streaming could serve ~{poolHuman} of textures on demand", $"Mipmap Streaming 可让约 {poolHuman} 的纹理按需加载"),
                     groupTitle: L.Tr("Mipmap Streaming opportunity", "Mipmap Streaming 优化机会"),
                     detail: L.Tr($"{candidates.Count} mipmapped scene textures (est. ~{poolHuman} total, importer-metadata estimate) are eligible for Mipmap Streaming " +
                                  "but not participating. With streaming, Unity loads only the mip levels the current camera needs instead of every texture at full size — " +
@@ -185,7 +214,12 @@ namespace PerfLint.Scanners
                                  $"The streaming Memory Budget caps the effect per moment, and only one scene's textures are resident at a time — the realistic savings ceiling is ~{ScannerUtil.Human(reclaimCeiling)}: {ceilingLocEn}. " +
                                  "Scenes whose pool stays under the budget see no change; lowering the budget raises the ceiling; additive multi-scene loading can exceed a single scene's pool (the estimate is conservative there). " +
                                  "Set per-camera behaviour via Streaming Controller if needed. After enabling, verify visuals and tune Memory Budget / " +
-                                 "Max Level Reduction in the PerfLint Runtime Profiler's Texture Streaming section (SRP has no built-in mip debug view).",
+                                 "Max Level Reduction in the PerfLint Runtime Profiler's Texture Streaming section (SRP has no built-in mip debug view)." +
+                                 (noPerceivableGain
+                                     ? "\nThis one comes without a one-click action: by the figures above, enabling it at the current budget saves no measurable memory, " +
+                                       "and a button that cannot move the number is worse than saying so. Use \"Tune the budget\" to bring Memory Budget below the scene pool " +
+                                       "(or confirm your additive loading exceeds a single scene's pool), re-scan, and the action returns."
+                                     : ""),
                                  $"{candidates.Count} 个带 Mipmap 的场景纹理（合计约 {poolHuman}，按导入元数据估算）符合 Mipmap Streaming 条件但未参与。" +
                                  "开启串流后 Unity 只加载当前相机需要的 Mip 级别、不再整张全尺寸加载——用少量 CPU 换大量纹理内存（实测案例默认参数 280MB → 176MB）。" +
                                  $"{stateLine}\n" +
@@ -193,10 +227,18 @@ namespace PerfLint.Scanners
                                  $"串流 Memory Budget 决定单一时刻的效果上限，且同一时刻只有一个场景的纹理驻留——现实可省上限约 {ScannerUtil.Human(reclaimCeiling)}：{ceilingLocCn}。" +
                                  "场景池低于预算的场景看不到变化；调低预算可抬高上限；additive 多场景叠加加载可能超过单场景池（此估算对其偏保守）。" +
                                  "如需按相机差异化可加 Streaming Controller。" +
-                                 "开启后请检查画质，并在 PerfLint Runtime Profiler 的 Texture Streaming 区调 Memory Budget / Max Level Reduction 验证（SRP 没有内置的 Mip 调试视图）。"),
+                                 "开启后请检查画质，并在 PerfLint Runtime Profiler 的 Texture Streaming 区调 Memory Budget / Max Level Reduction 验证（SRP 没有内置的 Mip 调试视图）。" +
+                                 // Says why the button is absent. Without this the row reads as "the fix disappeared",
+                                 // which is worse than the misleading offer it replaced.
+                                 (noPerceivableGain
+                                     ? "\n本条这次没有提供一键动作：按上面的算法，当前预算下开启后省不到可测量的内存，给一个按不出效果的按钮不如说清楚。" +
+                                       "先用「去调预算」把 Memory Budget 调到场景池以下（或确认你的 additive 叠加会超过单场景池），重扫后动作就会回来。"
+                                     : "")),
                     targetPath: null,
                     group: candidates.Count > 1 ? candidates : null,
-                    action: new FindingAction(
+                    // No action while the budget makes it a no-op — see noPerceivableGain. Not a smaller action, none:
+                    // an offer that cannot change the number is the thing the executable-state rule forbids.
+                    action: noPerceivableGain ? null : new FindingAction(
                         label: needsQuality
                             ? L.Tr("Enable Mipmap Streaming (settings + textures)", "开启 Mipmap Streaming（设置 + 纹理）")
                             : L.Tr($"Enable Stream Mip Maps on {candidates.Count} textures", $"为 {candidates.Count} 个纹理开启 Stream Mip Maps"),

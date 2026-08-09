@@ -314,10 +314,27 @@ namespace PerfLint.Llm
                 "字节取 .data。尽量保持原方法签名与调用形态；确实无法保持时选最小改动并留 // TODO(PerfLint AI Migrate): 注明调用方需跟进。\n" +
                 "4) Application.LoadLevel / LoadLevelAsync → SceneManager.LoadScene / LoadSceneAsync（using UnityEngine.SceneManagement）。\n" +
                 "5) 'RenderTargetHandle' 找不到 → 属结构性 URP 迁移：声明改 RTHandle、Identifier() 改直接传句柄、" +
-                "GetTemporaryRT/ReleaseTemporaryRT 改 RenderingUtils.ReAllocateIfNeeded + 显式 Release；仅做让本文件编译通过的最小迁移，" +
-                "复杂 pass 逻辑保守处理并留 TODO。\n" +
-                "6) TextMeshPro 相关类型找不到（Unity 6 把 TMP 合并进 UGUI）→ 保持 using TMPro 不变，通常是 asmdef 引用问题而非代码问题——" +
-                "若代码层无从修复，保持原样并留 TODO 说明该改 asmdef 引用。\n" +
+                "GetTemporaryRT/ReleaseTemporaryRT 改 RenderingUtils.ReAllocateIfNeeded + 显式 Release" +
+                "（该方法在较新 URP 已改名 ReAllocateHandleIfNeeded 且旧名废弃——按本工程实际存在的那个选用）；" +
+                "仅做让本文件编译通过的最小迁移，复杂 pass 逻辑保守处理并留 TODO。\n" +
+                "5b) 'cameraColorTarget' / 'cameraDepthTarget' 错误级废弃 → cameraColorTargetHandle / cameraDepthTargetHandle。" +
+                "注意类型随之从 RenderTargetIdentifier 变为 RTHandle：接收它的变量/字段声明、以及 Blit 目标、ConfigureTarget、" +
+                "SetComputeTextureParam 等下游用法要一并改成 RTHandle（RTHandle 可隐式转 RenderTargetIdentifier，所以多数下游能直接传句柄）。\n" +
+                "5c) 'VolumeComponentMenuForRenderPipeline' 错误级废弃 → 拆成两个特性：" +
+                "[VolumeComponentMenu(\"原菜单路径\")] 加 [SupportedOnRenderPipeline(typeof(UniversalRenderPipelineAsset))]。" +
+                "【类型必须换】新特性收的是管线 **Asset** 类型（UniversalRenderPipelineAsset / HDRenderPipelineAsset），" +
+                "不是旧特性里的管线类型（UniversalRenderPipeline）——照抄旧的 typeof 会编译失败。\n" +
+                "5d) 'XRGraphics' 找不到（URP 已移除该辅助类）→ 改名级替换到 XR 模块：XRGraphics.enabled → " +
+                "UnityEngine.XR.XRSettings.enabled，eyeTextureResolutionScale / renderViewportScale 同名对应到 XRSettings。\n" +
+                "5e) CS0592 'Attribute X is not valid on this declaration type' → 该特性贴错了目标（最常见：[SerializeField] " +
+                "贴在 enum/class/方法上）。老版本编辑器静默接受、Unity 6 才报错，所以它从来没起过作用——**直接删掉那一行特性**，" +
+                "不要试图改声明去迎合它。注意自动属性上的定向写法 [field: SerializeField] 是合法的，不要动。\n" +
+                "6) TextMeshPro 相关类型找不到（Unity 6 把 TMP 合并进 UGUI）→ 先分清两种：" +
+                "【a. 类型/命名空间找不到】保持 using TMPro 不变，通常是 asmdef 引用问题而非代码问题——" +
+                "若代码层无从修复，保持原样并留 TODO 说明该改 asmdef 引用；" +
+                "【b. CS0029 Vector4[] 与 Vector2[] 之间不能转换】TMP_MeshInfo.uvs0 在 Unity 6 从 Vector2[] 变宽为 Vector4[]" +
+                "（uvs2 仍是 Vector2[]）——接收它的局部变量/字段声明改成 Vector4[]；" +
+                "往 Mesh 上写时 mesh.uv 只收 Vector2[]，改用 mesh.SetUVs(0, uvs0)（TMP 自身就是这么写的）。\n" +
                 "7) 其他 CS0246/CS0117（类型或成员不存在）→ 按错误消息与你对该 Unity 版本的知识选择最保守的等价 API；拿不准时宁可用" +
                 "行为最接近的替代并留一行 // TODO(PerfLint AI Migrate): <说明>，绝不编造不确定存在的 API。\n" +
                 "【反幻觉纪律】绝不调用你不能确定存在于该 Unity 版本的 API；不引入新包依赖；不改与错误无关的代码。\n" +
@@ -448,15 +465,33 @@ namespace PerfLint.Llm
     /// </summary>
     public static class MigrateService
     {
+        /// <summary>
+        /// Line count of the file as the migration itself counts it. Must stay byte-for-byte the same measure
+        /// Propose uses (read → normalise line endings → CountLines): it used to be File.ReadAllLines().Length,
+        /// which is one SHORTER for any file ending in a newline — i.e. nearly every source file. A file sitting
+        /// exactly on the cap therefore passed the UI's pre-flight and was rejected after the click, the same
+        /// "you can only find out by clicking" failure this pre-flight exists to remove.
+        /// </summary>
         public static int FileLineCount(string assetPath)
         {
-            try
-            {
-                string full = Path.GetFullPath(assetPath);
-                return File.Exists(full) ? File.ReadAllLines(full).Length : 0;
-            }
-            catch { return 0; }
+            string raw = SafeReadAllText(assetPath);
+            return raw == null ? 0 : CountLines(Normalize(raw));
         }
+
+        /// <summary>
+        /// Whole-file migration pre-flight: is this file past the recipe's cap? Callers must ask BEFORE offering an
+        /// AI Migrate entry point — the cap is knowable from disk, so a button that only reveals it after the click
+        /// is an action that could never have run (the panel it opens has no Generate button at all).
+        /// Each caller phrases its own message: the editor speaks the user's language, the Pipeline envelope stays
+        /// English for agents. Only the measure is shared, and sharing it is the point.
+        /// </summary>
+        public static bool ExceedsLineCap(MigrateRecipe recipe, string filePath, out int lineCount)
+        {
+            lineCount = FileLineCount(filePath);
+            return recipe != null && lineCount > recipe.MaxLines;
+        }
+
+        private static string Normalize(string s) => s.Replace("\r\n", "\n").Replace("\r", "\n");
 
         public static void Propose(MigrateRecipe recipe, string filePath, Action<MigrateProposal> onDone)
             => Propose(recipe, new MigrateTarget { FilePath = filePath }, onDone);
@@ -500,8 +535,11 @@ namespace PerfLint.Llm
                 onDone(new MigrateProposal { Ok = false, Error = L.Tr("Failed to read the source file.", "读取源文件失败。"), FilePath = filePath });
                 return;
             }
-            string original = raw.Replace("\r\n", "\n").Replace("\r", "\n");
+            string original = Normalize(raw);
 
+            // Last line of defence, not the place users should meet the cap: every entry point (editor row,
+            // Pipeline command) checks ExceedsLineCap before it offers the action. Same measure on both sides —
+            // see FileLineCount — so a file can never pass there and fail here.
             int lineCount = CountLines(original);
             if (lineCount > recipe.MaxLines)
             {

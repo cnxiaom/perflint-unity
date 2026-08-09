@@ -52,10 +52,12 @@ namespace PerfLint.UI
         {
             var root = rootVisualElement;
             root.Clear();
-            root.style.paddingTop = 8;
-            root.style.paddingLeft = 8;
-            root.style.paddingRight = 8;
-            root.style.paddingBottom = 8;
+            _rows.Clear(); // BuildUi is callable twice on one instance; stale rows would let a dead toggle vote on Apply
+            PerfLintStyle.Apply(root);
+            root.style.paddingTop = 12;
+            root.style.paddingLeft = 14;
+            root.style.paddingRight = 14;
+            root.style.paddingBottom = 10;
 
             int applicable = _candidates.Count(c => AiFixBatch.IsApplicable(c.Proposal));
             int skipped = _candidates.Count - applicable;
@@ -69,13 +71,15 @@ namespace PerfLint.UI
                 $"Rule {_ruleId}: {applicable} applicable fix(es), {skipped} skipped. Only the checked ones will be written.",
                 $"规则 {_ruleId}：{applicable} 条可应用，{skipped} 条跳过。仅勾选的会被写入。") + flaggedNote)
             {
-                style = { whiteSpace = WhiteSpace.Normal, unityFontStyleAndWeight = FontStyle.Bold }
+                style = { whiteSpace = WhiteSpace.Normal, unityFontStyleAndWeight = FontStyle.Bold, fontSize = 16,
+                          color = PerfLintStyle.Ink }
             });
             root.Add(new Label(L.Tr(
                 "Review each diff, then apply. Applying writes to files; commit to version control first. Applied fixes are still background-verified and auto-rolled back on compile failure.",
                 "逐条审阅 diff 后应用。应用会写入文件，建议先提交版本控制。已应用的仍会后台校验、编译失败自动回滚。"))
             {
-                style = { whiteSpace = WhiteSpace.Normal, opacity = 0.7f, fontSize = 11, marginTop = 2, marginBottom = 4 }
+                style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 4, marginBottom = 6,
+                          color = PerfLintStyle.Dim }
             });
 
             // minHeight=0 is critical: flex children default to min-height:auto, so a flexGrow=1 ScrollView won't shrink
@@ -87,12 +91,14 @@ namespace PerfLint.UI
             root.Add(scroll);
 
             // Bottom action bar. flexShrink=0: always keeps its full height, never squeezed out by the scroll area above.
-            var footer = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginTop = 6, flexShrink = 0 } };
+            var footer = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginTop = 8, flexShrink = 0 } };
             footer.Add(new VisualElement { style = { flexGrow = 1 } });
-            var cancel = new Button(Close) { text = L.Tr("Cancel", "取消") };
+            var cancel = PerfLintStyle.Secondary(L.Tr("Cancel", "取消"), Close);
+            cancel.style.flexShrink = 0;
             footer.Add(cancel);
-            _applyButton = new Button(ApplySelected);
-            _applyButton.style.marginLeft = 6;
+            _applyButton = PerfLintStyle.Primary("", ApplySelected); // label carries the count — see RefreshApplyButton
+            _applyButton.style.marginLeft = 8;
+            _applyButton.style.flexShrink = 0;
             footer.Add(_applyButton);
             root.Add(footer);
 
@@ -101,15 +107,16 @@ namespace PerfLint.UI
 
         private VisualElement BuildCard(AiFixCandidate c)
         {
-            var card = new VisualElement
-            {
-                style =
-                {
-                    marginBottom = 6, paddingTop = 6, paddingBottom = 6, paddingLeft = 8, paddingRight = 8,
-                    backgroundColor = new Color(1, 1, 1, 0.04f),
-                    borderLeftWidth = 2, borderLeftColor = new Color(0.95f, 0.70f, 0.20f)
-                }
-            };
+            // The shared card. It used to be a white overlay at 0.04 with a 2 px amber stripe down the left edge —
+            // the same fixed amber on EVERY card, so the stripe distinguished nothing and told you only that this
+            // was a card. State is carried by what is written in the card (the skip line, the flagged banner), and
+            // the surface is the theme's own.
+            var card = PerfLintStyle.Card(8);
+            card.style.marginBottom = 6;
+            card.style.paddingTop = 8;
+            card.style.paddingBottom = 8;
+            card.style.paddingLeft = 10;
+            card.style.paddingRight = 10;
 
             var p = c.Proposal;
             var skip = AiFixBatch.Classify(p);
@@ -126,19 +133,29 @@ namespace PerfLint.UI
             string loc = c.Finding != null
                 ? $"{c.Finding.Title}  —  {ShortPath(c.Finding.CodeFile)}:{c.Finding.CodeLine}"
                 : ShortPath(p?.FilePath);
-            var title = new Label(loc) { style = { whiteSpace = WhiteSpace.Normal, flexGrow = 1 } };
-            if (!applicable) title.style.opacity = 0.6f;
+            // A tint, not an opacity: fading a label pushes it towards whatever is behind it, and on the light skin
+            // that is a near-white page. A skipped candidate is written in the quiet tint; an applicable one in ink.
+            var title = new Label(loc)
+            {
+                style = { whiteSpace = WhiteSpace.Normal, flexGrow = 1, flexShrink = 1, minWidth = 0,
+                          color = applicable ? PerfLintStyle.Ink : PerfLintStyle.Dimmer }
+            };
             headRow.Add(title);
             card.Add(headRow);
 
             _rows.Add((c, toggle));
 
-            // Skip reason (grayed out) or diff block.
+            // Skip reason (quiet) or diff block.
             if (!applicable)
             {
-                card.Add(new Label("⏭ " + SkipReason(skip, p))
+                // No leading glyph. The one that was here (U+23ED, "skip to next") is not in the 2021/2022 editor
+                // font — it is not EMOJI, so the glyph guard's ranges never caught it, and it would have shipped as
+                // a tofu box on exactly the editors we support and never on the one it was written against. The
+                // sentence after it already says the fix was skipped.
+                card.Add(new Label(SkipReason(skip, p))
                 {
-                    style = { whiteSpace = WhiteSpace.Normal, opacity = 0.6f, marginTop = 4, marginLeft = 22 }
+                    style = { whiteSpace = WhiteSpace.Normal, marginTop = 4, marginLeft = 22,
+                              color = PerfLintStyle.Dimmer }
                 });
                 // When it can't be located, still show the diff for manual reference; for generation failure / no change needed it's pointless.
                 if (skip == AiFixBatch.Skip.NotLocatable && p != null && p.Ok)

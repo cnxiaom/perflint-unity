@@ -214,6 +214,11 @@ namespace PerfLint.Llm
         public static void SyncHostedBalance()
         {
             if (LlmSettings.Mode != LlmMode.Hosted) return;
+            // Never from a headless editor. Its only caller is the LLM settings panel, refreshing a number for
+            // somebody to read — and in batch mode there is nobody and no panel, so the request is pure waste on
+            // every CI run. It also made the window untestable: constructing it fires OnEnable, and a test that
+            // reaches the network is a test that fails when the network does.
+            if (UnityEngine.Application.isBatchMode) return;
 
             string url = LlmSettings.ProxyBalanceEndpoint;
             var req = new UnityWebRequest(new Uri(url), "POST")

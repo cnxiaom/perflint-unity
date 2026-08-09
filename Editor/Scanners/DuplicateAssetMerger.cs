@@ -244,7 +244,13 @@ namespace PerfLint.Scanners
             // truly done only if ≤1 copy survives. A group that still has ≥2 surviving copies — multiple path-loaded
             // copies that can't be deleted, or one a merge couldn't touch — will be reported again by a re-scan, so
             // count it honestly as "still needs manual handling" (otherwise the summary undercounts what's left).
-            int done = 0, remaining = 0;
+            // Survivors are split by WHICH guard held them back. One sentence naming both causes made the dialog
+            // unfalsifiable: a run where 32 of 32 groups survived said "path-loaded copies, or different import
+            // settings" while 22 of them had no path-loaded copy at all — the first half was simply untrue for
+            // those, and the reader has no way to tell which half was meant. The two need opposite work (manual
+            // dedup vs. aligning import settings), so they are counted apart.
+            int done = 0, blockedByPathLoads = 0, blockedByResourceLoads = 0, blockedByEntries = 0,
+                blockedByTypes = 0, blockedByContents = 0;
             foreach (var g in groups)
             {
                 if (g == null) continue;
@@ -254,37 +260,216 @@ namespace PerfLint.Scanners
                     try { if (File.Exists(ScannerUtil.ToPhysicalFullPath(p))) survivors++; }
                     catch { /* ignore */ }
                 }
-                if (survivors <= 1) done++; else remaining++;
+                if (survivors <= 1) { done++; continue; }
+
+                // Two or more undeletable copies is a ceiling nothing can lift — but WHICH kind of load pins them
+                // decides the work: moving files out of Resources and fixing call sites, versus dropping one of two
+                // identical Addressables entries. Measured on one project: 3 groups held by Resources, 5 by entries,
+                // and 4 of those 5 had been made entries by our own "extract to shared group".
+                int pathLoaded = 0, resourceLike = 0, entries = 0;
+                foreach (var p in g)
+                {
+                    var kind = PathLoadKindOf(p);
+                    if (kind == PathLoadKind.None) continue;
+                    pathLoaded++;
+                    if (kind == PathLoadKind.AddressablesEntry) entries++; else resourceLike++;
+                }
+
+                if (pathLoaded >= 2)
+                {
+                    if (entries >= 2 && resourceLike == 0) blockedByEntries++;
+                    else if (resourceLike >= 2 && entries == 0) blockedByResourceLoads++;
+                    else blockedByPathLoads++;
+                    continue;
+                }
+
+                // Otherwise the copies are either different KINDS of asset (one imported as a Texture2D and another as
+                // a Cubemap — identical bytes, incompatible objects) or the same kind with mismatched sub-objects.
+                // Named apart because the first is usually intentional and the second is an import-settings slip.
+
+                var types = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var p in g)
+                {
+                    Type mt = null;
+                    try { mt = AssetDatabase.GetMainAssetTypeAtPath(p); } catch { /* unreadable */ }
+                    types.Add(mt == null ? "?" : mt.FullName);
+                }
+                if (types.Count > 1) blockedByTypes++; else blockedByContents++;
             }
 
+            int remaining = blockedByPathLoads + blockedByResourceLoads + blockedByEntries + blockedByTypes + blockedByContents;
             var sb = new StringBuilder();
             sb.Append(L.Tr($"Deduplicated {done} of {done + remaining} group(s).", $"已去重 {done + remaining} 组中的 {done} 组。"));
-            if (remaining > 0)
+            if (blockedByResourceLoads > 0)
                 sb.Append(L.Tr(
-                    $"\n\n{remaining} group(s) still have duplicates that can't be auto-merged: they contain multiple copies loaded by path/name/address (Resources / StreamingAssets / AssetBundle / Addressables), or copies with different import settings. Dedup these manually.",
-                    $"\n\n{remaining} 组仍有无法自动合并的重复：含多份按路径/名称/address 加载的副本（Resources / StreamingAssets / AssetBundle / Addressables），或导入设置不同的副本，请手动处理。"));
+                    $"\n\n{blockedByResourceLoads} group(s) hold two or more copies under Resources / StreamingAssets, or assigned to an AssetBundle — loaded by name at runtime, which a reference redirect cannot repair, so none of them can be removed. Move all but one out (and update the call sites that load it), then re-scan. Doing this first also unblocks the rest of the duplication work.",
+                    $"\n\n{blockedByResourceLoads} 组含两份及以上位于 Resources / StreamingAssets 或已分配到 AssetBundle 的副本——运行时按名字加载，引用重定向修不了，因此一份都删不掉。把其中除一份外的都移出（并改掉加载它的调用点）后重新扫描。先做这件事也会解开后续的去重工作。"));
+            if (blockedByEntries > 0)
+                sb.Append(L.Tr(
+                    $"\n\n{blockedByEntries} group(s) hold two or more copies that are Addressables entries, loaded by address — a reference redirect cannot repair that. They are identical bytes, so one entry is enough: remove all but one from its group and re-scan. If \"Extract to shared group\" put them there, Tools ▸ PerfLint ▸ Revert \"PerfLint Shared\" Extraction takes them back out.",
+                    $"\n\n{blockedByEntries} 组含两份及以上 Addressables 条目、按 address 加载——引用重定向修不了这类加载。它们内容完全相同，留一个条目就够：把其余的从各自 group 里移除后重新扫描。如果是「提取到公共 group」放进去的，用 Tools ▸ PerfLint ▸ Revert「PerfLint Shared」Extraction 取出来。"));
+            if (blockedByPathLoads > 0)
+                sb.Append(L.Tr(
+                    $"\n\n{blockedByPathLoads} group(s) hold two or more copies pinned by DIFFERENT kinds of string-keyed load (Resources / StreamingAssets / AssetBundle / Addressables). A reference redirect repairs none of them — free all but one, whichever applies to that copy, then re-scan.",
+                    $"\n\n{blockedByPathLoads} 组含两份及以上被不同形式的字符串加载钉住的副本（Resources / StreamingAssets / AssetBundle / Addressables）。引用重定向对它们都无效——按各自情况把除一份外的都解开后重新扫描。"));
+            if (blockedByTypes > 0)
+                sb.Append(L.Tr(
+                    $"\n\n{blockedByTypes} group(s) hold copies imported as DIFFERENT kinds of asset — the same bytes brought in once as a texture and once as a cubemap, say. Nothing can be redirected between them; if that difference is not deliberate, align the import settings and re-scan.",
+                    $"\n\n{blockedByTypes} 组的副本被导入成了不同种类的资产——同样的字节，一处当贴图导入、另一处当 Cubemap。两者之间无法重定向；如果这个差别不是有意为之，请统一导入设置后重新扫描。"));
+            if (blockedByContents > 0)
+                sb.Append(L.Tr(
+                    $"\n\n{blockedByContents} group(s) were skipped on contents: same kind of asset, but the copies expose different sub-objects (different import settings) or have diverged since the scan, and redirecting references would break them. Align their import settings, re-scan, then try again.",
+                    $"\n\n{blockedByContents} 组因内容被跳过：属同一种资产，但副本暴露的子对象不一致（导入设置不同）或自扫描后已改动，重定向引用会破坏它们。请先统一导入设置、重新扫描后再试。"));
             return FixResult.Ok(sb.ToString());
         }
 
-        /// <summary>The default "keep" choice: the most-referenced copy (fewest references to rewrite), ties → ordinal order.</summary>
+        /// <summary>The default "keep" choice: whichever copy the most others can actually be merged INTO; ties →
+        /// most-referenced (fewest references to rewrite), then ordinal order.</summary>
         public static string ChooseDefaultKeep(IReadOnlyList<string> group)
         {
             if (group == null || group.Count == 0) return null;
             return ChooseDefaultKeep(group, BuildReferenceIndex(group, showProgress: false));
         }
 
-        private static string ChooseDefaultKeep(IReadOnlyList<string> group, DuplicateReferenceIndex index)
+        /// <summary>
+        /// The same choice as the public overload, reusing an index the caller already built. The chooser window
+        /// builds one for its per-copy counts, and a second sweep of a large project is minutes rather than seconds —
+        /// so it passes that one in instead of asking for the choice the expensive way.
+        /// </summary>
+        internal static string ChooseDefaultKeep(IReadOnlyList<string> group, DuplicateReferenceIndex index)
         {
             if (group == null || group.Count == 0) return null;
-            string best = null;
-            int bestCount = -1;
-            // Iterate the group in its given (ordinal-sorted) order; strict '>' keeps the first on ties → lowest ordinal.
-            foreach (var p in group)
+            if (group.Count == 1) return group[0];
+
+            // LocalFileIds loads the asset, so ask once per copy rather than once per candidate×copy.
+            var ids = new Dictionary<string, HashSet<long>>(StringComparer.Ordinal);
+            foreach (var p in group) if (!ids.ContainsKey(p)) ids[p] = LocalFileIds(p);
+
+            // An absent index only costs the tie-break; the ranking that actually matters (how many copies the
+            // survivor can absorb) does not need it, so a failed scan must not fall back to "keep group[0]".
+            Func<string, int> refs = index != null ? (Func<string, int>)index.ReferenceCount : (_ => 0);
+            return group[ChooseKeepIndex(group, IsLoadedByStringPath, p => ids[p], refs)];
+        }
+
+        /// <summary>What a merge would do to one copy of a duplicate group — one value per guard in <see cref="Merge"/>.</summary>
+        internal enum CopyOutcome
+        {
+            /// <summary>The survivor: every other copy's references are redirected here.</summary>
+            Kept,
+            /// <summary>References redirected to the survivor, then this file is deleted.</summary>
+            WillBeDeleted,
+            /// <summary>Loaded by path / name / address — a GUID redirect cannot repair those loads, so never deleted.</summary>
+            KeptPathLoaded,
+            /// <summary>No longer byte-identical to the survivor (changed since the scan) — never deleted on doubt.</summary>
+            KeptDiverged,
+            /// <summary>Exposes sub-objects the survivor lacks; redirecting would leave those fileIDs dangling.</summary>
+            KeptSubObjects,
+            /// <summary>No usable GUID, or the same asset listed twice under one path.</summary>
+            KeptUnresolved,
+        }
+
+        /// <summary>
+        /// What <see cref="Merge"/> would do to each copy if <paramref name="keep"/> were the survivor — the same
+        /// guards in the same order, asked without executing any of them.
+        ///
+        /// The chooser draws its per-row status and its "keeping this removes N" line from this, so the window cannot
+        /// promise something the merge then refuses. It is the same failure 7e6bfec was written for, one level up:
+        /// that fix taught the SCANNER not to offer a button whose only outcome is "merged 0", while the chooser went
+        /// on defaulting to a survivor that could absorb nothing (a real group: a plain copy with 10 references beat
+        /// an Addressable copy with 3, and keeping the plain one made the group undeletable).
+        /// </summary>
+        /// Every fact is injected (defaulting to the AssetDatabase / this class's own guards) so each branch is
+        /// reachable in batchmode, the same shape as <see cref="ChooseKeepIndex"/> and DUP001's <c>PlanMerge</c>.
+        internal static Dictionary<string, CopyOutcome> PreviewMerge(
+            IReadOnlyList<string> group, string keep,
+            Func<string, string> guidOf = null, Func<string, bool> isPathLoaded = null,
+            Func<string, string, bool> filesEqual = null, Func<string, HashSet<long>> idsOf = null)
+        {
+            var outcome = new Dictionary<string, CopyOutcome>(StringComparer.Ordinal);
+            if (group == null || group.Count == 0 || string.IsNullOrEmpty(keep) || !group.Contains(keep)) return outcome;
+
+            guidOf ??= AssetDatabase.AssetPathToGUID;
+            isPathLoaded ??= IsLoadedByStringPath;
+            filesEqual ??= FilesEqual;
+            idsOf ??= LocalFileIds;
+
+            string keepGuid = guidOf(keep);
+            HashSet<long> keepIds = null;   // loaded lazily: only needed once some copy survives the cheaper guards
+
+            foreach (var dup in group)
             {
-                int c = index.ReferenceCount(p);
-                if (c > bestCount) { bestCount = c; best = p; }
+                if (outcome.ContainsKey(dup)) continue;               // a path listed twice: first verdict wins
+                if (dup == keep) { outcome[dup] = CopyOutcome.Kept; continue; }
+
+                string dupGuid = guidOf(dup);
+                if (string.IsNullOrEmpty(dupGuid) || dupGuid == keepGuid) { outcome[dup] = CopyOutcome.KeptUnresolved; continue; }
+                if (isPathLoaded(dup)) { outcome[dup] = CopyOutcome.KeptPathLoaded; continue; }
+                if (!filesEqual(keep, dup)) { outcome[dup] = CopyOutcome.KeptDiverged; continue; }
+                if (keepIds == null) keepIds = idsOf(keep);
+                if (!IsSubset(idsOf(dup), keepIds)) { outcome[dup] = CopyOutcome.KeptSubObjects; continue; }
+                outcome[dup] = CopyOutcome.WillBeDeleted;
             }
-            return best ?? group[0];
+            return outcome;
+        }
+
+        /// <summary>How many copies <see cref="Merge"/> would delete with this survivor. Zero means the merge is a no-op.</summary>
+        internal static int DeletableWith(
+            IReadOnlyList<string> group, string keep,
+            Func<string, string> guidOf = null, Func<string, bool> isPathLoaded = null,
+            Func<string, string, bool> filesEqual = null, Func<string, HashSet<long>> idsOf = null)
+        {
+            int n = 0;
+            foreach (var kv in PreviewMerge(group, keep, guidOf, isPathLoaded, filesEqual, idsOf))
+                if (kv.Value == CopyOutcome.WillBeDeleted) n++;
+            return n;
+        }
+
+        /// <summary>
+        /// Which copy to keep, by the only objective that matters: **how many of the others the merge can then
+        /// actually delete**. Pure (every fact injected) so it is unit-testable in batchmode.
+        ///
+        /// The old rule was "most-referenced copy, fewest references to rewrite" — a cost heuristic that never asked
+        /// whether the winner could absorb the others at all. Two things make a copy unabsorbable, and
+        /// <see cref="Merge"/> enforces both: a copy loaded by path/name/address can never be deleted, and a copy
+        /// whose sub-objects are not all present in the kept asset would leave dangling fileIDs.
+        /// Measured on a real project: 18 duplicate groups where one copy imported as a Sprite (Texture2D + sprite
+        /// sub-asset, 2 fileIDs) and the other as a plain texture (1 fileID). The 1-fileID copy was the
+        /// more-referenced one, so it won — and then nothing could merge into it, because the richer copy's sprite
+        /// id had nowhere to go. Keeping the RICHER copy merges every one of them. The reference count survives as
+        /// the tie-break, where it belongs.
+        ///
+        /// Ties keep the earliest candidate (both comparisons are strict), so an unchanged group always picks the
+        /// same copy — the group arrives ordinal-sorted, so that is the lowest path.
+        /// </summary>
+        internal static int ChooseKeepIndex(IReadOnlyList<string> group, Func<string, bool> isPathLoaded,
+                                            Func<string, HashSet<long>> idsOf, Func<string, int> refCount)
+        {
+            if (group == null || group.Count == 0) return -1;
+
+            int best = 0, bestAbsorbable = -1, bestRefs = -1;
+            for (int i = 0; i < group.Count; i++)
+            {
+                string candidate = group[i];
+                var candidateIds = idsOf(candidate);
+                int absorbable = 0;
+                for (int j = 0; j < group.Count; j++)
+                {
+                    if (j == i) continue;
+                    string other = group[j];
+                    if (isPathLoaded(other)) continue;                    // undeletable whatever we keep
+                    if (!IsSubset(idsOf(other), candidateIds)) continue;  // its sub-objects would dangle
+                    absorbable++;
+                }
+
+                int refs = refCount(candidate);
+                if (absorbable > bestAbsorbable || (absorbable == bestAbsorbable && refs > bestRefs))
+                {
+                    best = i;
+                    bestAbsorbable = absorbable;
+                    bestRefs = refs;
+                }
+            }
+            return best;
         }
 
         /// <summary>Per-copy project-wide reference counts (thin wrapper over <see cref="BuildReferenceIndex"/>).</summary>
@@ -442,31 +627,45 @@ namespace PerfLint.Scanners
         }
 
         /// <summary>
-        /// True when an asset is loaded by string path / name / address rather than by GUID reference, so deleting a
-        /// duplicate of it would silently break loading that a GUID redirect can't repair: anything under a
-        /// <c>Resources/</c> or <c>StreamingAssets/</c> folder (<c>Resources.Load</c> / streaming reads), explicitly
-        /// assigned to an AssetBundle (<c>bundle.LoadAsset("name")</c>), or an Addressables entry (loaded by address,
-        /// via <see cref="AddressableEntryHook"/> when the package is installed). The chooser also uses this to
-        /// annotate such rows.
+        /// Which kind of string-keyed load pins a copy in place. The four have DIFFERENT ways out — move it out of
+        /// <c>Resources/</c> and fix the <c>Resources.Load</c> call sites, versus drop one of two identical
+        /// Addressables entries — so they are told apart rather than collapsed into "loaded by path/name/address".
+        /// One sentence covering all four sent a user holding two Addressables entries to go looking in a Resources
+        /// folder that does not exist in their project.
         /// </summary>
-        public static bool IsLoadedByStringPath(string assetPath)
+        public enum PathLoadKind { None, Resources, StreamingAssets, AssetBundle, AddressablesEntry }
+
+        /// <summary>
+        /// How <paramref name="assetPath"/> is loaded, if not by GUID reference — deleting a duplicate of such a copy
+        /// would silently break a load a GUID redirect cannot repair. <c>Resources/</c> and <c>StreamingAssets/</c>
+        /// are path loads, an explicit <c>assetBundleName</c> is a name load (<c>bundle.LoadAsset("name")</c>), and an
+        /// Addressables entry is an address load (via <see cref="AddressableEntryHook"/> when the package is present).
+        /// </summary>
+        public static PathLoadKind PathLoadKindOf(string assetPath)
         {
-            if (string.IsNullOrEmpty(assetPath)) return false;
-            if (assetPath.IndexOf("/Resources/", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            if (assetPath.IndexOf("/StreamingAssets/", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (string.IsNullOrEmpty(assetPath)) return PathLoadKind.None;
+            if (assetPath.IndexOf("/Resources/", StringComparison.OrdinalIgnoreCase) >= 0) return PathLoadKind.Resources;
+            if (assetPath.IndexOf("/StreamingAssets/", StringComparison.OrdinalIgnoreCase) >= 0) return PathLoadKind.StreamingAssets;
             try
             {
                 var imp = AssetImporter.GetAtPath(assetPath);
-                if (imp != null && !string.IsNullOrEmpty(imp.assetBundleName)) return true;
+                if (imp != null && !string.IsNullOrEmpty(imp.assetBundleName)) return PathLoadKind.AssetBundle;
             }
             catch { /* importer unavailable: fall through */ }
             try
             {
-                if (AddressableEntryHook != null && AddressableEntryHook(assetPath)) return true;
+                if (AddressableEntryHook != null && AddressableEntryHook(assetPath)) return PathLoadKind.AddressablesEntry;
             }
             catch { /* hook failure: treat as not-addressable */ }
-            return false;
+            return PathLoadKind.None;
         }
+
+        /// <summary>
+        /// True when a copy is loaded by string path / name / address rather than by GUID reference, so the merge can
+        /// never delete it. Single source of truth for that question; <see cref="PathLoadKindOf"/> when you need to
+        /// tell the user WHICH kind, because the ways out differ.
+        /// </summary>
+        public static bool IsLoadedByStringPath(string assetPath) => PathLoadKindOf(assetPath) != PathLoadKind.None;
 
         private static string NormalizePath(string path)
         {

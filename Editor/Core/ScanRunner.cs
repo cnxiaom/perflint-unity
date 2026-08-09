@@ -341,11 +341,24 @@ namespace PerfLint.Core
             // Fresh findings for this file.
             bool handled = false;
             var fresh = new List<Finding>();
+            // Who produced what, so a rule appearing for the first time gets an owner -- see the map merge below.
+            var producedByScanner = new Dictionary<string, List<string>>(StringComparer.Ordinal);
             foreach (var s in scanners)
             {
                 if (!(s is IFileScanner fs) || !fs.Handles(assetPath)) continue;
                 handled = true;
-                try { fresh.AddRange(fs.ScanFile(assetPath, ctx) ?? Enumerable.Empty<Finding>()); }
+                try
+                {
+                    var produced = (fs.ScanFile(assetPath, ctx) ?? Enumerable.Empty<Finding>()).ToList();
+                    fresh.AddRange(produced);
+                    if (produced.Count > 0)
+                    {
+                        if (!producedByScanner.TryGetValue(s.Name, out var rules))
+                            producedByScanner[s.Name] = rules = new List<string>();
+                        foreach (var pf in produced)
+                            if (!string.IsNullOrEmpty(pf.RuleId) && !rules.Contains(pf.RuleId)) rules.Add(pf.RuleId);
+                    }
+                }
                 catch (Exception ex) { UnityEngine.Debug.LogError("[PerfLint] " + L.Tr($"Incremental re-scan '{s.Name}' failed: {ex}", $"增量重扫 '{s.Name}' 出错: {ex}")); }
             }
 
@@ -377,7 +390,37 @@ namespace PerfLint.Core
 
             // Carry over the ownership map: a file-level incremental re-scan does not alter the scanner→rule mapping,
             // so we preserve it to keep subsequent group re-scans functional.
-            return new ScanResult(merged, previous.Duration, previous.ScannerRuleMap);
+            // Carry the ownership map over, and ADD anything this file produced that the map did not know about.
+            //
+            // "A file-level re-scan does not alter the scanner-to-rule mapping" was the assumption, and it holds in
+            // one direction only: a rule that produced nothing during the last full scan has no owner, and this is
+            // precisely how it acquires findings -- you edit an asset and introduce the first violation of it.
+            //
+            // The map is what RescanRules reverse-looks-up to decide which scanners to re-run, and RescanRules is
+            // what FindingActions.ApplyRule calls to revive a Fix delegate that disk cannot carry. No owner meant it
+            // returned the previous result untouched, so ApplyRule found nothing to fix and answered "Nothing left to
+            // fix for that rule -- it may already be done" about a finding sitting on screen with a working fix.
+            // Measured: enable Read/Write on a 4096 texture, and RescanFile finds PERF.TEX001 with a live Fix while
+            // RescanRules("PERF.TEX001") finds zero.
+            //
+            // Additive only. This re-scan saw one file, so it can say a scanner produces a rule; it cannot say a
+            // scanner has stopped producing one elsewhere.
+            var ownerMap = previous.ScannerRuleMap;
+            if (producedByScanner.Count > 0)
+            {
+                var grown = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+                if (ownerMap != null) foreach (var kv in ownerMap) grown[kv.Key] = kv.Value;
+                foreach (var kv in producedByScanner)
+                {
+                    var union = new List<string>();
+                    if (grown.TryGetValue(kv.Key, out var had) && had != null) union.AddRange(had);
+                    foreach (var r in kv.Value) if (!union.Contains(r)) union.Add(r);
+                    grown[kv.Key] = union;
+                }
+                ownerMap = grown;
+            }
+
+            return new ScanResult(merged, previous.Duration, ownerMap);
         }
 
         /// <summary>

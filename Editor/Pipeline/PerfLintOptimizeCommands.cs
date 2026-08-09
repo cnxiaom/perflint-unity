@@ -22,7 +22,7 @@ namespace PerfLint.Ci.Pipeline
     ///
     /// DESIGN (open-editor first — the majority of users run the agent against an editor they have open, see
     /// docs/conversational-optimize-ux.md): the wire applies ONLY the auto/waste tier — deterministic import-setting
-    /// fixes, undoable via Edit &gt; Undo, the exact set the editor's "Fix All" applies. EVERY trade-off (Static
+    /// fixes — recoverable from version control, not via Edit &gt; Undo — the exact set the editor's "Fix All" applies. EVERY trade-off (Static
     /// Batching, texture streaming, Addressables extraction) AND every irreversible op (duplicate merge) is surfaced in
     /// the plan but is NEVER executed over the wire — the user runs those in the editor, where each action's own
     /// confirmation carries the full warning. "Waste is automatable; trade-offs are yours" → trade-offs are yours to
@@ -47,7 +47,7 @@ namespace PerfLint.Ci.Pipeline
         }
 
         [CliCommand("perflint_optimize_apply",
-            "Apply ONLY the safe, reversible waste fixes for a goal (build size or memory) — the auto tier, undoable via Edit > Undo — then re-scan and report the verified delta. Trade-offs and irreversible ops are never applied here; the plan lists them to do in the editor. Pro. Modifies the open project.")]
+            "Apply ONLY the safe waste fixes for a goal (build size or memory) — the auto tier, recoverable from version control but NOT via Edit > Undo — then re-scan and report the verified delta. Trade-offs and irreversible ops are never applied here; the plan lists them to do in the editor. Pro. Modifies the open project.")]
         public static OptimizeApplyDto PerfLintOptimizeApply(
             [CliArg("goal", "What to optimize: 'build' or 'memory'. Matched loosely; default 'build'.")] string goal = "build",
             [CliArg("dry_run", "Report what would be applied without changing anything.")] bool dryRun = false)
@@ -375,7 +375,7 @@ namespace PerfLint.Ci.Pipeline
                 + $"Grade {before.HealthGrade()}→{after.HealthGrade()}, reclaimed ~{ScannerUtil.Human(reclaimed)} "
                 + $"(re-scan verified). {plan.DecisionGroups.Count} trade-off group(s) "
                 + $"(~{ScannerUtil.Human(plan.DecisionSavingsBytes)}) left for you in the editor. "
-                + "Edit > Undo reverts what was just applied.";
+                + "Edit > Undo does NOT revert this — restore from version control if you want it back.";
             return dto;
         }
     }

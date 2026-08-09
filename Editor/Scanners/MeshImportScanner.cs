@@ -85,7 +85,27 @@ namespace PerfLint.Scanners
                 // generates Lightmap UVs, that quantization can bake visible seams/cracks into lightmapped surfaces,
                 // so compression here is a trade-off that needs a human visual check — not a safe blanket win. For
                 // those models we still surface the finding (build-size cost is real) but withhold the one-click fix
-                // and route the user to set it manually + inspect. Non-lightmapped models keep the one-click Low fix.
+                // and route the user to set it manually + inspect. Non-lightmapped models get the one-click.
+                //
+                // The one-click sets LOW, and that is a measured decision rather than a cautious guess. Three builds
+                // of urp3dsample, same settings and output path, 239 models, nothing else touched — every other
+                // asset type came out byte-identical, so the deltas are the setting and nothing else:
+                //
+                //   Off     mesh 24,193,408 B
+                //   Low     mesh 16,901,328 B    -7,292,080  (-30.1%)
+                //   Medium  mesh 14,784,536 B    -2,116,792 further  (-12.5% of Low)
+                //
+                // Low takes 77.5% of everything on offer. The second step costs harder quantization on every channel
+                // and buys 2.1 MB — 0.42% of a 484 MB build, which is why it read on screen as "almost no change".
+                // For a bulk, lossy, not-Ctrl+Z-able one-click on a screen that promises "anything that changes how
+                // the game plays or looks is never applied for you", that is the wrong side of the trade. Medium and
+                // High stay available by hand for projects where size is the whole problem.
+                //
+                // The detail names the level the button will set: it is lossy, Unity quantizes positions within each
+                // mesh's own bounds, so the bigger the mesh the bigger the absolute error.
+                //
+                // The lightmapped branch keeps advising LOW, deliberately: that is the subset where quantization bakes
+                // seams into a lit surface, so the manual path stays at the gentler setting.
                 // Read from the importer only (no mesh load): author-supplied UV2 carries the same risk, but generateSecondaryUV
                 // is the reliable metadata-level signal for the common auto-generated case, and the detail names the caveat.
                 bool lightmapUv = importer.generateSecondaryUV;
@@ -105,10 +125,14 @@ namespace PerfLint.Scanners
                                 $"'{file}' 的 Mesh Compression 为 Off，包体偏大。该模型会生成 Lightmap UV，而网格压缩会量化光照贴图 UV（UV2）通道" +
                                 "——开启后可能在烘焙表面产生可见接缝/裂缝。这是取舍而非免费收益：请手动设为 Low 并检查烘焙效果，不要批量套用。" +
                                 "（此处刻意不提供一键。）")
-                        : L.Tr($"'{file}' has Mesh Compression set to Off, inflating build size. Setting it to Low/Medium reduces disk usage " +
-                                "(note: compression can introduce vertex precision loss, so geometry-sensitive models need a visual check).",
-                                $"'{file}' 的 Mesh Compression 为 Off，包体偏大。开启 Low/Medium 可减小磁盘占用" +
-                                "（注意：压缩可能引入顶点精度损失，几何敏感的模型需肉眼确认）。"),
+                        : L.Tr($"'{file}' has Mesh Compression set to Off, inflating build size. The one-click fix sets it to Low, " +
+                                "which quantizes the stored vertex data — the mesh is expanded again on load, so this is disk and download size, not runtime memory. " +
+                                "Compression is lossy: positions are quantized within each mesh's own bounds, so large models lose the most precision, and those are the ones worth a look afterwards. " +
+                                "Medium and High compress further; they are left to you, because past Low the extra precision loss buys much less.",
+                                $"'{file}' 的 Mesh Compression 为 Off，包体偏大。一键修复会设为 Low：它量化的是**存储**的顶点数据" +
+                                "——加载时会解回原样，所以省的是磁盘与下载体积，不是运行时内存。" +
+                                "压缩是有损的：顶点位置按各自网格的包围盒量化，网格越大精度损失越明显，这类模型改完值得看一眼。" +
+                                "Medium/High 能再压一些，但过了 Low 之后额外的精度损失换回的字节少得多，所以留给你自己决定。"),
                     targetPath: path,
                     ping: () => ScannerUtil.PingAsset(path),
                     fix: lightmapUv ? null : new MeshCompressionFix(path, ModelImporterMeshCompression.Low)));

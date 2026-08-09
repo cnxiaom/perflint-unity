@@ -18,7 +18,7 @@ namespace PerfLint.UI
     /// </summary>
     public sealed class PerfLintWelcomeWindow : EditorWindow
     {
-        const string DocsUrl = "https://perflint.dev/docs";
+        const string DocsUrl = "https://perflint.dev/docs/";
 
         [MenuItem("Tools/PerfLint/Getting Started", priority = 2000)] // priority gap => separated from the working tools above
         public static void Open()
@@ -31,6 +31,7 @@ namespace PerfLint.UI
         private void CreateGUI()
         {
             var root = rootVisualElement;
+            PerfLintStyle.Apply(root);
             root.style.paddingTop = 12;
             root.style.paddingLeft = 14;
             root.style.paddingRight = 14;
@@ -47,11 +48,19 @@ namespace PerfLint.UI
                 "装进编辑器里的资深技术经理。一次扫描找出拖慢、撑大、卡住你工程的问题——给出准确位置、大白话影响，以及修复方案。检测由确定性规则引擎完成：离线、免注册、零 token，每次跑结果一致。")));
 
             // ── 1. Where to find it ──────────────────────────────
+            //
+            // The Autopilot leads, and not by seniority: it is the menu's first item (priority 1) and the main
+            // panel's own header points at it. A guide that opened with the instrument panel would be sending a
+            // first-time user to the screen the Autopilot exists to spare them.
             scroll.Add(Header(L.Tr("Where to find it", "在哪里找到它")));
             scroll.Add(MenuRow(
+                "Tools ▸ PerfLint ▸ Autopilot", null,
+                L.Tr("Where you are, what to fix this round, and whether it actually worked. Start here — it decides what to do next so you don't have to read a list to find out.",
+                     "你现在在哪、这一轮修什么、做完到底有没有用。从这里开始——它替你定下一步，不用先读完一整张清单。")));
+            scroll.Add(MenuRow(
                 "Tools ▸ PerfLint ▸ Scan Project", "Ctrl/Cmd + Shift + L",
-                L.Tr("The main panel — health score and every finding. Start here.",
-                     "主面板——健康分和全部问题清单。从这里开始。")));
+                L.Tr("The full panel — health score, every finding, and all the evidence behind the Autopilot's ranking.",
+                     "完整面板——健康分、全部问题清单，以及 Autopilot 排序背后的全部证据。")));
             scroll.Add(MenuRow(
                 "Tools ▸ PerfLint ▸ Runtime Profiler", "Ctrl/Cmd + Shift + K",
                 L.Tr("Play Mode profiling: stutter, per-frame GC, and CPU hotspots, down to the script.",
@@ -82,20 +91,45 @@ namespace PerfLint.UI
                 "Build, quality and player settings that quietly cost you frames or megabytes.",
                 "悄悄吃掉帧率或体积的 Build / Quality / Player 设置。")));
 
-            // ── 3. The main panel's toolbar, button by button ─────
+            // ── 3. The Autopilot — what the scan's list turns into ──
+            //
+            // Its three screens are named with the Autopilot's own tab titles, verbatim. A guide that paraphrases
+            // the thing it is pointing at leaves the reader matching approximations against a live window.
+            scroll.Add(Header(L.Tr("Autopilot: one thing at a time", "Autopilot：一次只做一件事")));
+            scroll.Add(Body(L.Tr(
+                "A scan gives you a list. The Autopilot turns it into a next step — ranked by what is actually limiting your project rather than by severity, and verified by measuring before and after. Three screens, in this order:",
+                "扫描给你的是一张清单。Autopilot 把它变成「下一步做什么」——按「当前真正卡住你的是什么」排序，而不是按严重级别，并用前后两次测量来验证。三屏，按顺序：")));
+            scroll.Add(Bullet(DotStep, L.Tr("1 · Where you are", "1 · 当前结论"), L.Tr(
+                "The single item the evidence ranks first, with what it should buy you, its risk, and whether it can be undone. The rest is shown as a roadmap under it, not as a to-do list.",
+                "证据排在第一位的那一项，附带预期改善、风险，以及能否撤销。其余的以路线图形式列在下面，而不是一张待办清单。")));
+            scroll.Add(Bullet(DotStep, L.Tr("2 · This round", "2 · 本轮修复"), L.Tr(
+                "Only the best-evidenced items, with the reversible ones applied in one click. Anything that changes how your game plays or looks is never applied for you — it is listed as a decision, with the trade-off spelled out.",
+                "只放证据最充分的项，其中可逆的那些一键应用。任何会改变游戏玩法或观感的改动都不会替你执行——它们单列为「需要你决定」，并写清取舍。")));
+            scroll.Add(Bullet(DotStep, L.Tr("3 · Did it work", "3 · 验证结果"), L.Tr(
+                "Measure the scene, make the changes, measure again. A difference smaller than the drift PerfLint has measured on your own machine comes back as \"no measurable change\" rather than as a win.",
+                "先测一次当前场景，改完再测一次。如果差异小于 PerfLint 在你这台机器上实测到的漂移，结论是「无可测量的变化」，而不是一场胜利。")));
+            scroll.Add(Hint(L.Tr(
+                "Ranking and measuring are free. Applying the fixes is the Pro part, and the round says which of its items that covers before you click anything.",
+                "排序与测量免费。执行修复才是 Pro 的部分，而且本轮列表会在你点任何按钮之前先说明哪些项属于它。")));
+
+            // ── 4. The main panel's toolbar, button by button ─────
             scroll.Add(Header(L.Tr("The main panel, button by button", "主面板工具栏逐个说明")));
             scroll.Add(ToolRow("Scan Project", L.Tr(
                 "Runs the full scan. Re-running after an edit is incremental — only what changed is re-scanned.",
                 "跑完整扫描。改动后重跑是增量的——只重扫变化的部分。")));
             scroll.Add(ToolRow("Fix All", L.Tr(
-                "Applies every safe, deterministic fix in one batch (import settings and the like), with a preview first and Edit ▸ Undo after. Pro.",
-                "一次性应用全部安全的确定性修复（导入设置等），先预览、事后可 Edit ▸ Undo 撤销。Pro 功能。")));
+                "Applies every safe, deterministic fix in one batch (import settings and the like), with a preview first. Commit to version control before you run it — Edit ▸ Undo does not revert these. Pro.",
+                "一次性应用全部安全的确定性修复（导入设置等），先预览。运行前请先提交版本控制——Edit ▸ Undo 撤销不了。Pro 功能。")));
             scroll.Add(ToolRow(L.Tr("Export CSV / Export Report", "Export CSV / Export Report"), L.Tr(
                 "The raw findings as CSV, or a self-contained shareable HTML health report. Both free, both offline.",
                 "导出原始问题清单 CSV，或自包含、可分享的 HTML 健康报告。都免费、都离线。")));
             scroll.Add(ToolRow(L.Tr("Ignore", "Ignore"), L.Tr(
                 "Exclude paths or whole rules from scans — third-party plugins, generated content, rules you've decided against.",
                 "把某些路径或整条规则排除出扫描——第三方插件、生成内容、你已决定不改的规则。")));
+            // Listed here in the order the toolbar actually lays them out — Autopilot sits between Ignore and Runtime.
+            scroll.Add(ToolRow(L.Tr("Autopilot", "Autopilot"), L.Tr(
+                "Opens the guided loop described above. The same findings, ranked into one next step, with the before/after measurement that says whether it worked. The header's \"What should I do? →\" goes to the same place.",
+                "打开上面那套引导流程。同一批问题，收敛成一个「下一步」，并用前后测量说明它到底有没有用。面板顶部的「该做什么？ →」通向同一处。")));
             scroll.Add(ToolRow(L.Tr("Runtime", "Runtime"), L.Tr(
                 "Opens the Runtime Profiler. A static scan can't see stutter; that panel measures it while your game runs.",
                 "打开运行时分析面板。静态扫描看不见卡顿，那个面板在游戏运行时实测。")));
@@ -109,13 +143,13 @@ namespace PerfLint.UI
                 "Your license state. Click to activate a key or manage the machine's activation.",
                 "许可证状态。点击可激活 key 或管理本机激活。")));
 
-            // ── 4. Privacy — the trust anchor, stated before anything is clicked ──
+            // ── 5. Privacy — the trust anchor, stated before anything is clicked ──
             scroll.Add(Header(L.Tr("Your project stays on your machine", "你的工程不会离开本机")));
             scroll.Add(Body(L.Tr(
                 "Scanning is entirely local — your code and art assets are never uploaded, and no account is needed to scan. The only thing that ever leaves your machine is the finding text or the single snippet you pick when you use Explain / AI Fix, and you're told what's being sent each time. Zero telemetry.",
                 "扫描全程本地——代码与美术资产永不上传，扫描也无需注册账号。唯一会离开本机的，是你主动使用 Explain / AI Fix 时的那条问题描述或你选中的那段代码，且每次都会告知发送内容。零遥测。")));
 
-            // ── 5. Free vs Pro (no prices in-plugin: the landing page is the single source of truth) ──
+            // ── 6. Free vs Pro (no prices in-plugin: the landing page is the single source of truth) ──
             scroll.Add(Header(L.Tr("Free and Pro", "Free 与 Pro")));
             scroll.Add(Bullet(DotFree, L.Tr("Free, forever", "免费，永久"), L.Tr(
                 "The full scan, every finding, the health score, the shareable HTML report, written fix guidance, and a daily allowance of AI Fix / Explain.",
@@ -130,37 +164,37 @@ namespace PerfLint.UI
                 style = { flexDirection = FlexDirection.Row, marginTop = 10, flexShrink = 0 }
             };
 
-            var open = new Button(() => { PerfLintWindow.OpenWindow(); Close(); })
-            {
-                text = L.Tr("Open PerfLint", "打开 PerfLint")
-            };
-            open.style.height = 28;
+            // The one thing to do on this screen, in the product's primary. It used to be an accent blue picked to
+            // match the Scan button, which was itself a blue picked here — two windows agreeing with each other and
+            // with nothing else. Both now wear pl-primary, which is also the only way they get a hover at all.
+            var open = PerfLintStyle.Primary(L.Tr("Open PerfLint", "打开 PerfLint"),
+                () => { PerfLintWindow.OpenWindow(); Close(); });
             open.style.flexGrow = 1;
-            open.style.backgroundColor = new Color(0.20f, 0.45f, 0.85f); // same accent as the panel's primary Scan button
-            open.style.color = Color.white;
-            open.style.unityFontStyleAndWeight = FontStyle.Bold;
             footer.Add(open);
 
-            var docs = new Button(() => Application.OpenURL(DocsUrl)) { text = L.Tr("Docs", "文档") };
-            docs.style.height = 28;
+            var docs = PerfLintStyle.Secondary(L.Tr("Docs", "文档"), () => Application.OpenURL(DocsUrl));
             docs.style.marginLeft = 6;
             footer.Add(docs);
 
             root.Add(footer);
         }
 
-        // ── small UI helpers (same shape as PerfLintCliHelpWindow) ──
+        // ── small UI helpers (same type scale as the Autopilot) ──
+        //
+        // Three tints rather than three opacities. Opacity fades a label towards whatever is behind it, which on a
+        // light skin means fading white text towards a white page; the palette states the colour it should be on
+        // each skin instead.
         static Label Title(string t) => new Label(t)
-        { style = { unityFontStyleAndWeight = FontStyle.Bold, fontSize = 16, marginBottom = 6, whiteSpace = WhiteSpace.Normal } };
+        { style = { unityFontStyleAndWeight = FontStyle.Bold, fontSize = 16, marginBottom = 6, whiteSpace = WhiteSpace.Normal, color = PerfLintStyle.Ink } };
 
         static Label Header(string t) => new Label(t)
-        { style = { unityFontStyleAndWeight = FontStyle.Bold, marginTop = 14, marginBottom = 6, whiteSpace = WhiteSpace.Normal } };
+        { style = { unityFontStyleAndWeight = FontStyle.Bold, marginTop = 14, marginBottom = 6, whiteSpace = WhiteSpace.Normal, color = PerfLintStyle.Ink } };
 
         static Label Body(string t) => new Label(t)
-        { style = { whiteSpace = WhiteSpace.Normal, marginBottom = 6, opacity = 0.9f } };
+        { style = { whiteSpace = WhiteSpace.Normal, marginBottom = 6, color = PerfLintStyle.Dim } };
 
         static Label Hint(string t) => new Label(t)
-        { style = { whiteSpace = WhiteSpace.Normal, unityFontStyleAndWeight = FontStyle.Italic, opacity = 0.6f, fontSize = 10, marginTop = 4 } };
+        { style = { whiteSpace = WhiteSpace.Normal, unityFontStyleAndWeight = FontStyle.Italic, fontSize = 10, marginTop = 4, color = PerfLintStyle.Dimmer } };
 
         /// <summary>Menu path + optional shortcut chip on one line, with the "what it's for" line under it.</summary>
         static VisualElement MenuRow(string menuPath, string shortcut, string desc)
@@ -170,40 +204,33 @@ namespace PerfLint.UI
             var top = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, flexWrap = Wrap.Wrap } };
             top.Add(new Label(menuPath)
             {
-                style = { unityFontStyleAndWeight = FontStyle.Bold, whiteSpace = WhiteSpace.Normal, flexShrink = 1 }
+                style = { unityFontStyleAndWeight = FontStyle.Bold, whiteSpace = WhiteSpace.Normal, flexShrink = 1,
+                          color = PerfLintStyle.Ink }
             });
-            if (!string.IsNullOrEmpty(shortcut)) top.Add(Chip(shortcut));
+            if (!string.IsNullOrEmpty(shortcut)) top.Add(PerfLintStyle.Chip(shortcut));
             box.Add(top);
 
-            box.Add(new Label(desc) { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.7f, fontSize = 11, marginTop = 1 } });
+            box.Add(new Label(desc) { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 1, color = PerfLintStyle.Dimmer } });
             return box;
         }
 
-        /// <summary>Keyboard-shortcut pill.</summary>
-        static Label Chip(string t)
-        {
-            var l = new Label(t)
-            {
-                style =
-                {
-                    fontSize = 10, marginLeft = 8,
-                    paddingLeft = 6, paddingRight = 6, paddingTop = 1, paddingBottom = 1,
-                    backgroundColor = new Color(1f, 1f, 1f, 0.07f),
-                    borderTopLeftRadius = 4, borderTopRightRadius = 4,
-                    borderBottomLeftRadius = 4, borderBottomRightRadius = 4,
-                    opacity = 0.8f, flexShrink = 0
-                }
-            };
-            return l;
-        }
+        // Bullet colors, one per section. Drawn, not typed — see Bullet(). Two of the six are states the rest of the
+        // product already has a colour for (free = the good green, Pro = the amber it marks a caveat with), so they
+        // take it rather than a second opinion of it; the four domain hues are this window's own and are stated per
+        // skin, because a pastel picked on a dark editor has almost no contrast on a white page.
+        // Properties, not static readonly fields: a field initialiser reads the skin once when the type is first
+        // touched and keeps that answer for the rest of the domain, so a theme switch would leave four dots wrong.
+        static Color DotPerformance => PerfLintStyle.Pro ? new Color(0.30f, 0.60f, 0.95f) : new Color(0.10f, 0.38f, 0.78f);
+        static Color DotAssets => PerfLintStyle.Pro ? new Color(0.65f, 0.50f, 0.90f) : new Color(0.44f, 0.28f, 0.72f);
+        static Color DotMigration => PerfLintStyle.Pro ? new Color(0.95f, 0.70f, 0.30f) : new Color(0.66f, 0.44f, 0.05f);
+        static Color DotSettings => PerfLintStyle.Pro ? new Color(0.45f, 0.75f, 0.70f) : new Color(0.14f, 0.47f, 0.43f);
+        static Color DotFree => PerfLintStyle.Good;
+        static Color DotPro => PerfLintStyle.Amber;
 
-        // Bullet colors, one per section. Drawn, not typed — see Bullet().
-        static readonly Color DotPerformance = new Color(0.30f, 0.60f, 0.95f);
-        static readonly Color DotAssets = new Color(0.65f, 0.50f, 0.90f);
-        static readonly Color DotMigration = new Color(0.95f, 0.70f, 0.30f);
-        static readonly Color DotSettings = new Color(0.45f, 0.75f, 0.70f);
-        static readonly Color DotFree = new Color(0.40f, 0.80f, 0.45f); // the green the main panel's Pro pill uses
-        static readonly Color DotPro = new Color(0.95f, 0.75f, 0.25f);
+        // One colour for all three Autopilot screens, and deliberately so: the four above are CATEGORIES and have to
+        // be told apart, while these are STEPS in one loop. Three different hues would say they are three kinds of
+        // thing. The order is carried by the numbers, which are the ones its own tab strip shows.
+        static Color DotStep => PerfLintStyle.Accent;
 
         /// <summary>
         /// Colored dot + bold lead-in + wrapped description, laid out as a hanging indent.
@@ -230,8 +257,8 @@ namespace PerfLint.UI
             });
 
             var col = new VisualElement { style = { flexGrow = 1, flexShrink = 1, minWidth = 0 } };
-            col.Add(new Label(name) { style = { unityFontStyleAndWeight = FontStyle.Bold, whiteSpace = WhiteSpace.Normal } });
-            col.Add(new Label(desc) { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.75f, fontSize = 11, marginTop = 1 } });
+            col.Add(new Label(name) { style = { unityFontStyleAndWeight = FontStyle.Bold, whiteSpace = WhiteSpace.Normal, color = PerfLintStyle.Ink } });
+            col.Add(new Label(desc) { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 1, color = PerfLintStyle.Dimmer } });
             row.Add(col);
             return row;
         }
@@ -240,8 +267,8 @@ namespace PerfLint.UI
         static VisualElement ToolRow(string button, string desc)
         {
             var box = new VisualElement { style = { marginBottom = 6 } };
-            box.Add(new Label(button) { style = { unityFontStyleAndWeight = FontStyle.Bold, fontSize = 11, whiteSpace = WhiteSpace.Normal } });
-            box.Add(new Label(desc) { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.75f, fontSize = 11, marginTop = 1 } });
+            box.Add(new Label(button) { style = { unityFontStyleAndWeight = FontStyle.Bold, fontSize = 11, whiteSpace = WhiteSpace.Normal, color = PerfLintStyle.Ink } });
+            box.Add(new Label(desc) { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 1, color = PerfLintStyle.Dimmer } });
             return box;
         }
     }
@@ -276,7 +303,11 @@ namespace PerfLint.UI
         // Machine-global (EditorPrefs), storing the guide version the user has seen. Bump GuideVersion only when
         // the content changes enough to be worth re-showing to everyone — a casual bump re-nags every user.
         private const string SeenKey = "PerfLint.Welcome.SeenVersion";
-        private const string GuideVersion = "1";
+
+        // 2 — the guide gained the Autopilot, which by then was the menu's first item and the panel's own answer to
+        // "what should I do", and was not mentioned anywhere in here. That is the bar this constant is meant to have:
+        // someone who read version 1 came away not knowing the product's front door exists.
+        private const string GuideVersion = "2";
 
         /// <summary>
         /// Pure decision (unit-tested): the whole "should the popup happen" policy, with no editor state involved.

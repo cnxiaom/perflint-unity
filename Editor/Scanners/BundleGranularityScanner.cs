@@ -91,6 +91,43 @@ namespace PerfLint.Scanners
             return false;
         }
 
+        /// <summary>Why an Addressables group entry cannot be packed. Mirrors Addressables' own build-time check.</summary>
+        public enum EntryProblem
+        {
+            None = 0,
+            /// <summary>The asset has no usable main type — a failed/absent import. Addressables sees DefaultAsset.</summary>
+            UnrecognizedAsset,
+            /// <summary>The address contains '[' and ']', which Addressables rejects outright (bundle naming).</summary>
+            BracketInAddress
+        }
+
+        /// <summary>
+        /// Pure mirror of <c>BuildScriptPackedMode.ThrowExceptionIfInvalidFiletypeOrAddress</c> (Addressables 1.16–1.22):
+        /// an entry with brackets in its address, or whose asset resolves to no main type and is not a folder, makes the
+        /// packed build throw. The SAME code path backs every official Analyze rule, which is why one such entry silently
+        /// removed ASSET.AADUP001 / ASSET.AARES001 from the report entirely (see AddressableAnalyzeGuard).
+        /// Kept in the main assembly so it is unit-testable in batchmode, where the Addressables package is absent —
+        /// same precedent as <see cref="TryParseDupeResult"/>.
+        ///
+        /// <paramref name="hasUsableMainType"/> must be false for BOTH "no type at all" and "the type is
+        /// <c>DefaultAsset</c>". Unity does not report a failed import as a missing type — it reports
+        /// <c>typeof(DefaultAsset)</c>, which is precisely what DefaultAsset means: a file the editor knows about and
+        /// has no importer for. Addressables' own `MainAssetType` only falls back to DefaultAsset when the lookup
+        /// returns null, so its single `== typeof(DefaultAsset)` test covers both; a null-only test covers the rarer
+        /// half and misses every ordinary unimportable file. Caught in the field: the rule stayed silent on the exact
+        /// .png that was aborting the duplicate analysis two rules over.
+        /// </summary>
+        public static EntryProblem ClassifyEntry(string address, bool hasGuid, bool hasUsableMainType, bool isFolder)
+        {
+            // Bracket check runs first and is NOT suppressed by IgnoreUnsupportedFilesInBuild — it throws either way.
+            if (hasGuid && !string.IsNullOrEmpty(address) && address.IndexOf('[') >= 0 && address.IndexOf(']') >= 0)
+                return EntryProblem.BracketInAddress;
+            // Folders legitimately have no main asset type; only non-folder entries are a problem.
+            if (!hasUsableMainType && !isFolder)
+                return EntryProblem.UnrecognizedAsset;
+            return EntryProblem.None;
+        }
+
         public sealed class GranularityStats
         {
             public int Total;

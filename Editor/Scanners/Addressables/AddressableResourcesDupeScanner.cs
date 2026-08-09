@@ -47,49 +47,70 @@ namespace PerfLint.Scanners
 
             // Aggregate asset path → number of duplicate rows (≈ how many bundles carry an extra copy).
             var rowsPerAsset = new Dictionary<string, int>();
-            bool failed = false;
+            string failure = null;
             var rule = new CheckResourcesDupeDependencies();
             try
             {
-                var results = rule.RefreshAnalysis(settings);
-                context.ReportProgress(Name, 0.85f);
-                if (results != null)
+                // Same abort-on-one-bad-asset exposure as AADUP001 — both rules walk PrepGroupBundlePacking.
+                using (new AddressableAnalyzeGuard(settings))
                 {
-                    foreach (var r in results)
+                    var results = rule.RefreshAnalysis(settings);
+                    context.ReportProgress(Name, 0.85f);
+                    if (results != null)
                     {
-                        if (r == null) continue;
-                        if (!BundlePacking.TryExtractAssetPath(r.resultName, out string assetPath)) continue;
-                        // Only Resources-resident assets are this rule's subject; be defensive about row shapes.
-                        if (assetPath.IndexOf("/Resources/", StringComparison.OrdinalIgnoreCase) < 0) continue;
-                        rowsPerAsset.TryGetValue(assetPath, out int n);
-                        rowsPerAsset[assetPath] = n + 1;
+                        foreach (var r in results)
+                        {
+                            if (r == null) continue;
+                            if (!BundlePacking.TryExtractAssetPath(r.resultName, out string assetPath)) continue;
+                            // Only Resources-resident assets are this rule's subject; be defensive about row shapes.
+                            if (assetPath.IndexOf("/Resources/", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                            rowsPerAsset.TryGetValue(assetPath, out int n);
+                            rowsPerAsset[assetPath] = n + 1;
+                        }
                     }
                 }
             }
             catch (Exception e)
             {
                 Debug.LogWarning("[PerfLint] " + L.Tr($"Resources↔Addressables duplicate analysis failed (rule skipped): {e}", $"Resources↔Addressables 重复分析失败（已跳过该规则）：{e}"));
-                failed = true;
+                failure = e.Message;
             }
             finally
             {
                 try { rule.ClearAnalysis(); } catch { /* cleanup best-effort */ }
             }
 
-            if (failed || rowsPerAsset.Count == 0) yield break;
+            if (failure != null)
+            {
+                yield return AddressableAnalyzeFailure.Describe(
+                    "ASSET.AARES001", L.Tr("Resources ↔ Addressables duplication", "Resources↔Addressables 重复"), failure);
+                yield break;
+            }
 
-            // Sort by REAL waste: max(in-memory estimate, source file size) × duplicate rows. Max() matters for
-            // composite assets — a TMP FontAsset's main object measures ~496 B in memory while its source file is
-            // 65.8 MB (the atlas lives in sub-assets), and mem-first sorting buried the single biggest offender at
-            // the bottom of the list. Weighting by rows ranks "65MB × 74 copies" above "11MB × 57".
-            var entries = rowsPerAsset
-                .Select(kv => new
-                {
-                    Path = kv.Key,
-                    Rows = kv.Value,
-                    Size = ScannerUtil.FileSizeBytes(kv.Key),
-                    Mem = ScannerUtil.StorageMemoryBytes(kv.Key)
-                })
+            if (rowsPerAsset.Count == 0) yield break;
+
+            // Sort by REAL waste: max(in-memory estimate, source file size) × duplicate rows. Weighting by rows
+            // ranks "65MB × 74 copies" above "11MB × 57".
+            //
+            // The memory figure now comes from ScannerUtil.AssetMemoryBytes, which walks sub-assets and gauges each
+            // by type. The previous reading was main-object-only, which for exactly the assets this rule is about
+            // was not a small error: a TMP FontAsset's main object measures ~496 B while its atlas lives in a
+            // sub-asset, and a model's main object is a GameObject while its meshes are sub-assets (one measured
+            // 272 B against 51.5 MB). Max() with the file size kept the ranking honest despite that, and is kept
+            // because the two gauges still legitimately disagree — a font asset can be larger on disk than in memory.
+            //
+            // Loading every sub-object of every duplicate costs graphics memory in a scan that never yields a frame,
+            // so each asset goes through ThrottleReclaim (see ScannerUtil).
+            var measured = new List<(string Path, int Rows, long Size, long Mem)>(rowsPerAsset.Count);
+            int loadsSinceReclaim = 0;
+            foreach (var kv in rowsPerAsset)
+            {
+                context.CancellationToken.ThrowIfCancellationRequested();
+                measured.Add((kv.Key, kv.Value, ScannerUtil.FileSizeBytes(kv.Key), ScannerUtil.AssetMemoryBytes(kv.Key)));
+                loadsSinceReclaim = ScannerUtil.ThrottleReclaim(loadsSinceReclaim);
+            }
+
+            var entries = measured
                 .OrderByDescending(e => Math.Max(e.Mem, e.Size) * e.Rows)
                 .ThenBy(e => e.Path, StringComparer.Ordinal)
                 .ToList();

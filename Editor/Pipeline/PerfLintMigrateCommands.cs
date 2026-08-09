@@ -179,8 +179,7 @@ namespace PerfLint.Ci.Pipeline
                 return;
             }
 
-            int lines = MigrateService.FileLineCount(resolved.FilePath);
-            if (lines > recipe.MaxLines)
+            if (MigrateService.ExceedsLineCap(recipe, resolved.FilePath, out int lines))
             {
                 done(Envelope("too_large",
                     $"{resolved.FilePath} is {lines} lines; whole-file migration is capped at {recipe.MaxLines} because the entire "

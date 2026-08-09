@@ -90,15 +90,31 @@ namespace PerfLint.Runtime
         /// <summary>The biggest group of identical runtime RenderTextures alive at once (leak-suspect), or null. For RUN.MEM005.</summary>
         public RtLeakGroup SuspectRtLeak { get; }
 
+        /// <summary>
+        /// Resolution the rendering path was allocating its targets against when this was captured — in the Editor,
+        /// the Game view's size.
+        ///
+        /// Recorded because it is the difference between a figure and a misleading figure. The camera, depth and TAA
+        /// targets in <see cref="TopMemoryAssets"/> are sized from it, so on a 4K Game view they measure tens of MB
+        /// each — seen live: three targets at 3840x2160 totalling 126 MB, listed as the project's largest graphics
+        /// assets. They are genuinely the game's rendering cost, unlike the editor's own buffers, but their SIZE is
+        /// the editor window's, and a reader has no way to know that from the list alone. 0 when unknown.
+        /// </summary>
+        public int RenderWidth { get; }
+        public int RenderHeight { get; }
+
         private SceneBatchingSnapshot(
             bool hasData, bool isSrp, int rendererCount, int uniqueMaterialCount,
             int instancedRendererCount, IReadOnlyList<GameObject> instancedExamples,
             IReadOnlyList<MeshTriangleStat> topTriangleMeshes, long totalSceneTriangles,
             IReadOnlyList<IReadOnlyList<GameObject>> topMeshExamplesByRank,
             IReadOnlyList<AssetMemStat> topMemoryAssets,
-            RtLeakGroup suspectRtLeak)
+            RtLeakGroup suspectRtLeak,
+            int renderWidth = 0, int renderHeight = 0)
         {
             SuspectRtLeak = suspectRtLeak;
+            RenderWidth = renderWidth;
+            RenderHeight = renderHeight;
             HasData = hasData;
             IsSrp = isSrp;
             RendererCount = rendererCount;
@@ -119,8 +135,9 @@ namespace PerfLint.Runtime
         internal static SceneBatchingSnapshot ForTests(bool isSrp, int rendererCount, int uniqueMaterialCount, int instancedRendererCount,
             IReadOnlyList<MeshTriangleStat> topTriangleMeshes = null, long totalSceneTriangles = 0,
             IReadOnlyList<AssetMemStat> topMemoryAssets = null, RtLeakGroup suspectRtLeak = null,
-            IReadOnlyList<IReadOnlyList<GameObject>> topMeshExamplesByRank = null) =>
-            new SceneBatchingSnapshot(true, isSrp, rendererCount, uniqueMaterialCount, instancedRendererCount, null, topTriangleMeshes, totalSceneTriangles, topMeshExamplesByRank, topMemoryAssets, suspectRtLeak);
+            IReadOnlyList<IReadOnlyList<GameObject>> topMeshExamplesByRank = null,
+            int renderWidth = 0, int renderHeight = 0) =>
+            new SceneBatchingSnapshot(true, isSrp, rendererCount, uniqueMaterialCount, instancedRendererCount, null, topTriangleMeshes, totalSceneTriangles, topMeshExamplesByRank, topMemoryAssets, suspectRtLeak, renderWidth, renderHeight);
 
         /// <summary>True when rank <paramref name="rank"/> (parallel to <see cref="TopTriangleMeshes"/>) has at least one GameObject to Locate.</summary>
         public bool HasMeshExamples(int rank) =>
@@ -231,7 +248,11 @@ namespace PerfLint.Runtime
                 totalSceneTriangles: totalSceneTris,
                 topMeshExamplesByRank: topMeshExamplesByRank,
                 topMemoryAssets: CaptureTopMemoryAssets(),
-                suspectRtLeak: CaptureRtLeak());
+                suspectRtLeak: CaptureRtLeak(),
+                // In Play Mode this is the Game view's size, which is exactly what the camera/depth/TAA targets are
+                // allocated from — so it is the number that explains why they measure what they measure.
+                renderWidth: Screen.width,
+                renderHeight: Screen.height);
         }
 
         /// <summary>
@@ -321,6 +342,14 @@ namespace PerfLint.Runtime
             if (string.IsNullOrEmpty(name)) return false;
             return name.IndexOf("GUIView", System.StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("GameView", System.StringComparison.OrdinalIgnoreCase) >= 0
+                // The Profiler's own capture buffers. Seen live at the TOP of the list — "ProfilerScreenshotFull
+                // 94.9 MB" reported as the project's biggest graphics asset, when it is the cost of the window the
+                // user was reading the finding in. The comment below already predicted "an occasional
+                // editor-internal asset may still slip through"; this was the one, and it slipped through first.
+                || name.IndexOf("Profiler", System.StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("FrameDebugger", System.StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("Inspector", System.StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("Preview", System.StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("SceneView", System.StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("Scene RenderTexture", System.StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("Gizmo", System.StringComparison.OrdinalIgnoreCase) >= 0
@@ -359,6 +388,24 @@ namespace PerfLint.Runtime
         }
 
         /// <summary>Selects the GameObjects using the mesh at <paramref name="rank"/> (0 = heaviest), filtering out already-destroyed ones. Intended for RUN.GPU002's per-mesh Locate — each rank reveals its own group.</summary>
+        /// <summary>
+        /// Scene-hierarchy paths of the examples for one mesh rank, so the selection survives being written to disk.
+        ///
+        /// <see cref="SelectMeshExamples"/> holds live GameObject references, which die with the domain — that is
+        /// why a restored measurement could name the heaviest meshes and not take you to any of them.
+        /// </summary>
+        public List<string> MeshExamplePaths(int rank)
+        {
+            var paths = new List<string>();
+            if (!HasMeshExamples(rank)) return paths;
+            foreach (var go in TopMeshExamplesByRank[rank])
+            {
+                string p = PerfLint.Scanners.ScannerUtil.HierarchyPath(go);
+                if (!string.IsNullOrEmpty(p)) paths.Add(p);
+            }
+            return paths;
+        }
+
         public void SelectMeshExamples(int rank)
         {
             if (!HasMeshExamples(rank)) return;

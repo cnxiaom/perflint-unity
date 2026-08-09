@@ -147,8 +147,21 @@ namespace PerfLint.Core
             ignoreExempt = f.IgnoreExempt,
             memSavings = f.EstimatedMemorySavingsBytes,
             buildSavings = f.EstimatedBuildSavingsBytes,
-            savingsCeiling = f.SavingsAreCeiling
+            savingsCeiling = f.SavingsAreCeiling,
+            locateLabels = AssetTargets(f).Select(t => t.Label).ToArray(),
+            locateDetails = AssetTargets(f).Select(t => t.Detail ?? "").ToArray(),
+            locatePaths = AssetTargets(f).Select(t => t.AssetPath).ToArray()
         };
+
+        /// <summary>
+        /// The Locate rows worth persisting: those naming an asset, so the Ping can be rebuilt from the path after
+        /// the closure that created it is gone. Scene-object targets are dropped — their objects do not exist until
+        /// a scene is loaded, and the runtime session store already handles that case via ObjectPaths.
+        /// </summary>
+        private static List<Finding.LocateTarget> AssetTargets(Finding f)
+            => f.LocateTargets == null
+                ? new List<Finding.LocateTarget>()
+                : f.LocateTargets.Where(t => !string.IsNullOrEmpty(t.AssetPath)).ToList();
 
         private static Finding FromDto(FindingDto d)
         {
@@ -170,6 +183,25 @@ namespace PerfLint.Core
             {
                 string tp = d.targetPath;
                 ping = () => ScannerUtil.PingAsset(tp);
+            }
+
+            // Locate rows come back as live buttons: the label and second line were stored, and the Ping is rebuilt
+            // from the asset path. Without this a restored finding kept its text and silently lost every button.
+            List<Finding.LocateTarget> locateTargets = null;
+            if (d.locatePaths != null && d.locatePaths.Length > 0)
+            {
+                locateTargets = new List<Finding.LocateTarget>(d.locatePaths.Length);
+                for (int i = 0; i < d.locatePaths.Length; i++)
+                {
+                    string ap = d.locatePaths[i];
+                    if (string.IsNullOrEmpty(ap)) continue;
+                    string label = d.locateLabels != null && i < d.locateLabels.Length ? d.locateLabels[i] : ap;
+                    string sub = d.locateDetails != null && i < d.locateDetails.Length ? d.locateDetails[i] : null;
+                    locateTargets.Add(new Finding.LocateTarget(
+                        label, () => ScannerUtil.PingAsset(ap),
+                        detail: string.IsNullOrEmpty(sub) ? null : sub, assetPath: ap));
+                }
+                if (locateTargets.Count == 0) locateTargets = null;
             }
 
             return new Finding(
@@ -201,7 +233,8 @@ namespace PerfLint.Core
                 // after a domain reload (missing fields in an old file deserialize as 0 = "no estimate").
                 estimatedMemorySavingsBytes: d.memSavings,
                 estimatedBuildSavingsBytes: d.buildSavings,
-                savingsAreCeiling: d.savingsCeiling);
+                savingsAreCeiling: d.savingsCeiling,
+                locateTargets: locateTargets);
         }
 
         private static bool LooksLikeAssetPath(string p) =>
@@ -212,12 +245,10 @@ namespace PerfLint.Core
         private static bool TryParsePathLine(string s, out string path, out int line)
         {
             path = null; line = 0;
+            // Delegated: this was the only copy of the convention for a while, and the runtime session store's lack
+            // of one is what made the same "X.cs:42" target work in the static report and not in the runtime one.
             if (!LooksLikeAssetPath(s)) return false;
-            int colon = s.LastIndexOf(':');
-            if (colon <= 0 || colon == s.Length - 1) return false;
-            if (!int.TryParse(s.Substring(colon + 1), out line) || line <= 0) return false;
-            path = s.Substring(0, colon);
-            return path.EndsWith(".cs", StringComparison.Ordinal);
+            return ScannerUtil.TryParsePathLine(s, out path, out line);
         }
 
         // ── JsonUtility DTOs (supports only public fields / arrays / nested serializable classes; no Dictionary support) ──
@@ -250,6 +281,12 @@ namespace PerfLint.Core
             public long memSavings;
             public long buildSavings;
             public bool savingsCeiling;
+            // Per-target Locate rows, as three parallel arrays: JsonUtility will not serialize a list of structs
+            // holding a delegate, and the delegate is exactly the part that cannot survive anyway. Only targets
+            // naming an asset are kept — those are the ones whose Ping can be rebuilt from the path alone.
+            public string[] locateLabels;
+            public string[] locateDetails;
+            public string[] locatePaths;
         }
 
         [Serializable]

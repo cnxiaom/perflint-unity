@@ -16,8 +16,9 @@ namespace PerfLint.Core
     ///   · window open  → hand off to the window's live incremental refresh (keeps Fix instances, re-renders);
     ///   · window closed→ update the on-disk baseline directly (RescanFile the changed files, save).
     /// If we instead overwrote the store from a loaded (Fix-less) baseline while the window was open, the window would
-    /// lose its one-click fixes on reload. The window registers <see cref="WindowRefresh"/> while open to signal both
-    /// "a window is open" and "how to refresh it".
+    /// lose its one-click fixes on reload. The window registers <see cref="WindowRefresh"/> while open, and that hook
+    /// answers whether it TOOK the work — being open is not the same as owning a live result, and reading the one as
+    /// the other left the store stale whenever the panel sat in a hidden tab.
     /// </summary>
     [InitializeOnLoad]
     public static class PerfLintAutoRescan
@@ -26,7 +27,24 @@ namespace PerfLint.Core
         /// Set by the open window to its live incremental-refresh method (cleared to null on close). Non-null ⇒ a window
         /// is open and owns the live result; the background pump defers to it instead of touching the persisted store.
         /// </summary>
-        public static Action WindowRefresh;
+        /// <summary>
+        /// Returns whether the window actually TOOK the work, not merely that a window exists.
+        ///
+        /// It used to be an Action, and "registered" was read as "handled". Registration happens in OnEnable, which
+        /// runs after a domain reload whatever tab the user is on; the window's live result and its visual tree only
+        /// exist after CreateGUI, which waits until the tab is SHOWN. So a main panel sitting in a hidden tab claimed
+        /// the work, its incremental refresh returned early with nothing to refresh, and the pump had already given
+        /// up its own path — leaving the pending queue undrained and the persisted baseline stale.
+        ///
+        /// Nothing is lost when it declines: the reason the pump defers at all is that overwriting the store from a
+        /// Fix-less on-disk baseline would cost the window its one-click fixes, and a window with no live result has
+        /// no fixes to lose. That is exactly the case that now falls through.
+        ///
+        /// The stale store is not only a redraw: MCP and the CLI read it whenever PerfLintLiveResult has no live
+        /// provider, which is the same condition. So an agent driving a project whose main panel was open but not
+        /// visible got answers from a baseline that had stopped catching up.
+        /// </summary>
+        public static Func<bool> WindowRefresh;
 
         private static bool _scheduled;
 
@@ -44,16 +62,16 @@ namespace PerfLint.Core
         {
             _scheduled = false;
 
-            // A window is open → it owns the live result (with Fix instances); let it consume pending + re-render.
+            // A window that OWNS the live result (with Fix instances) takes it; one that merely exists does not.
             var windowRefresh = WindowRefresh;
             if (windowRefresh != null)
             {
-                try { windowRefresh(); }
+                try { if (windowRefresh()) return; }
                 catch (Exception ex) { Debug.LogWarning("[PerfLint] " + L.Tr($"Incremental window refresh failed: {ex.Message}", $"增量刷新窗口失败：{ex.Message}")); }
-                return;
             }
 
-            // No window open → update the persisted baseline directly so it stays live for the next open.
+            // Nobody took it → update the persisted baseline directly so it stays live for the next open, and for
+            // the agent reading it right now.
             if (!ScanResultStore.Exists()) { PerfLintPendingRescan.Consume(); return; } // no baseline to update → drop the queue
             var restored = ScanResultStore.Load();
             if (restored?.Result == null) return;

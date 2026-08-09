@@ -61,41 +61,52 @@ namespace PerfLint.Scanners
             //    call; yield is not allowed inside an iterator catch block, so we set a failed flag and handle it outside.
             var assetToGroups = new Dictionary<string, HashSet<string>>();
             var assetToBundles = new Dictionary<string, HashSet<string>>();
-            bool failed = false;
+            string failure = null;
             var rule = new CheckBundleDupeDependencies();
             try
             {
-                var results = rule.RefreshAnalysis(settings);
-                context.ReportProgress(Name, 0.85f);
-                if (results != null)
+                // One unimportable asset anywhere in any build-included group makes RefreshAnalysis throw and takes
+                // this entire rule down with it — see AddressableAnalyzeGuard for the mechanism and the real case.
+                using (new AddressableAnalyzeGuard(settings))
                 {
-                    foreach (var r in results)
+                    var results = rule.RefreshAnalysis(settings);
+                    context.ReportProgress(Name, 0.85f);
+                    if (results != null)
                     {
-                        if (r == null) continue;
-                        if (!BundlePacking.TryParseDupeResult(r.resultName, out string group, out string bundleFile, out string assetPath)) continue;
-                        if (!assetToGroups.TryGetValue(assetPath, out var gset))
+                        foreach (var r in results)
                         {
-                            gset = new HashSet<string>();
-                            assetToGroups[assetPath] = gset;
-                            assetToBundles[assetPath] = new HashSet<string>();
+                            if (r == null) continue;
+                            if (!BundlePacking.TryParseDupeResult(r.resultName, out string group, out string bundleFile, out string assetPath)) continue;
+                            if (!assetToGroups.TryGetValue(assetPath, out var gset))
+                            {
+                                gset = new HashSet<string>();
+                                assetToGroups[assetPath] = gset;
+                                assetToBundles[assetPath] = new HashSet<string>();
+                            }
+                            gset.Add(group);
+                            // Bundle identity = group + file; fall back to the group when the row carries no file segment.
+                            assetToBundles[assetPath].Add(bundleFile != null ? group + "/" + bundleFile : group);
                         }
-                        gset.Add(group);
-                        // Bundle identity = group + file; fall back to the group when the row carries no file segment.
-                        assetToBundles[assetPath].Add(bundleFile != null ? group + "/" + bundleFile : group);
                     }
                 }
             }
             catch (Exception e)
             {
                 Debug.LogWarning("[PerfLint] " + L.Tr($"Addressables duplicate analysis failed (rule skipped): {e}", $"Addressables 重复分析失败（已跳过该规则）：{e}"));
-                failed = true;
+                failure = e.Message;
             }
             finally
             {
                 try { rule.ClearAnalysis(); } catch { /* cleanup failure does not affect results */ }
             }
 
-            if (failed) yield break;
+            // Report the blind spot instead of vanishing: an empty rule is indistinguishable from a clean project.
+            if (failure != null)
+            {
+                yield return AddressableAnalyzeFailure.Describe(
+                    "ASSET.AADUP001", L.Tr("Addressables duplicate packing", "Addressables 重复打包"), failure);
+                yield break;
+            }
 
             // 2) Packed into ≥2 distinct BUNDLES = duplicate. Counting bundles (not groups) is load-bearing: a
             //    per-scene-bundle group bakes one copy into EACH scene bundle, so an asset duplicated 74× can have
@@ -184,6 +195,9 @@ namespace PerfLint.Scanners
                             PerfLintWarnings.Irreversible +
                             L.Tr(" To roll back, use Tools > PerfLint > Revert \"PerfLint Shared\" Extraction.", " 回退请用 Tools > PerfLint > Revert「PerfLint Shared」Extraction 菜单。"),
                         run: () => AddressableSharedGroup.Extract(path),
+                        // Asked before the confirmation: extracting an asset that still has a byte-identical twin
+                        // makes both unmergeable forever, and only the last scan's DUP001 results know that.
+                        preflight: () => AddressableSharedGroup.PreflightForExtract(path),
                         // Rule-level "Extract all" hands the whole path list here: one SaveAssets instead of N, plus a
                         // before/after official-duplicate count so the user sees whether it actually deduplicated.
                         batchRun: paths => AddressableSharedGroup.ExtractMany(paths),

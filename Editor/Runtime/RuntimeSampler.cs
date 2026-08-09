@@ -73,6 +73,10 @@ namespace PerfLint.Runtime
         private double _startTime;
         private int _startFrameIndex;
         private bool _prevProfilerEnabled;
+        private string _startScene;
+        /// <summary>Name of the scene that was active when sampling began — see <see cref="Start"/> for why the end alone is not enough.</summary>
+        public string StartScene => _startScene;
+        private ProfilerMemoryRecordMode _prevMemoryRecordMode; // GC.Alloc callstack recording is switched on for the sample and put back at Stop()
         private int _capturedStartFrame;
         private double _capturedAvgFrameNs;
         private bool _wasDeepProfile;
@@ -80,6 +84,7 @@ namespace PerfLint.Runtime
         private Action _cancelHotspots;
         private List<double> _gpuFrameMs;          // Per-frame GPU times measured by FrameTimingManager (ms); more reliable than the ProfilerRecorder counter
         private FrameTiming[] _frameTimingBuf;     // Reusable buffer for GetLatestTimings (capacity 1, fetches the most recent frame)
+        private int _lastGpuFrameIndex = -1;       // Profiler frame the last GPU timing was recorded for — keeps the GPU series one-sample-per-frame (see CaptureGpuTiming)
 
         // ── Live spike capture (root fix for FPS003 attribution) ──
         // The counter ring buffer (2000 frames) far outlives the Profiler backend's Hierarchy frame retention (only a few hundred frames), so a spike the
@@ -96,6 +101,27 @@ namespace PerfLint.Runtime
         private GcAllocSite _lastGcSite; // top steady-state per-frame GC allocator from the last hotspot merge (RUN.GC001 runtime attribution); null when none dominant
         /// <summary>Top steady-state per-frame GC allocator found by the last BeginHotspots merge (or null). Read by the window right after onComplete.</summary>
         public GcAllocSite LastGcSite => _lastGcSite;
+        private MetricStats _lastGameGc; // per-frame allocation inside PlayerLoop — the game's, not the process's
+
+        /// <summary>
+        /// First frame of the attribution window — the short tail recorded WITH GC.Alloc callstacks, after the
+        /// measured window has closed. -1 when there is none (nothing was sampled, or the mode is unavailable).
+        ///
+        /// The split exists because callstack recording costs +37% of frame time at 2000 allocations per frame, and
+        /// a measurement carrying that cost cannot honestly be compared against one that does not — least of all
+        /// when the user's change is precisely a change in the number of allocations.
+        /// </summary>
+        private int _attributionStartFrame = -1;
+
+        /// <summary>Frames to collect with callstacks on. ~2 seconds at 60 fps: attribution needs to know WHICH method allocates, not with what precision.</summary>
+        private const int AttributionFrames = 120;
+        /// <summary>Editor ticks to wait for those frames before merging anyway. A paused or stalled Play Mode must not hang the merge.</summary>
+        private const int AttributionMaxTicks = 400;
+        /// <summary>Game-side per-frame GC allocation from the last merge (or null). See <see cref="PlayerLoopGcBytes"/> for why this is not the counter.</summary>
+        public MetricStats LastGameGcPerFrame => _lastGameGc;
+        private MetricStats _lastGameFrameTime; // nanoseconds inside PlayerLoop — the game's main-thread work, not the whole editor frame
+        /// <summary>Game-side main-thread time per frame from the last merge, in nanoseconds (or null). See <see cref="PlayerLoopTotalMs"/>.</summary>
+        public MetricStats LastGameFrameTime => _lastGameFrameTime;
         // A detected spike whose Hierarchy isn't replayable yet: the just-ended freeze frame's frame-data commonly lags 1-2 frames behind, so we
         // remember the frame hint + magnitude and retry the snapshot on later ticks until it becomes valid (or scrolls out of the retained window).
         // Detected spikes awaiting capture. A level-gen freeze produces SEVERAL spiking frames (different phases) in quick succession, so we track a small
@@ -192,10 +218,27 @@ namespace PerfLint.Runtime
             _prevProfilerEnabled = ProfilerDriver.enabled;
             ProfilerDriver.enabled = true;
 
+            // GC.Alloc callstack recording is NOT switched on here, and that is the point of the two-window design.
+            //
+            // Recording walks the stack at every allocation, so its cost scales with the NUMBER of allocations. On a
+            // scene doing 4 per frame it is unmeasurable — 11.053 / 11.032 / 10.657 ms across alternating windows,
+            // inside this machine's own drift. On a scene doing 2000 per frame it is +37%: 8.547 / 11.886 / 8.812 ms,
+            // with the two off-windows agreeing to 3%. The first measurement was taken as licence to leave it on for
+            // the whole sample, which was an extrapolation from one allocation rate to all of them.
+            //
+            // Leaving it on would corrupt the very thing a before/after exists to establish. Not merely by inflating
+            // frame time: a user who removes allocations also removes the recorder's per-allocation cost, so the
+            // tool's own overhead shrinks alongside their improvement and is credited to them.
+            //
+            // So the main window measures with recording OFF, and Stop() opens a short second window with it ON,
+            // used for nothing but "which method allocated". See <see cref="BeginAttributionWindow"/>.
+            _prevMemoryRecordMode = ProfilerDriver.memoryRecordMode;
+
             // GPU frame time comes from FrameTimingManager (the same data source as the Profiler "GPU Usage" module), captured once per frame.
             // The "GPU Frame Time" ProfilerRecorder counter is unavailable on most platforms (even when the Profiler can display it),
             // so FrameTimingManager is the primary source and the counter is the fallback.
             _gpuFrameMs = new List<double>(Capacity);
+            _lastGpuFrameIndex = -1;
             if (_frameTimingBuf == null) _frameTimingBuf = new FrameTiming[1];
             FrameTimingManager.CaptureFrameTimings();
 
@@ -205,6 +248,12 @@ namespace PerfLint.Runtime
             _pendingSpikes.Clear();
             _lastGcSite = null;
             EditorApplication.update += EditorFrameTick;
+
+            // The scene the sample STARTED in. A project whose entry scene loads the real one at runtime — Init →
+            // Bootstrap → the actual content — ends the sample somewhere other than where it began, and recording
+            // only the end makes every later visit to the entry scene look like "that measurement was taken
+            // elsewhere". Both ends are the truth; keeping one of them was the bug.
+            _startScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
 
             _startTime = EditorApplication.timeSinceStartup;
             _startFrameIndex = ProfilerDriver.lastFrameIndex;
@@ -226,7 +275,22 @@ namespace PerfLint.Runtime
         {
             try
             {
-                FrameTimingManager.CaptureFrameTimings();
+                FrameTimingManager.CaptureFrameTimings(); // must advance every tick, whether or not we record
+
+                // Record at most once per PROFILER FRAME, not once per editor tick.
+                //
+                // This runs on EditorApplication.update, which is not frame-locked: it can fire several times between
+                // two game frames, or miss frames entirely. Recording unconditionally therefore built a series that
+                // was not per-frame at all — GetLatestTimings returns the same completed frame's timing until a new
+                // one lands, so a fast tick rate duplicated one reading many times over. Observed in the wild: a
+                // 5.2s / 304-frame session produced 2000 GPU samples (more samples than frames, which is impossible
+                // for a per-frame series), and the resulting average read as "GPU idle at 0.2 ms" for a scene
+                // submitting 14M triangles per frame. Everything downstream that compares GPU against CPU frame time
+                // — the GPU-bound / CPU-bound verdict most of all — was drawing conclusions from that.
+                int frame = ProfilerDriver.lastFrameIndex;
+                if (frame >= 0 && frame == _lastGpuFrameIndex) return;
+                _lastGpuFrameIndex = frame;
+
                 uint n = FrameTimingManager.GetLatestTimings(1, _frameTimingBuf);
                 if (n > 0)
                 {
@@ -459,7 +523,9 @@ namespace PerfLint.Runtime
 
             // Release the counters and restore the Profiler state (HierarchyFrameDataView remains usable; no need for the Profiler to keep recording).
             DisposeChannels();
-            ProfilerDriver.enabled = _prevProfilerEnabled;
+            // The Profiler must keep recording: the attribution window opened below runs AFTER this point, during the
+            // merge phase, which the runner deliberately keeps inside Play Mode. It is restored when the merge ends.
+            BeginAttributionWindow();
 
             var categoryCounters = new Dictionary<string, MetricStats>(CategoryCounterNames.Length);
             foreach (var n in CategoryCounterNames) categoryCounters[n] = Stat(n);
@@ -500,10 +566,16 @@ namespace PerfLint.Runtime
             _cancelHotspots?.Invoke();
 
             int first = Math.Max(_capturedStartFrame, ProfilerDriver.firstFrameIndex);
-            int last  = ProfilerDriver.lastFrameIndex;
+            // The measured window ENDS where the attribution window begins: frames recorded with callstacks on cost
+            // up to 37% more, and letting them into the hotspot merge would attribute the recorder's own overhead to
+            // the user's markers.
+            int last = _attributionStartFrame > first
+                ? Math.Min(ProfilerDriver.lastFrameIndex, _attributionStartFrame - 1)
+                : ProfilerDriver.lastFrameIndex;
 
             if (last < first)
             {
+                EndAttributionWindow();
                 // No replayable frames, but spikes may still have been captured live during sampling.
                 onComplete(new List<Hotspot>(), BuildWorstFrames(null), null, true);
                 return;
@@ -511,9 +583,25 @@ namespace PerfLint.Runtime
 
             var acc = new Dictionary<string, double>();
             var peak = new Dictionary<string, PeakPair>();
+            var hits = new Dictionary<string, int>();   // per-marker count of REPRESENTATIVE frames it did main-thread work in → sampled-frame hit rate
             var gpuMsList = new List<double>(); // GPU time per sampled frame (ms, read from columnTotalGpuTime of the HierarchyFrameDataView root node)
             var gcByScript = new Dictionary<string, double>();    // steady-state GC-alloc bytes accumulated per user script (RUN.GC001 runtime attribution)
             var gcMethodByScript = new Dictionary<string, string>();
+            var gcLineByScript = new Dictionary<string, int>();   // exact allocation line — callstack attribution only; the marker path cannot see one
+            // Everything the GC.Alloc samples add up to, and over how many frames — the denominator for how much of
+            // the measured per-frame allocation the attribution actually explains. Measured on urp3dsample: the
+            // "GC Allocated In Frame" counter read 96 KB/frame while the samples in the same frames totalled 2.8 KB,
+            // so a finding that names the largest site without this ratio invites the reader to mistake 3% for the
+            // cause. Why the rest carries no sample is unresolved (EditorLoop's subtree holds none either, and the
+            // editor records no frames at all outside Play Mode, so there is no idle baseline to compare against).
+            double gcSampledBytes = 0;
+            int gcSampledFrames = 0;
+            // Per-frame game-side allocation, uniform frames only — spike frames would drag the median the same way
+            // they are kept out of every other steady-state figure here.
+            var gameGcPerFrame = new List<double>(64);
+            // Same idea, for time: what the GAME's main thread spent, as opposed to the whole editor frame.
+            // Collected from every merged frame (spikes included) — see the comment at the point of collection.
+            var gameFrameMs = new List<double>(64);
             _lastGcSite = null;
             _scriptPathCache.Clear(); // Reset the script-resolution cache each sampling run (avoids stale mappings from scripts added/removed/renamed across sessions)
             int framesSeen        = 0; // Total sampled frames (uniform + spike) — feeds peaks, used for logging
@@ -531,9 +619,11 @@ namespace PerfLint.Runtime
             // + the slowest few frames (to capture hotspots in occasional stutter-spike frames, which uniform sampling might otherwise skip).
             // Key: split uniform frames from spike frames — only uniform frames count toward "per-frame average/share" (steady state); spike frames only feed peaks. Otherwise
             // dividing the self-time of a load/JIT super-frame by a small sample fabricates garbage like "297ms per frame" with a share exceeding 100%.
-            var framesToProcess = SelectFramesForHotspots(first, last, out var uniformFrames);
+            var framesToProcess = SelectFramesForHotspots(first, last, out var uniformFrames, out int baseFrameCount);
             int plannedFrames = framesToProcess.Count;
             int idx = 0;
+            int attributionTicks = 0; // ticks spent waiting for the callstack window to fill; bounded by AttributionMaxTicks
+            long mergeWorkMs = 0; // Merge work actually performed (summed per tick) — NOT wall clock, which is dominated by the waits between ticks.
 
             var mergeWatch = System.Diagnostics.Stopwatch.StartNew();
             _cancelHotspots = () => cancelled = true;
@@ -544,6 +634,7 @@ namespace PerfLint.Runtime
                 if (cancelled)
                 {
                     EditorApplication.update -= tick;
+                    EndAttributionWindow();
                     return;
                 }
 
@@ -551,6 +642,17 @@ namespace PerfLint.Runtime
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 while (idx < framesToProcess.Count && sw.ElapsedMilliseconds < 30)
                 {
+                    // Extra representative frames buy hit-rate resolution, and they are the only part of the plan that is optional.
+                    // Drop the rest the moment the budget is gone: a coarser denominator that ships with the number beats a merge
+                    // that makes the user wait. Per-frame cost varies ~100× between a shallow scene and a Deep Profile one, so this
+                    // is measured, not guessed.
+                    if (idx >= baseFrameCount && mergeWorkMs + sw.ElapsedMilliseconds > ExtraUniformBudgetMs)
+                    {
+                        framesToProcess.RemoveRange(idx, framesToProcess.Count - idx);
+                        plannedFrames = framesToProcess.Count;
+                        break;
+                    }
+
                     var frame = ProfilerDriver.GetHierarchyFrameDataView(
                         framesToProcess[idx], 0,
                         HierarchyFrameDataView.ViewModes.MergeSamplesWithTheSameName,
@@ -562,7 +664,36 @@ namespace PerfLint.Runtime
                             framesSeen++;
                             bool isUniform = uniformFrames.Contains(framesToProcess[idx]);
                             if (isUniform) uniformFramesSeen++;
-                            AccumulateGcByScript(frame, gcByScript, gcMethodByScript); // GC attribution across ALL frames (steady + spike) → RUN.GC001's runtime allocator
+                            // Marker-name attribution only, here. These frames were recorded WITHOUT callstacks by
+                            // design, so there is nothing for the callstack path to read; the real attribution runs
+                            // over the attribution window further down. This line remains the fallback that keeps a
+                            // run useful when that window produced nothing.
+                            AccumulateGcByScript(frame, gcByScript, gcMethodByScript);
+
+                            // The GAME's allocation for this frame, as distinct from the process's.
+                            //
+                            // "GC Allocated In Frame" is a process-wide counter, and in the Editor the process is not
+                            // the game. Measured on urp3dsample within one Play Mode session: the counter read
+                            // 55 KB, then 308 KB, then 456 KB per frame while nothing about the scene changed —
+                            // running an eval was enough to move it eightfold — and PlayerLoop's own subtree held a
+                            // flat 2778 B throughout. That subtree total also equals the sum of the GC.Alloc leaves
+                            // beneath it, so the frame tree is self-consistent: 2.8 KB is what the game allocated,
+                            // and the rest is the editor around it.
+                            //
+                            // This is a lower bound, not a measurement of everything: allocation outside any
+                            // profiler marker leaves no trace here. It is nonetheless the only figure available that
+                            // is ABOUT the game, and it is what the allocation findings and the before/after
+                            // comparison need — a metric that moves when the user's code changes and stays put when
+                            // it does not. The counter fails that test in both directions.
+                            double gameGc = PlayerLoopGcBytes(frame);
+                            if (gameGc >= 0 && isUniform) gameGcPerFrame.Add(gameGc);
+                            // ALL merged frames, not just the uniform ones — unlike the GC figure above, which is a
+                            // steady-state rate and would be distorted by a level-gen burst. Frame time needs the
+                            // spikes: RUN.FPS003 is a statement about the worst frame, and a series collected only
+                            // from representative frames has no worst frame in it. The median stays robust anyway,
+                            // which is why it can be one series rather than two.
+                            double gameMs = PlayerLoopTotalMs(frame);
+                            if (gameMs >= 0) gameFrameMs.Add(gameMs);
                             // GPU frame time: read the root node's GPU time column (same source as the Profiler Hierarchy "GPU ms" column).
                             // The column constant exists only in 2022+; on older versions _gpuColumn==-1 is skipped and FrameTimingManager serves as the fallback.
                             if (_gpuColumn >= 0)
@@ -570,7 +701,7 @@ namespace PerfLint.Runtime
                                 double gpuMs = frame.GetItemColumnDataAsFloat(frame.GetRootItemID(), _gpuColumn);
                                 if (gpuMs > 0) gpuMsList.Add(gpuMs);
                             }
-                            double frameTotalMs = AccumulateHierarchySelfTime(frame, acc, peak, isUniform);
+                            double frameTotalMs = AccumulateHierarchySelfTime(frame, acc, peak, hits, isUniform);
                             // This frame's total self-time hit a new high → snapshot its top markers (_frameDict still holds this frame's data at this point; it is only cleared on the next call).
                             if (frameTotalMs > worstFrameTotalMs)
                             {
@@ -585,16 +716,26 @@ namespace PerfLint.Runtime
                     }
                     idx++;
                 }
+                mergeWorkMs += sw.ElapsedMilliseconds;
 
                 onProgress?.Invoke(idx, plannedFrames);
 
                 if (idx >= framesToProcess.Count)
                 {
+                    // The attribution window was opened at Stop() and needs Play Mode to actually run for a moment
+                    // before it contains anything. The merge often finishes faster than that, so wait here — bounded,
+                    // because a paused or stalled Play Mode must not hang the run. Nothing numeric depends on this
+                    // wait; only whether the finding can name a method.
+                    if (_attributionStartFrame >= 0 &&
+                        ProfilerDriver.lastFrameIndex - _attributionStartFrame < AttributionFrames &&
+                        ++attributionTicks < AttributionMaxTicks)
+                        return;
+
                     EditorApplication.update -= tick;
                     _cancelHotspots = null;
                     try
                     {
-                        var hotspots = BuildHotspots(acc, peak, uniformFramesSeen, _capturedAvgFrameNs);
+                        var hotspots = BuildHotspots(acc, peak, hits, uniformFramesSeen, _capturedAvgFrameNs);
                         // GPU time read from frame data (ms→ns). null if empty, in which case the caller falls back to the sampling-period GPU source.
                         MetricStats gpuFromFrames = null;
                         if (gpuMsList.Count > 0)
@@ -604,14 +745,36 @@ namespace PerfLint.Runtime
                             gpuFromFrames = new MetricStats("GPU Frame Time", gpuNs);
                         }
                         if (framesSeen > 0)
-                            Debug.Log("[PerfLint] " + L.Tr($"CPU hotspot merge complete: sampled {framesSeen} frames ({uniformFramesSeen} representative frames counted into the average), {acc.Count} markers, took {mergeWatch.ElapsedMilliseconds} ms.", $"CPU 热点归并完成：抽样 {framesSeen} 帧（其中 {uniformFramesSeen} 代表帧计入均值）、{acc.Count} 个 marker、用时 {mergeWatch.ElapsedMilliseconds} ms。"));
-                        _lastGcSite = BuildTopGcSite(gcByScript, gcMethodByScript); // heaviest per-frame GC allocator measured (RUN.GC001 Locate target)
+                            Debug.Log("[PerfLint] " + L.Tr($"CPU hotspot merge complete: sampled {framesSeen} frames ({uniformFramesSeen} representative frames counted into the average and into the sampled-frame hit rate), {acc.Count} markers, took {mergeWatch.ElapsedMilliseconds} ms ({mergeWorkMs} ms of work).", $"CPU 热点归并完成：抽样 {framesSeen} 帧（其中 {uniformFramesSeen} 代表帧计入均值与采样帧命中率）、{acc.Count} 个 marker、用时 {mergeWatch.ElapsedMilliseconds} ms（实际工作 {mergeWorkMs} ms）。"));
+                        // Attribution runs over its OWN window — the tail recorded with callstacks on, after every
+                        // number above was already fixed. Anything it finds replaces the marker-name guesses
+                        // accumulated from the measured window; if it finds nothing, those guesses stand.
+                        AttributeFromCallstackWindow(gcByScript, gcMethodByScript, gcLineByScript,
+                            ref gcSampledBytes, ref gcSampledFrames);
+                        EndAttributionWindow();
+
+                        // heaviest per-frame GC allocator measured (RUN.GC001 Locate target), plus how much the
+                        // samples explained per frame so the finding can state its own coverage
+                        _lastGcSite = BuildTopGcSite(gcByScript, gcMethodByScript, gcLineByScript,
+                            gcSampledFrames > 0 ? gcSampledBytes / gcSampledFrames : 0);
+                        _lastGameGc = gameGcPerFrame.Count > 0
+                            ? new MetricStats("Game GC Per Frame", gameGcPerFrame)
+                            : null;
+                        // Stored in nanoseconds to match FrameTimeNs, so the two are directly comparable.
+                        if (gameFrameMs.Count > 0)
+                        {
+                            var ns = new List<double>(gameFrameMs.Count);
+                            foreach (var ms in gameFrameMs) ns.Add(ms * 1_000_000.0);
+                            _lastGameFrameTime = new MetricStats("Game Frame Time", ns);
+                        }
+                        else _lastGameFrameTime = null;
                         // The live-captured spikes (per culprit) plus the deferred merge's worst frame, deduped and ranked — RUN.FPS003 reports one per culprit.
                         onComplete(hotspots, BuildWorstFrames(worstFrame), gpuFromFrames, true);
                     }
                     catch (Exception ex)
                     {
                         Debug.LogWarning("[PerfLint] " + L.Tr($"Hotspot merge failed: {ex.Message}", $"热点归并失败：{ex.Message}"));
+                        EndAttributionWindow();
                         onComplete(new List<Hotspot>(), BuildWorstFrames(null), null, false);
                     }
                 }
@@ -627,21 +790,44 @@ namespace PerfLint.Runtime
         private const int UniformHotspotFrames = 8;
         private const int SpikeHotspotFrames   = 6;
 
+        // The base 8 representative frames are enough to average self-time over, but as a hit-rate denominator they can only ever
+        // express multiples of 12.5% — too coarse to state a confidence with, and far too coarse to compare a before/after against.
+        // So the grid is refined twice (8 → 16 → 32) and the refinements are processed only while ExtraUniformBudgetMs of merge work
+        // is left. Which tiers survive has to be measured at run time rather than fixed here; whatever survives is reported as the
+        // denominator alongside the rate.
+        //
+        // Measured, on two real projects, which is what sets the budget:
+        //   without Deep Profile — the full 32-frame grid costs 56-93 ms even on a 13.9M-triangle scene, so the budget is nowhere
+        //     near binding and raising it costs those runs nothing at all;
+        //   with Deep Profile — ~100 ms per frame, so a 1200 ms budget bought only 7-13 representative frames.
+        // That was backwards. Deep Profile is the mode in which the hit rate is the ONLY figure worth reading (its milliseconds are
+        // the profiler's), and it was the mode getting the weakest denominator. 3500 ms buys most of the grid there and changes
+        // nothing anywhere else; a project slower still degrades gracefully, reporting the smaller denominator it earned.
+        private const int MaxUniformHotspotFrames = 32;
+        private const int ExtraUniformBudgetMs    = 3500;
+
         /// <summary>
-        /// Select the set of frame indices used for hotspot merging: UniformHotspotFrames uniformly sampled frames (persistent hotspots) + the
+        /// Select the set of frame indices used for hotspot merging: uniformly sampled representative frames (persistent hotspots) + the
         /// SpikeHotspotFrames frames with the highest main-thread time (stutter spikes). The latter are located using the per-frame Main Thread time over the sampling period — sequence index i approximately corresponds
-        /// to frame index first+i (ProfilerRecorder produces one sample per frame, aligned to the sampling window). Returns a deduplicated, ascending list of frame indices.
-        /// The uniformFrames out parameter returns the "uniform frames" subset: the caller uses it to count only uniform frames toward per-frame average/share (steady state), with spike frames only feeding peaks.
+        /// to frame index first+i (ProfilerRecorder produces one sample per frame, aligned to the sampling window).
+        /// The uniformFrames out parameter returns the "uniform frames" subset: the caller uses it to count only uniform frames toward per-frame average/share (steady state) and toward the sampled-frame hit rate, with spike frames only feeding peaks.
+        /// Returns base frames (deduplicated, ascending) first, then the optional refinement tiers in coarse→fine order; baseFrameCount marks the split, so a caller that runs out of budget can drop the tail and still hold an evenly spread sample.
         /// </summary>
-        private List<int> SelectFramesForHotspots(int first, int last, out HashSet<int> uniformFrames)
+        private List<int> SelectFramesForHotspots(int first, int last, out HashSet<int> uniformFrames, out int baseFrameCount)
         {
             int totalFrames = last - first + 1;
             var selected = new SortedSet<int>();
             uniformFrames = new HashSet<int>();
 
-            // Uniform sampling (taken within the [first,last] range the Profiler actually retains, not relying on sequence alignment). These are "representative frames" and count toward the average.
-            int step = Math.Max(1, totalFrames / UniformHotspotFrames);
-            for (int f = first; f <= last; f += step) { selected.Add(f); uniformFrames.Add(f); }
+            // A 32-position grid over the retained range [first,last] (not relying on sequence alignment). Every 4th position is the
+            // base set; the positions in between form the refinement tiers, so cutting the tail at any point still leaves an evenly
+            // spread sample rather than a sample crowded into the start of the window.
+            var grid = new int[MaxUniformHotspotFrames];
+            for (int j = 0; j < MaxUniformHotspotFrames; j++)
+                grid[j] = first + (int)((long)j * totalFrames / MaxUniformHotspotFrames);
+
+            const int BaseStride = MaxUniformHotspotFrames / UniformHotspotFrames; // 4
+            for (int j = 0; j < MaxUniformHotspotFrames; j += BaseStride) { selected.Add(grid[j]); uniformFrames.Add(grid[j]); }
 
             // The slowest few frames. Key: the counter ring buffer and the frame range retained by the Profiler backend start at different points (the latter is usually shorter),
             // so align from the end of the sequence — the latest sample series[L-1] must correspond to the latest frame last, and we derive frame indices backward from there to avoid a start-point mismatch.
@@ -668,7 +854,26 @@ namespace PerfLint.Runtime
             if (!string.IsNullOrEmpty(spikeDiag))
                 Debug.Log("[PerfLint] " + L.Tr($"Hotspot sampling included the slowest (stutter spike) frames: {spikeDiag.Trim()}", $"热点抽样纳入最慢（卡顿尖刺）帧：{spikeDiag.Trim()}"));
 
-            return new List<int>(selected);
+            var plan = new List<int>(selected);
+            baseFrameCount = plan.Count;
+
+            // Refinement tiers, coarse first: the midpoints between base frames (→16), then the quarter points (→32).
+            // A frame already in the plan (short windows collapse grid positions onto each other) is skipped, not re-processed.
+            AddRefinementTier(plan, selected, uniformFrames, grid, offset: BaseStride / 2, stride: BaseStride);
+            AddRefinementTier(plan, selected, uniformFrames, grid, offset: 1, stride: 2);
+
+            return plan;
+        }
+
+        /// <summary>Append the grid positions at grid[offset], grid[offset+stride], … to the merge plan as representative frames (skipping ones already planned).</summary>
+        private static void AddRefinementTier(List<int> plan, SortedSet<int> selected, HashSet<int> uniformFrames, int[] grid, int offset, int stride)
+        {
+            for (int j = offset; j < grid.Length; j += stride)
+            {
+                if (!selected.Add(grid[j])) continue;
+                uniformFrames.Add(grid[j]);
+                plan.Add(grid[j]);
+            }
         }
 
         /// <summary>Culprit identity of a spike frame: deepest USER method on the heaviest path; else deepest PACKAGE method; else "unmapped". Aggregates spike frames by cause.</summary>
@@ -753,7 +958,7 @@ namespace PerfLint.Runtime
         /// mapping every unique marker (thousands under Deep Profile) would take tens of seconds, whereas mapping only the final Top N reduces it to N calls.
         /// </summary>
         private static List<Hotspot> BuildHotspots(
-            Dictionary<string, double> acc, Dictionary<string, PeakPair> peak,
+            Dictionary<string, double> acc, Dictionary<string, PeakPair> peak, Dictionary<string, int> hits,
             int uniformFramesSeen, double avgFrameTimeNs)
         {
             // acc comes only from uniform (representative) frames, so the denominator for per-frame average/share must be uniformFramesSeen. With no representative frames there is no way to compute an average.
@@ -778,7 +983,10 @@ namespace PerfLint.Runtime
                 if (share > 100.0) share = 100.0; // Defensive cap: a single marker's self-time cannot exceed the whole frame (rarely triggered after splitting)
                 double peakMs   = peak.TryGetValue(kv.Key, out var pk) ? pk.Reported : perFrame;
                 string script   = ResolveScriptPath(kv.Key); // Called only for the ≤12 selected markers
-                filtered.Add(new Hotspot(display, perFrame, peakMs, share, script));
+                // Hit count and denominator come from the same representative frames as the average, so "7.8 ms/frame" and
+                // "hit in 22 of 24 frames" can never be quoting different sets of frames at each other.
+                int hitFrames   = hits != null && hits.TryGetValue(kv.Key, out var hc) ? hc : 0;
+                filtered.Add(new Hotspot(display, perFrame, peakMs, share, script, hitFrames, uniformFramesSeen));
                 if (filtered.Count >= 12) break;
             }
             return filtered;
@@ -793,12 +1001,15 @@ namespace PerfLint.Runtime
         /// <summary>Merge this frame's self-time into the global acc/peak and return this frame's total main-thread self-time (ms, for slowest-frame localization).
         /// After returning, _frameDict still holds this frame's per-marker self (cleared only on the next call), so the caller can snapshot the slowest frame from it.</summary>
         private static double AccumulateHierarchySelfTime(
-            HierarchyFrameDataView frame, Dictionary<string, double> acc, Dictionary<string, PeakPair> peak,
+            HierarchyFrameDataView frame, Dictionary<string, double> acc, Dictionary<string, PeakPair> peak, Dictionary<string, int> hits,
             bool contributeToAverage)
         {
             // First aggregate each marker's self-time for "this frame" into _frameDict (via FillFrameDict), then merge into the global:
             // - peak always maintains the highest + second-highest across frames (the second-highest excludes a single extreme frame, see PeakPair) — spike frames are also counted.
             // - acc accumulates only when contributeToAverage (uniform/representative frame) — spike frames are excluded, to avoid load/JIT super-frames contaminating the per-frame average.
+            // - hits counts frames rather than milliseconds, over the same representative set: presence, not cost. FillFrameDict only
+            //   records markers with self > 0, so "in the dict" already means "this marker did main-thread work in this frame" —
+            //   which is the claim the hit rate makes, and deliberately not a claim about how much.
             double frameTotal = FillFrameDict(frame);
             foreach (var kv in _frameDict)
             {
@@ -806,6 +1017,11 @@ namespace PerfLint.Runtime
                 {
                     acc.TryGetValue(kv.Key, out var a);
                     acc[kv.Key] = a + kv.Value;
+                    if (hits != null)
+                    {
+                        hits.TryGetValue(kv.Key, out var h);
+                        hits[kv.Key] = h + 1;
+                    }
                 }
                 peak.TryGetValue(kv.Key, out var p);
                 p.Add(kv.Value);
@@ -964,6 +1180,143 @@ namespace PerfLint.Runtime
         // method whose subtree GC carries the bulk of the frame's allocation. Called on ALL merged frames (steady + spike) — RUN.GC001 then points to the
         // heaviest per-frame allocator the session actually measured (typically the level-gen methods that allocate MBs), which is what users want to open.
         private const double GcAttributeFloor = 4096; // ignore trivial per-frame allocations when attributing; also the drill's stop threshold
+
+        /// <summary>
+        /// Floor for a single GC.Alloc sample, which is NOT the same quantity as <see cref="GcAttributeFloor"/> and
+        /// must not borrow its value.
+        ///
+        /// GcAttributeFloor gates a METHOD SUBTREE's accumulated allocation while drilling the marker tree, so 4 KB
+        /// there means "this branch carries real weight". A GC.Alloc leaf is ONE allocation site's bytes in one
+        /// frame, which is a smaller quantity by orders of magnitude.
+        ///
+        /// Reusing 4096 shipped through 994 green unit tests and a five-version matrix and still broke the whole
+        /// feature live: urp3dsample allocates 55.2 KB per frame across 4 GC.Alloc nodes, and the largest single node
+        /// measured 2240 B. Every node fell under the floor, attribution found nothing, and GC001 fell back to
+        /// "spread across many sites" — the exact unattributed message this work existed to remove. The unit suite
+        /// could not see it because it constructs GcAllocSite directly; only a live sample goes through here.
+        ///
+        /// 256 B is deliberately low: GC001 only fires at all when the median frame allocates ≥1 KB, so by the time
+        /// anything reaches this code the frame's allocation is already worth explaining, and the ranking — not the
+        /// floor — decides which site leads. The floor's only job is to keep single small objects out of the ranking.
+        ///
+        /// Applied to a site's total FOR ONE FRAME, not to a single allocation. Individual allocations measured
+        /// 40-144 B on urp3dsample, so a per-allocation floor of any useful size would discard everything; what
+        /// matters is that a method allocated a hundred small objects this frame, not that each was small.
+        /// </summary>
+        private const double GcSampleFloor = 256;
+
+        // Per-frame working set for callstack attribution: one frame's bytes/method/line per allocation site, plus
+        // the buffer the merged per-sample column data is read into. Static and reused because this runs on every
+        // merged frame and allocating four collections per frame inside the allocation profiler would be its own joke.
+        private static readonly Dictionary<string, double> _gcFrameBytes = new Dictionary<string, double>(64);
+        private static readonly Dictionary<string, string> _gcFrameMethod = new Dictionary<string, string>(64);
+        private static readonly Dictionary<string, int> _gcFrameLine = new Dictionary<string, int>(64);
+        private static readonly List<float> _gcSampleBuf = new List<float>(256);
+
+        /// <summary>
+        /// Attribute this frame's allocations from the GC.Alloc callstacks recorded during sampling.
+        ///
+        /// This is the primary path, and it is why RUN.GC001 no longer needs Deep Profile. The stacks are switched on
+        /// in <see cref="Start"/>, cost less than this machine's own drift, and carry the file and line outright —
+        /// where the marker path below has to infer a file from a type name and needs per-method markers to see any
+        /// type name at all.
+        ///
+        /// Returns false when no stacks were found, so the caller can fall back: an old session, a user who cleared
+        /// memoryRecordMode mid-run, or a Unity version that records nothing still get the previous behaviour rather
+        /// than an empty result.
+        ///
+        /// Two details cost real time to find, both worth keeping written down:
+        /// * The stacks hang off leaf items literally named "GC.Alloc", not off the allocating method's own marker.
+        /// * They are only reachable in MergeSamplesWithTheSameName view via ResolveItemMergedSampleCallstack.
+        ///   ViewModes.Default with ResolveItemCallstack returns nothing at all — measured, 0 stacks out of 72 nodes.
+        /// </summary>
+        private static bool AccumulateGcByCallstack(HierarchyFrameDataView frame,
+            Dictionary<string, double> gcByScript, Dictionary<string, string> gcMethodByScript,
+            Dictionary<string, int> gcLineByScript, ref double sampledBytes)
+        {
+            if (_gcColumn < 0) return false;
+
+            bool any = false;
+            var stack = new Stack<int>();
+            var kids = new List<int>(64);
+            _gcFrameBytes.Clear();
+            _gcFrameMethod.Clear();
+            _gcFrameLine.Clear();
+            stack.Push(frame.GetRootItemID());
+            int guard = 0;
+
+            while (stack.Count > 0 && guard++ < 40000)
+            {
+                int node = stack.Pop();
+                if (frame.GetItemName(node) == "GC.Alloc")
+                {
+                    double nodeBytes = frame.GetItemColumnDataAsFloat(node, _gcColumn);
+                    if (nodeBytes > 0)
+                    {
+                        // The node total is the denominator for "how much did we explain", and it is exact — unlike
+                        // the per-site figures below, nothing here is dropped or approximated.
+                        sampledBytes += nodeBytes;
+
+                        // A merged node is NOT one allocation. MergeSamplesWithTheSameName folds every GC.Alloc under
+                        // the same parent into one item, each fold carrying its own callstack and its own bytes.
+                        //
+                        // Reading sampleIndex 0 and charging it the whole node — which is what this did — attributes
+                        // every allocation under that parent to whichever one happens to be first. It survived a live
+                        // check by luck: the same scene attributed to a Visual Effect Graph binder on one run and to
+                        // UnityEditor.MaterialEditor on the next, with the node total (2778 B/frame) identical both
+                        // times, because that number never depended on the attribution at all.
+                        int count = frame.GetItemMergedSamplesCount(node);
+                        _gcSampleBuf.Clear();
+                        frame.GetItemMergedSamplesColumnDataAsFloats(node, _gcColumn, _gcSampleBuf);
+
+                        for (int si = 0; si < count; si++)
+                        {
+                            double b = si < _gcSampleBuf.Count ? _gcSampleBuf[si] : 0;
+                            if (b <= 0) continue;
+
+                            string cs = null;
+                            try { cs = frame.ResolveItemMergedSampleCallstack(node, si); }
+                            catch { continue; } // one unresolvable stack is not fatal
+
+                            var site = GcCallstackParser.InnermostManagedFrame(cs);
+                            // A site with no asset path names a method we cannot open — keep the marker path's
+                            // contract that what we report can be located.
+                            if (!site.IsValid || string.IsNullOrEmpty(site.AssetPath)) continue;
+
+                            any = true;
+                            // Summed WITHIN the frame before being ranked: a single allocation is routinely 40-140 B,
+                            // and a method that allocates a hundred of them per frame is the one worth naming. Ranking
+                            // individual allocations would surface whichever object happened to be biggest instead.
+                            _gcFrameBytes.TryGetValue(site.AssetPath, out double sofar);
+                            _gcFrameBytes[site.AssetPath] = sofar + b;
+                            _gcFrameMethod[site.AssetPath] = site.Method;
+                            _gcFrameLine[site.AssetPath] = site.Line;
+                        }
+                    }
+                }
+
+                if (frame.HasItemChildren(node))
+                {
+                    kids.Clear();
+                    frame.GetItemChildren(node, kids);
+                    foreach (var k in kids) stack.Push(k);
+                }
+            }
+
+            // PEAK across frames of the per-frame totals, matching the marker path's "up to ~X in a frame", which is
+            // honest whether the allocation is steady or bursty.
+            foreach (var kv in _gcFrameBytes)
+            {
+                if (kv.Value < GcSampleFloor) continue;
+                gcByScript.TryGetValue(kv.Key, out double prevPeak);
+                if (kv.Value <= prevPeak) continue;
+                gcByScript[kv.Key] = kv.Value;
+                gcMethodByScript[kv.Key] = _gcFrameMethod[kv.Key];
+                gcLineByScript[kv.Key] = _gcFrameLine[kv.Key];
+            }
+            return any;
+        }
+
         private static void AccumulateGcByScript(HierarchyFrameDataView frame, Dictionary<string, double> gcByScript, Dictionary<string, string> gcMethodByScript)
         {
             if (_gcColumn < 0) return;
@@ -1010,15 +1363,153 @@ namespace PerfLint.Runtime
             }
         }
 
+        /// <summary>
+        /// Opens the short window recorded WITH GC.Alloc callstacks, after the measured window has closed.
+        ///
+        /// Called from <see cref="Stop"/> — after the counters have been read, so nothing here can touch the figures
+        /// this run reports. The frames it produces are used for one thing: naming the method behind an allocation.
+        /// Everything numeric, including the game-side allocation total, still comes from the clean window, which is
+        /// possible because a GC.Alloc node exists in the frame tree whether or not callstacks are being recorded —
+        /// measured: 72 nodes with the mode off. Only the STACK depends on the mode.
+        /// </summary>
+        private void BeginAttributionWindow()
+        {
+            try
+            {
+                ProfilerDriver.memoryRecordMode = _prevMemoryRecordMode | ProfilerMemoryRecordMode.GCAlloc;
+                _attributionStartFrame = ProfilerDriver.lastFrameIndex + 1;
+            }
+            catch
+            {
+                _attributionStartFrame = -1; // no attribution this run; the merge falls back to the measured window
+            }
+        }
+
+        /// <summary>
+        /// Reads the attribution window — the frames recorded with GC.Alloc callstacks — and attributes allocation
+        /// from them, replacing whatever the marker path guessed from the measured window.
+        ///
+        /// Replacing rather than merging, because the two disagree by construction: marker names resolve a TYPE to a
+        /// file by search, callstacks carry the file and the line. Mixing them would rank a guess against a fact.
+        ///
+        /// Silently does nothing when the window is empty. Play Mode can be paused, the merge can start before any
+        /// attribution frame has been produced, or the mode can be unavailable — none of which is a failure worth
+        /// reporting, because the run's numbers do not depend on any of it.
+        /// </summary>
+        private void AttributeFromCallstackWindow(Dictionary<string, double> gcByScript,
+            Dictionary<string, string> gcMethodByScript, Dictionary<string, int> gcLineByScript,
+            ref double sampledBytes, ref int sampledFrames)
+        {
+            if (_attributionStartFrame < 0 || _gcColumn < 0) return;
+
+            int last = ProfilerDriver.lastFrameIndex;
+            int firstAttr = Math.Max(_attributionStartFrame, ProfilerDriver.firstFrameIndex);
+            if (last < firstAttr) return;
+
+            var byScript = new Dictionary<string, double>();
+            var methodByScript = new Dictionary<string, string>();
+            var lineByScript = new Dictionary<string, int>();
+            double bytes = 0;
+            int frames = 0;
+
+            // Newest first: those are the frames most certainly recorded with the mode already applied.
+            for (int fi = last; fi >= firstAttr && frames < AttributionFrames; fi--)
+            {
+                var frame = ProfilerDriver.GetHierarchyFrameDataView(
+                    fi, 0, HierarchyFrameDataView.ViewModes.MergeSamplesWithTheSameName,
+                    HierarchyFrameDataView.columnSelfTime, false);
+                try
+                {
+                    if (frame == null || !frame.valid) continue;
+                    if (AccumulateGcByCallstack(frame, byScript, methodByScript, lineByScript, ref bytes)) frames++;
+                }
+                catch { /* one unreadable frame does not sink the window */ }
+                finally { frame?.Dispose(); }
+            }
+
+            if (frames == 0 || byScript.Count == 0) return;
+
+            gcByScript.Clear(); gcMethodByScript.Clear(); gcLineByScript.Clear();
+            foreach (var kv in byScript) gcByScript[kv.Key] = kv.Value;
+            foreach (var kv in methodByScript) gcMethodByScript[kv.Key] = kv.Value;
+            foreach (var kv in lineByScript) gcLineByScript[kv.Key] = kv.Value;
+            sampledBytes = bytes;
+            sampledFrames = frames;
+        }
+
+        /// <summary>Closes the attribution window and puts the Profiler back exactly as it was found.</summary>
+        private void EndAttributionWindow()
+        {
+            try { ProfilerDriver.memoryRecordMode = _prevMemoryRecordMode; } catch { /* best effort */ }
+            try { ProfilerDriver.enabled = _prevProfilerEnabled; } catch { /* best effort */ }
+        }
+
+        /// <summary>
+        /// Bytes allocated inside PlayerLoop for this frame — the game's own allocation — or -1 when it cannot be read.
+        ///
+        /// PlayerLoop rather than the root, because the root reports 0 (like its Total time) and because the whole
+        /// point is to exclude everything the editor does around the game. EditorLoop measures 0 here in practice,
+        /// which is not the same as the editor allocating nothing: its code simply is not marker-instrumented. That
+        /// asymmetry is exactly why the process-wide counter cannot be split after the fact and this has to be read
+        /// from the tree.
+        /// </summary>
+        private static double PlayerLoopGcBytes(HierarchyFrameDataView frame)
+        {
+            if (_gcColumn < 0) return -1;
+            var top = new List<int>(8);
+            frame.GetItemChildren(frame.GetRootItemID(), top);
+            foreach (var t in top)
+                if (frame.GetItemName(t) == "PlayerLoop")
+                    return frame.GetItemColumnDataAsFloat(t, _gcColumn);
+            return -1; // no PlayerLoop in this frame (editor-only frame) — not zero, which would be a claim
+        }
+
+        /// <summary>
+        /// Milliseconds this frame spent inside PlayerLoop — the game's own main-thread work — or -1 when unreadable.
+        ///
+        /// The whole frame is not the game. In the Editor the main thread runs EditorLoop and PlayerLoop in the same
+        /// frame, and EditorLoop is the editor drawing its own windows. Measured on urp3dsample across two clean
+        /// windows (read after sampling ended, away from both the eval that does the reading and the attribution
+        /// window at the end): 8.42 ms total = 5.41 ms game + 2.75 ms editor, and 8.95 = 5.82 + 2.88. **About a third
+        /// of the measured frame belongs to the editor.**
+        ///
+        /// Collected, reported, and deliberately NOT used for any verdict. It is not a drop-in replacement for frame
+        /// time: PlayerLoop's total is main-thread work inside the player loop, which is not the same quantity as a
+        /// frame's wall clock (VSync waits and render-thread synchronisation live outside it). Swapping the FPS rules
+        /// onto it would change every threshold and invalidate every baseline, on an equivalence nobody has verified.
+        /// So the figure is surfaced and the reader gets to know; what to judge on stays a decision to make on
+        /// purpose rather than one made by this comment.
+        /// </summary>
+        private static double PlayerLoopTotalMs(HierarchyFrameDataView frame)
+        {
+            var top = new List<int>(8);
+            frame.GetItemChildren(frame.GetRootItemID(), top);
+            foreach (var t in top)
+                if (frame.GetItemName(t) == "PlayerLoop")
+                    return frame.GetItemColumnDataAsFloat(t, HierarchyFrameDataView.columnTotalTime);
+            return -1;
+        }
+
         /// <summary>Pick the heaviest per-frame GC allocator measured (peak single-frame bytes). Returns null if none reaches a meaningful amount / GC column unavailable.</summary>
-        private static GcAllocSite BuildTopGcSite(Dictionary<string, double> gcByScript, Dictionary<string, string> gcMethodByScript)
+        private static GcAllocSite BuildTopGcSite(Dictionary<string, double> gcByScript, Dictionary<string, string> gcMethodByScript,
+            Dictionary<string, int> gcLineByScript = null, double sampledBytesPerFrame = 0)
         {
             if (gcByScript.Count == 0) return null;
             string topScript = null; double topPeak = 0;
             foreach (var kv in gcByScript) if (kv.Value > topPeak) { topPeak = kv.Value; topScript = kv.Key; }
-            if (topScript == null || topPeak < 4096) return null; // not a meaningful allocator → GC001 falls back to the static Script GC panel
+            // Not a meaningful allocator → GC001 falls back to the static Script GC panel.
+            //
+            // Aligned with GC001's own trigger (median ≥1 KB per frame) rather than the 4 KB it used to carry. The
+            // two have to agree or the finding contradicts itself: urp3dsample fires GC001 at 55.2 KB/frame while its
+            // largest single allocation site measured 2240 B, so a 4 KB floor here declared "no meaningful allocator"
+            // about the very allocation the finding was reporting. If a frame's allocation is worth warning about,
+            // the site that leads it is worth naming.
+            if (topScript == null || topPeak < 1024) return null;
             gcMethodByScript.TryGetValue(topScript, out var method);
-            return new GcAllocSite(topScript, method, topPeak); // BytesPerFrame carries the PEAK single-frame allocation
+            int line = 0;
+            gcLineByScript?.TryGetValue(topScript, out line);
+            // BytesPerFrame carries the PEAK single-frame allocation.
+            return new GcAllocSite(topScript, method, topPeak, line, IsPackagePath(topScript), sampledBytesPerFrame);
         }
 
         private static string ResolveScriptPathCached(string marker)
@@ -1031,7 +1522,14 @@ namespace PerfLint.Runtime
         }
 
         // Engine/framework-level markers: time-consuming but parts the developer cannot change (rendering, physics, player loop skeleton); excluded to focus on actionable items.
-        private static bool IsFrameworkNoise(string marker)
+        /// <summary>
+        /// Internal rather than private because the comparison reads it too, over sessions recorded by OLDER builds.
+        ///
+        /// Filtering only at capture makes every later addition to this list produce a phantom result: a marker
+        /// stored in a pinned baseline and filtered out of the next measurement compares as "no longer among the
+        /// most expensive markers" — a change the user did not make, attributed to work they did.
+        /// </summary>
+        internal static bool IsFrameworkNoise(string marker)
         {
             if (string.IsNullOrEmpty(marker)) return true;
             switch (marker)
@@ -1040,6 +1538,10 @@ namespace PerfLint.Runtime
                 case "Profiler.FinalizeAndSendFrame":
                 case "GUI.Repaint":
                 case "WaitForTargetFPS":
+                // The main thread blocked on the job system finishing. Real time, but not a call path anybody can
+                // open and optimise — a real run put it top of the list as "busiest call path", which tells the user
+                // the thing to go and fix is their own waiting. Same family as the two wait markers either side.
+                case "WaitForJobGroupID":
                 case "Gfx.WaitForPresentOnGfxThread":
                 case "Gfx.PresentFrame":
                 case "Semaphore.WaitForSignal":
@@ -1051,9 +1553,31 @@ namespace PerfLint.Runtime
                 case "PersistentManager.Remapper":
                     return true;
             }
+            // The graphics backend, whichever one is loaded. The list above names wait markers one at a time and
+            // says they are a family; it then missed the member that tops real reports —
+            // "GfxDeviceD3D12.WaitForLastPresentation.WaitForGPU" was the "busiest call path" in every measurement
+            // taken on this machine, and every backend spells its own differently (D3D11, Vulkan, Metal, GLES), so
+            // enumerating them was never going to hold. None of GfxDevice* is code anybody can open.
+            //
+            // What it measures also reads backwards as a hotspot: it is the main thread BLOCKED waiting for the GPU,
+            // so more of it means the CPU had more idle time, and the report presented a rise in it as "more
+            // expensive". Losing it costs no information — whether the GPU is the bottleneck is answered properly by
+            // PerfMeasurement.Side, from GPU frame time against frame time.
+            if (marker.StartsWith("GfxDevice", StringComparison.Ordinal)) return true;
+
+            // Same reasoning, for the rest of the family: a marker whose whole job is to wait is time the thread was
+            // NOT doing work. Subsumes WaitForTargetFPS and WaitForJobGroupID above, which stay as documentation of
+            // where this rule came from.
+            if (marker.StartsWith("WaitFor", StringComparison.Ordinal)) return true;
+
             // Prefix fallback: Loading.* (scene-load internals), Mono.JIT* (JIT compilation on first call).
             if (marker.StartsWith("Loading.", StringComparison.Ordinal)) return true;
             if (marker.StartsWith("Mono.JIT", StringComparison.Ordinal)) return true;
+            // Profiler.* is the measuring instrument's own bookkeeping. A real run on a light scene put
+            // "Profiler.FlushMemoryCounters" at the TOP of the hotspot list — a report whose number one answer to
+            // "what is costing you" is our own act of measuring reads as broken, and the user cannot act on it either
+            // way. FinalizeAndSendFrame above was the same case caught one marker at a time; this covers the family.
+            if (marker.StartsWith("Profiler.", StringComparison.Ordinal)) return true;
             return false;
         }
 

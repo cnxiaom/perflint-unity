@@ -42,20 +42,22 @@ namespace PerfLint.UI
         private void CreateGUI()
         {
             var root = rootVisualElement;
+            PerfLintStyle.Apply(root);
             root.style.paddingTop = 8;
             root.style.paddingLeft = 8;
             root.style.paddingRight = 8;
 
             // ── Toolbar ───────────────────────────────
             var toolbar = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginBottom = 8 } };
-            var openMain = new Button(PerfLintWindow.Open) { text = L.Tr("Static Scan Panel", "静态扫描面板") };
-            openMain.style.height = 26;
+            var openMain = PerfLintStyle.Toolbar(L.Tr("Static Scan Panel", "静态扫描面板"), PerfLintWindow.Open);
             toolbar.Add(openMain);
-            var openRuntime = new Button(PerfLintRuntimeWindow.Open) { text = L.Tr("Runtime", "运行时") };
-            openRuntime.style.height = 26;
+            var openRuntime = PerfLintStyle.Toolbar(L.Tr("Runtime", "运行时"), PerfLintRuntimeWindow.Open);
             openRuntime.style.marginLeft = 6;
             toolbar.Add(openRuntime);
             L.InjectDevLangSwitch(toolbar, () => { root.Clear(); CreateGUI(); });
+            // Whatever the dev language switch injected wears the toolbar look too, so the row cannot end in a
+            // button that belongs to a different product.
+            PerfLintStyle.ToolbarButtons(toolbar);
             root.Add(toolbar);
 
             // Everything below scrolls. Without this, when the content is taller than the window (small window or a
@@ -66,36 +68,34 @@ namespace PerfLint.UI
             root.Add(body);
 
             // ── Unavailable notice (internal API didn't resolve on this editor) ──
-            _unavailableBox = MakeCard();
+            // A caveat, not a card: it says the panel cannot do its job here, and the coloured block is what
+            // separates that from the ordinary content it sits above.
+            _unavailableBox = PerfLintStyle.Note(PerfLintStyle.NoteWarning);
             _unavailableBox.style.display = DisplayStyle.None;
             _unavailableBox.Add(new Label(L.Tr(
                 "Shader-variant recording isn't available on this Unity version (the editor's internal tracking API didn't resolve). Static shader diagnostics (SHDR001) still work in the Scan panel.",
                 "本 Unity 版本不支持着色器变体录制（编辑器内部追踪 API 未解析到）。静态着色器诊断（SHDR001）在扫描面板仍可用。"))
-            { style = { whiteSpace = WhiteSpace.Normal, color = new Color(0.95f, 0.78f, 0.30f), fontSize = 11 } });
+            { style = { whiteSpace = WhiteSpace.Normal, color = PerfLintStyle.Dim, fontSize = 11 } });
             body.Add(_unavailableBox);
 
             // ── Capture status card ───────────────────
             var statusCard = MakeCard();
-            _countLabel = new Label("—") { style = { fontSize = 20, unityFontStyleAndWeight = FontStyle.Bold } };
-            _stateLabel = new Label { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.7f, fontSize = 11, marginTop = 4 } };
+            _countLabel = new Label("—") { style = { fontSize = 20, unityFontStyleAndWeight = FontStyle.Bold, color = PerfLintStyle.Ink } };
+            _stateLabel = new Label { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 4, color = PerfLintStyle.Dimmer } };
             statusCard.Add(_countLabel);
             statusCard.Add(_stateLabel);
             body.Add(statusCard);
 
             // ── Record controls ───────────────────────
             var controls = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginTop = 8, flexWrap = Wrap.Wrap } };
-            var clearBtn = new Button(OnClear) { text = L.Tr("Clear captured", "清空已捕获") };
-            clearBtn.style.height = 26;
+            var clearBtn = PerfLintStyle.Secondary(L.Tr("Clear captured", "清空已捕获"), OnClear);
             controls.Add(clearBtn);
-            var saveBtn = new Button(OnSave) { text = L.Tr("Save captured…", "保存已捕获…") };
-            saveBtn.style.height = 26;
+            // Save is what the whole recording flow is for, so it is the screen's primary — the same one the
+            // Autopilot and the Getting Started window use, rather than a third opinion of "accent blue".
+            var saveBtn = PerfLintStyle.Primary(L.Tr("Save captured…", "保存已捕获…"), OnSave);
             saveBtn.style.marginLeft = 6;
-            saveBtn.style.backgroundColor = new Color(0.20f, 0.45f, 0.85f); // primary
-            saveBtn.style.color = Color.white;
-            saveBtn.style.unityFontStyleAndWeight = FontStyle.Bold;
             controls.Add(saveBtn);
-            var playBtn = new Button(EnterPlay) { text = L.Tr("Enter Play Mode", "进入 Play Mode") };
-            playBtn.style.height = 26;
+            var playBtn = PerfLintStyle.Secondary(L.Tr("Enter Play Mode", "进入 Play Mode"), EnterPlay);
             playBtn.style.marginLeft = 6;
             controls.Add(playBtn);
             body.Add(controls);
@@ -104,12 +104,12 @@ namespace PerfLint.UI
             body.Add(new Label(L.Tr(
                 "How to capture: 1) Clear. 2) Enter Play Mode and walk through the scenes, quality levels and platforms you ship — Unity records every shader variant it actually renders. 3) Save to a .shadervariants asset. Then turn on Warm-up below: Unity precompiles those variants at startup, so they don't hitch the first time they're used. (Build-time stripping from the same asset is also available, but it's experimental — see its warning.)",
                 "录制步骤：1）清空。2）进入 Play Mode，把你要发布的场景、画质档、平台都走一遍——Unity 会记录它实际渲染过的每个着色器变体。3）保存为 .shadervariants 资产。然后在下方开启「启动预热」：Unity 启动时预编译这些变体，首次使用就不会卡顿。（同一份资产也可做构建期剥离，但那是实验性的——见其警告。）"))
-            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.85f, fontSize = 11, marginTop = 10 } });
+            { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 10, color = PerfLintStyle.Dim } });
 
             body.Add(new Label(L.Tr(
                 "Tip: capture is cumulative until you Clear. Run several sessions (different scenes/quality/platforms) for fuller coverage — warm-up is safe either way (precompiling fewer variants just means a few first-use hitches remain), but stripping to an incomplete capture is what breaks builds.",
                 "提示：捕获会累积，直到你点清空。多跑几次（不同场景/画质/平台）覆盖更全——预热无论如何都安全（少预热几个，只是还剩几次首用卡顿），但「剥离到不完整捕获」才是会弄坏 build 的那个。"))
-            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.6f, fontSize = 11, marginTop = 6, unityFontStyleAndWeight = FontStyle.Italic } });
+            { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 6, unityFontStyleAndWeight = FontStyle.Italic, color = PerfLintStyle.Dimmer } });
 
             body.Add(BuildDeviceCaptureCard());
 
@@ -121,7 +121,7 @@ namespace PerfLint.UI
             body.Add(new Label(L.Tr(
                 "Recording runs locally and is never uploaded.",
                 "录制在本机完成、永不上传。"))
-            { style = { whiteSpace = WhiteSpace.Normal, unityFontStyleAndWeight = FontStyle.Italic, opacity = 0.5f, marginTop = 10, fontSize = 10 } });
+            { style = { whiteSpace = WhiteSpace.Normal, unityFontStyleAndWeight = FontStyle.Italic, marginTop = 10, fontSize = 10, color = PerfLintStyle.Dimmer } });
 
             RefreshState();
             _poll = root.schedule.Execute(RefreshState).Every(500);
@@ -200,13 +200,12 @@ namespace PerfLint.UI
         {
             var card = MakeCard();
             card.style.marginTop = 4;
-            card.Add(new Label(L.Tr("Capture on device (development builds)", "真机捕获（Development Build）"))
-            { style = { unityFontStyleAndWeight = FontStyle.Bold, marginBottom = 4 } });
+            card.Add(CardTitle(L.Tr("Capture on device (development builds)", "真机捕获（Development Build）")));
 
             card.Add(new Label(L.Tr(
                 "The editor records what the EDITOR renders. Your players compile a different set — per platform, graphics API and quality level. This captures the real thing from a running build.",
                 "编辑器录的是「编辑器渲染的变体」。打出的包在不同平台/图形 API/画质下编译的是另一套。这里从真实运行的构建里捕获真正的那套。"))
-            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.85f, fontSize = 11, marginBottom = 6 } });
+            { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginBottom = 6, color = PerfLintStyle.Dim } });
 
             _devLogToggle = new Toggle(L.Tr("Log shader compilation in players", "在播放器中记录着色器编译"))
             { value = SafeGetLogWhenShaderCompiled() };
@@ -224,26 +223,20 @@ namespace PerfLint.UI
             card.Add(new Label(L.Tr(
                 "1) Turn on logging above. 2) Make a Development Build and run it — walk every scene, quality level and platform you ship. 3) Desktop players (Windows/macOS/Linux): an attached player (Build & Run attaches automatically) streams its variants here live, and also keeps a capture file (<persistentDataPath>/PerfLint/shader-variants-*.json) you can import later. 4) Android/iOS players can't read their own log — dump it instead (adb logcat > log.txt, or the Xcode console) and import the dump below. 5) Merge into a collection, then enable warm-up below.",
                 "1）开启上面的记录开关。2）打一个 Development Build 运行——把要发布的场景、画质、平台都走一遍。3）桌面播放器（Windows/macOS/Linux）：已连接的播放器（Build & Run 自动连接）会把变体实时传回这里，同时写一份捕获文件（<persistentDataPath>/PerfLint/shader-variants-*.json）供事后导入。4）Android/iOS 播放器读不到自己的日志——改为导出日志（adb logcat > log.txt，或 Xcode 控制台）后在下方导入。5）并入集合后，在下方开启预热。"))
-            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.85f, fontSize = 11, marginTop = 6 } });
+            { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 6, color = PerfLintStyle.Dim } });
 
-            _devCountLabel = new Label { style = { unityFontStyleAndWeight = FontStyle.Bold, marginTop = 8 } };
+            _devCountLabel = new Label { style = { unityFontStyleAndWeight = FontStyle.Bold, marginTop = 8, color = PerfLintStyle.Ink } };
             card.Add(_devCountLabel);
-            _devConnLabel = new Label { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 2, opacity = 0.8f } };
+            _devConnLabel = new Label { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 2, color = PerfLintStyle.Dim } };
             card.Add(_devConnLabel);
 
             var buttons = new VisualElement { style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginTop = 8, flexWrap = Wrap.Wrap } };
-            var mergeBtn = new Button(OnMergeDeviceCapture) { text = L.Tr("Add to collection… (Pro)", "并入集合…（Pro）") };
-            mergeBtn.style.height = 26;
-            mergeBtn.style.backgroundColor = new Color(0.20f, 0.45f, 0.85f);
-            mergeBtn.style.color = Color.white;
-            mergeBtn.style.unityFontStyleAndWeight = FontStyle.Bold;
+            var mergeBtn = PerfLintStyle.Primary(L.Tr("Add to collection… (Pro)", "并入集合…（Pro）"), OnMergeDeviceCapture);
             buttons.Add(mergeBtn);
-            var importBtn = new Button(OnImportDeviceCapture) { text = L.Tr("Import capture / log file…", "导入捕获 / 日志文件…") };
-            importBtn.style.height = 26;
+            var importBtn = PerfLintStyle.Secondary(L.Tr("Import capture / log file…", "导入捕获 / 日志文件…"), OnImportDeviceCapture);
             importBtn.style.marginLeft = 6;
             buttons.Add(importBtn);
-            var clearBtn = new Button(OnClearDeviceCapture) { text = L.Tr("Clear received", "清空已接收") };
-            clearBtn.style.height = 26;
+            var clearBtn = PerfLintStyle.Secondary(L.Tr("Clear received", "清空已接收"), OnClearDeviceCapture);
             clearBtn.style.marginLeft = 6;
             buttons.Add(clearBtn);
             card.Add(buttons);
@@ -251,7 +244,7 @@ namespace PerfLint.UI
             card.Add(new Label(L.Tr(
                 "Streams over Unity's local editor-attach connection (the Profiler channel) — your LAN at most, never the internet.",
                 "数据走 Unity 本地的编辑器连接通道（Profiler 同款）——最多经局域网，绝不上互联网。"))
-            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.5f, fontSize = 10, marginTop = 6, unityFontStyleAndWeight = FontStyle.Italic } });
+            { style = { whiteSpace = WhiteSpace.Normal, fontSize = 10, marginTop = 6, unityFontStyleAndWeight = FontStyle.Italic, color = PerfLintStyle.Dimmer } });
 
             return card;
         }
@@ -276,7 +269,7 @@ namespace PerfLint.UI
                 _devConnLabel.text = live
                     ? L.Tr($"● {players} player(s) attached · recorder online — receiving now.", $"● 已连接 {players} 个播放器 · 录制器在线——正在接收。")
                     : L.Tr($"● {players} player(s) attached · recorder online — new variants stream in as they compile.", $"● 已连接 {players} 个播放器 · 录制器在线——新变体编译时会实时传回。");
-                _devConnLabel.style.color = new Color(0.45f, 0.80f, 0.50f);
+                _devConnLabel.style.color = PerfLintStyle.Good;
             }
             else if (players > 0)
             {
@@ -285,14 +278,14 @@ namespace PerfLint.UI
                 _devConnLabel.text = L.Tr(
                     $"● {players} player(s) attached, but PerfLint's in-build recorder hasn't reported in. Most likely the running build predates enabling capture — make a fresh Development Build and run it. To verify, search the device's Player.log for \"PerfLint: recording compiled shader variants\".",
                     $"● 已连接 {players} 个播放器，但包内录制器没有上报。最常见原因：正在跑的包是在开启捕获之前打的——重新打一个 Development Build 再运行。可在设备 Player.log 里搜 “PerfLint: recording compiled shader variants” 验证。");
-                _devConnLabel.style.color = new Color(0.95f, 0.70f, 0.20f);
+                _devConnLabel.style.color = PerfLintStyle.Amber;
             }
             else
             {
                 _devConnLabel.text = L.Tr(
                     "No player attached. Build & Run attaches automatically (or attach via the Profiler); importing a file works without any connection.",
                     "未连接播放器。Build & Run 会自动连接（也可通过 Profiler 连接）；导入文件则完全不需要连接。");
-                _devConnLabel.style.color = new StyleColor(StyleKeyword.Null);
+                _devConnLabel.style.color = PerfLintStyle.Dim;
             }
         }
 
@@ -427,8 +420,7 @@ namespace PerfLint.UI
             // ── Shared "captured collection" picker (used by both warm-up and stripping) ──
             var pickCard = MakeCard();
             pickCard.style.marginTop = 4;
-            pickCard.Add(new Label(L.Tr("Use this captured collection", "使用以下已捕获集合"))
-            { style = { unityFontStyleAndWeight = FontStyle.Bold, marginBottom = 4 } });
+            pickCard.Add(CardTitle(L.Tr("Use this captured collection", "使用以下已捕获集合")));
             var svcField = new ObjectField
             {
                 objectType = typeof(ShaderVariantCollection),
@@ -442,8 +434,7 @@ namespace PerfLint.UI
 
             // ── Warm-up (recommended, safe) ──
             var warmCard = MakeCard();
-            warmCard.Add(new Label(L.Tr("Warm up at startup (Pro) · recommended", "启动预热（Pro）· 推荐"))
-            { style = { unityFontStyleAndWeight = FontStyle.Bold, marginBottom = 4, color = new Color(0.45f, 0.80f, 0.50f) } });
+            warmCard.Add(CardTitle(L.Tr("Warm up at startup (Pro) · recommended", "启动预热（Pro）· 推荐"), PerfLintStyle.Good));
             var warmToggle = new Toggle(L.Tr("Preload this collection at startup", "启动时预热此集合"));
             WrapToggleLabel(warmToggle);
             warmCard.Add(warmToggle);
@@ -459,8 +450,7 @@ namespace PerfLint.UI
                 if (svc == null)
                 {
                     warmInfo.text = L.Tr("Pick a captured collection above to enable warm-up.", "在上方选择已捕获集合以启用预热。");
-                    warmInfo.style.color = new StyleColor(StyleKeyword.Null);
-                    warmInfo.style.opacity = 0.6f;
+                    warmInfo.style.color = PerfLintStyle.Dimmer;
                     return;
                 }
                 int v = svc.variantCount, s = svc.shaderCount;
@@ -468,15 +458,13 @@ namespace PerfLint.UI
                 {
                     warmInfo.text = L.Tr($"✓ Preloaded — Unity precompiles all {v:N0} variants ({s:N0} shaders) at startup, so they won't hitch on first use.",
                                          $"✓ 已预热——Unity 启动时预编译全部 {v:N0} 个变体（{s:N0} 个着色器），首次使用不再卡顿。");
-                    warmInfo.style.color = new Color(0.45f, 0.80f, 0.50f);
-                    warmInfo.style.opacity = 1f;
+                    warmInfo.style.color = PerfLintStyle.Good;
                 }
                 else
                 {
                     warmInfo.text = L.Tr($"This collection has {v:N0} variants across {s:N0} shaders. Enable to precompile them at startup.",
                                          $"此集合含 {v:N0} 个变体、{s:N0} 个着色器。启用后启动时预编译。");
-                    warmInfo.style.color = new StyleColor(StyleKeyword.Null);
-                    warmInfo.style.opacity = 0.7f;
+                    warmInfo.style.color = PerfLintStyle.Dim;
                 }
             }
 
@@ -492,17 +480,22 @@ namespace PerfLint.UI
             warmCard.Add(new Label(L.Tr(
                 "Adds the collection to Project Settings → Graphics → Preloaded Shaders. Safe: warm-up only pre-compiles — it never removes anything, so it can't break the build.",
                 "把集合加入 Project Settings → Graphics → Preloaded Shaders。安全：预热只预编译、永不删除，不会弄坏 build。"))
-            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.5f, fontSize = 10, marginTop = 4, unityFontStyleAndWeight = FontStyle.Italic } });
+            { style = { whiteSpace = WhiteSpace.Normal, fontSize = 10, marginTop = 4, unityFontStyleAndWeight = FontStyle.Italic, color = PerfLintStyle.Dimmer } });
             container.Add(warmCard);
 
             // ── Build-time stripping (experimental, dangerous) ── hidden by default behind a collapsed foldout.
             // Research (docs/shader-strip-safety-research.md) concluded usage-based stripping can't be made safe: it
             // misuses the SVC (whose job is to KEEP/warm variants, not strip more) and fights Unity's already-correct
             // default stripping — it black-screened a real build. Kept only as a hidden expert escape hatch.
-            var stripCard = MakeCard();
+            // A tinted block, not a plain card: everything in it can break a build, and that is the one thing on this
+            // screen colour has to say before the words are read.
+            var stripCard = PerfLintStyle.Note(PerfLintStyle.NoteWarning);
             stripCard.style.marginBottom = 6;
-            stripCard.Add(new Label(L.Tr("Strips variants the build didn't capture — not recommended.", "剥掉捕获里没有的变体——不推荐。"))
-            { style = { unityFontStyleAndWeight = FontStyle.Bold, marginBottom = 4, color = new Color(0.95f, 0.70f, 0.20f) } });
+            stripCard.style.paddingTop = 10;
+            stripCard.style.paddingBottom = 10;
+            stripCard.style.paddingLeft = 14;
+            stripCard.style.paddingRight = 14;
+            stripCard.Add(CardTitle(L.Tr("Strips variants the build didn't capture — not recommended.", "剥掉捕获里没有的变体——不推荐。")));
 
             var enableToggle = new Toggle(L.Tr("Enable build-time stripping", "启用构建期剥离")) { value = settings.enabled };
             WrapToggleLabel(enableToggle);
@@ -544,7 +537,7 @@ namespace PerfLint.UI
             stripCard.Add(new Label(L.Tr(
                 "⚠ Stripping removes variants the build didn't capture — an incomplete capture can drop variants the player actually needs, rendering pink or a black screen (only visible in the built player). Prefer warm-up above. Only enable this if you can fully test the built player on every scene, quality level and platform. Turn it off and rebuild to recover.",
                 "⚠ 剥离会删掉捕获里没有的变体——捕获不全就会丢掉播放器真正需要的变体，导致粉红或黑屏（只在打出的包里才暴露）。优先用上面的预热。只有当你能在所有场景/画质/平台上完整测试构建产物时才启用。出问题就关掉它、重新打包即可恢复。"))
-            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.7f, fontSize = 11, marginTop = 4, color = new Color(0.95f, 0.75f, 0.45f) } });
+            { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 4, color = PerfLintStyle.Dim } });
 
             // Hidden by default — collapsed foldout keeps the experimental escape hatch available without promoting it.
             var advFold = new Foldout
@@ -581,8 +574,7 @@ namespace PerfLint.UI
 
             var card = MakeCard();
             card.style.marginTop = 4;
-            card.Add(new Label(L.Tr("Verify a test build (recommended)", "校验测试构建（推荐）"))
-            { style = { unityFontStyleAndWeight = FontStyle.Bold, marginBottom = 4 } });
+            card.Add(CardTitle(L.Tr("Verify a test build (recommended)", "校验测试构建（推荐）")));
 
             var toggle = new Toggle(L.Tr("Strict shader variant matching", "严格着色器变体匹配")) { value = cur.Value };
             WrapToggleLabel(toggle);
@@ -595,7 +587,7 @@ namespace PerfLint.UI
             card.Add(new Label(L.Tr(
                 "When on, the built player renders the error shader and logs a console error for any variant it's missing — instead of silently substituting the closest one. Turn it on for a test build to catch gaps (warm-up coverage, experimental stripping, or keywords toggled at runtime), then turn it off to ship with fuzzy fallback if you prefer. Player only.",
                 "开启后，构建出的播放器对任何缺失的变体会渲染错误着色器并在 Console 报错——而不是静默替换成最接近的。打测试包前开启它，揪出覆盖缺口（预热不全、实验性剥离、或运行时切换的 keyword）；之后若想要模糊回退再关掉。仅 Player 生效。"))
-            { style = { whiteSpace = WhiteSpace.Normal, opacity = 0.6f, fontSize = 11, marginTop = 4 } });
+            { style = { whiteSpace = WhiteSpace.Normal, fontSize = 11, marginTop = 4, color = PerfLintStyle.Dimmer } });
 
             return card;
         }
@@ -637,27 +629,28 @@ namespace PerfLint.UI
         private static void WrapToggleLabel(Toggle t)
         {
             var lbl = t.labelElement ?? t.Q<Label>();
-            if (lbl != null) { lbl.style.whiteSpace = WhiteSpace.Normal; lbl.style.minWidth = 0; }
+            if (lbl != null)
+            {
+                lbl.style.whiteSpace = WhiteSpace.Normal;
+                lbl.style.minWidth = 0;
+                lbl.style.color = PerfLintStyle.Ink;
+            }
         }
 
-        private static VisualElement MakeCard()
+        /// <summary>A card's heading. Bold, in the ink colour — or in the state colour when the card is about one.</summary>
+        private static Label CardTitle(string text, Color? tint = null) => new Label(text)
         {
-            var card = new VisualElement
-            {
-                style =
-                {
-                    marginBottom = 8,
-                    paddingTop = 10, paddingBottom = 10, paddingLeft = 14, paddingRight = 14,
-                    backgroundColor = new Color(1f, 1f, 1f, 0.03f),
-                    borderTopLeftRadius = 10, borderTopRightRadius = 10,
-                    borderBottomLeftRadius = 10, borderBottomRightRadius = 10,
-                    borderTopWidth = 1, borderBottomWidth = 1, borderLeftWidth = 1, borderRightWidth = 1,
-                }
-            };
-            var c = new Color(1f, 1f, 1f, 0.07f);
-            card.style.borderTopColor = c; card.style.borderBottomColor = c;
-            card.style.borderLeftColor = c; card.style.borderRightColor = c;
-            return card;
-        }
+            style = { unityFontStyleAndWeight = FontStyle.Bold, marginBottom = 4, whiteSpace = WhiteSpace.Normal,
+                      color = tint ?? PerfLintStyle.Ink }
+        };
+
+        /// <summary>
+        /// The shared card, at this window's spacing.
+        ///
+        /// It used to build its own: a white overlay at 0.03 with a 0.07 rule, both of which are additions to
+        /// whatever is behind them — correct on the dark editor they were eyeballed against and invisible on a
+        /// light one. The shared card sits on the theme's own helpbox surface instead.
+        /// </summary>
+        private static VisualElement MakeCard() => PerfLintStyle.Card();
     }
 }

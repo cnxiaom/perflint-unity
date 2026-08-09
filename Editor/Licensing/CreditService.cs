@@ -25,17 +25,34 @@ namespace PerfLint.Licensing
         // first call returns a real balance. Keep in sync if QUOTA changes there.
         private const int FreeDailyLimit = 10;
         private const int ProMonthlyLimit = 5000;
+        // Asset Store buyout: a ONE-TIME lifetime pack, not a monthly allowance. Mirrors
+        // QUOTA.assetStoreLifetime in worker.js — keep the two in step.
+        private const int BuyoutLifetimeLimit = 2000;
 
         /// <summary>Fired whenever the remaining balance changes, so the UI can refresh its display.</summary>
         public static event Action Changed;
 
-        // Paid-entitlement identity at the last seen change, so a real Free↔Pro switch can drop the now-stale
-        // balance: Free (daily) and Pro (monthly) are two separate server-side pools, so a count from one pool is
-        // meaningless for the other. Tracks HasActivePaidLicense — which IGNORES the offline grace window — NOT
-        // IsPro, so a grace-period flap (IsPro true→false→true on the same license: offline past grace, then a
-        // background re-validation restores it) does not look like a tier switch and does not wrongly wipe the
-        // still-valid Pro balance. Initialized on first access to the current state (no spurious reset).
-        private static bool _lastPaid = LicenseService.HasActivePaidLicense;
+        // Pool identity at the last seen change, so a real pool switch can drop the now-stale balance.
+        // There are THREE server-side pools and a count from one is meaningless for another:
+        //   Free = daily · subscription = monthly · Asset Store buyout = one-time lifetime.
+        //
+        // Keyed on the POOL, deliberately not on the provider name. Creem and Dodo share one monthly pool
+        // (usage:lic:<key> on the server), so moving between them is not a pool change and must not wipe a
+        // valid balance. Keying on the provider would also have punished every existing subscriber on the
+        // upgrade to this version: their stored provider is empty until the next background re-validation
+        // fills it in, and "" → "creem" would have looked like a switch and dropped a perfectly good count.
+        //
+        // Built on HasActivePaidLicense — which IGNORES the offline grace window — NOT IsPro, so a
+        // grace-period flap (IsPro true→false→true on the same license: offline past grace, then a
+        // background re-validation restores it) does not look like a switch and does not wrongly wipe the
+        // still-valid balance. Initialized on first access to the current state (no spurious reset).
+        private static string _lastPool = CurrentPool();
+
+        private static string CurrentPool()
+        {
+            if (!LicenseService.HasActivePaidLicense) return "free";
+            return LicenseSettings.IsPerpetualBuyout ? "paid:lifetime" : "paid:monthly";
+        }
 
         public static bool Known => EditorPrefs.GetBool(KKnown, false);
         public static int Remaining => EditorPrefs.GetInt(KRemaining, -1);
@@ -77,10 +94,22 @@ namespace PerfLint.Licensing
         /// <summary>Single-line balance label for use in the UI.</summary>
         public static string RemainingText()
         {
+            // A buyout's allowance is a one-time pack that never refills, so it needs its own wording:
+            // "left this period" would promise a reset that is never coming.
+            bool buyout = LicenseSettings.IsPerpetualBuyout;
+
             if (!Known)
+            {
+                if (buyout)
+                    return L.Tr($"AI credits: {BuyoutLifetimeLimit} one-time · ready", $"AI 额度：一次性 {BuyoutLifetimeLimit} 次 · 就绪");
                 return LicenseService.IsPro
                     ? L.Tr($"AI credits: {ProMonthlyLimit}/month · ready", $"AI 额度：每月 {ProMonthlyLimit} 次 · 就绪")
                     : L.Tr($"AI credits: {FreeDailyLimit}/day free · ready", $"AI 额度：每日 {FreeDailyLimit} 次免费 · 就绪");
+            }
+
+            if (buyout)
+                return L.Tr("AI credits left (one-time pack): ", "AI 剩余额度（一次性包）：") + Remaining;
+
             string reset = string.IsNullOrEmpty(ResetAt) ? "" : " · " + L.Tr("resets ", "重置于 ") + LicenseService.FormatExpiryLocal(ResetAt);
             return L.Tr("AI credits left this period: ", "本期 AI 剩余额度：") + Remaining + reset;
         }
@@ -91,19 +120,20 @@ namespace PerfLint.Licensing
         }
 
         /// <summary>
-        /// Called by <see cref="LicenseService"/> on any license change. If the paid entitlement just flipped
-        /// (a real Free↔Pro switch — activation / expiry / deactivation), the cached balance belongs to the wrong
-        /// pool, so drop it — <see cref="RemainingText"/> then shows the new tier's standby allowance
-        /// ("5000/month · ready" / "10/day free · ready") until the next /llm call returns the real balance.
-        /// Tracks <see cref="LicenseService.HasActivePaidLicense"/> (grace-window–independent), NOT IsPro, so an
-        /// offline grace-period flap on the SAME license does not wipe a valid balance. No-op when unchanged, so
+        /// Called by <see cref="LicenseService"/> on any license change. If the server-side pool just changed
+        /// (Free ↔ subscription ↔ Asset Store buyout — activation / expiry / deactivation / switching channels),
+        /// the cached balance belongs to the wrong pool, so drop it — <see cref="RemainingText"/> then shows the
+        /// new tier's standby allowance ("5000/month · ready" / "2000 one-time · ready" / "10/day free · ready")
+        /// until the next /llm call returns the real balance. Built on
+        /// <see cref="LicenseService.HasActivePaidLicense"/> (grace-window–independent), NOT IsPro, so an offline
+        /// grace-period flap on the SAME license does not wipe a valid balance. No-op when unchanged, so
         /// background re-validations don't wipe a known balance.
         /// </summary>
         internal static void OnLicenseChanged()
         {
-            bool now = LicenseService.HasActivePaidLicense;
-            if (now == _lastPaid) return;
-            _lastPaid = now;
+            string now = CurrentPool();
+            if (now == _lastPool) return;
+            _lastPool = now;
             ResetCache();
         }
 

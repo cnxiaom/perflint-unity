@@ -40,6 +40,16 @@ namespace PerfLint.Core
             /// <summary>True when this action cannot be undone via Edit &gt; Undo (see <see cref="OptimizePlan.IsIrreversible"/>).
             /// Advisory — surfaced so an agent can warn honestly; execution is editor-only for every decision item regardless.</summary>
             public bool Irreversible;
+
+            /// <summary>
+            /// True when NONE of this group's findings still carries a live <see cref="Finding.Action"/> — the scan came
+            /// back from disk and the delegates did not survive the trip. The group is still real (the waste is still
+            /// there and <see cref="Finding.WasActionable"/> records that a click could reach it), but it cannot be run
+            /// as-is: every executor bails on <c>Action == null</c>. The caller MUST re-scan the rule to revive the
+            /// delegates before dispatching, exactly as the auto tier relies on ApplyFixList reviving Fix delegates.
+            /// Ignoring this flag produces a checkbox that runs and does nothing at all.
+            /// </summary>
+            public bool NeedsRevive;
         }
 
         /// <summary>
@@ -101,25 +111,49 @@ namespace PerfLint.Core
                 if (sceneScoped && !string.IsNullOrEmpty(f.TargetPath) && !memorySceneScope.Contains(f.TargetPath))
                     continue; // asset not loaded by the open scene(s) → nothing perceivable to offer here
 
-                if (f.CanAutoFix)
+                // WasAutoFixable counts. A Fix delegate cannot survive the trip to disk, so every finding in a
+                // restored scan reads as not-fixable -- and this plan is built from the restored scan whenever the
+                // panel has not been rescanned since the last domain reload. Measured on urp3dsample: 24 findings
+                // worth 195.6 MB of one-click savings, all filed under "manual", the Optimize button gated off, and
+                // the Pipeline command answering an agent that there was nothing to optimise. ApplyFixList revives
+                // the delegates before applying, the same way FindingActions.ApplyRule does for a single rule.
+                if (f.CanAutoFix || f.WasAutoFixable)
                 {
                     plan.AutoItems.Add(f);
                     plan.AutoSavingsBytes += s;
                     if (!f.SavingsAreCeiling) plan.FirmActionableSavingsBytes += s;
                 }
-                else if (f.HasAction)
+                // WasActionable counts, for the same reason WasAutoFixable does one branch up: an Action delegate is no
+                // more serializable than a Fix delegate, so every finding in a restored scan reads as not-actionable.
+                // Only the auto tier was taught this, and the asymmetry had teeth — ASSET.AADUP001 (Addressables
+                // duplicate packing, the paid headline feature) fell straight through to the manual tier the moment the
+                // report came back from disk, which is the state the panel is in after any domain reload. Observed on a
+                // real project: 366 duplicate-packed assets filed under "no one-click available", the Autopilot's build
+                // plan reporting them as manual work, and the optimize button gated off entirely on any project whose
+                // build-size waste is Action-shaped only.
+                else if (f.HasAction || f.WasActionable)
                 {
                     if (!decisionByRule.TryGetValue(f.RuleId, out var g))
                     {
                         g = new DecisionGroup
                         {
                             RuleId = f.RuleId,
+                            // The action's own label is user-facing and localized, but it lives on the delegate that
+                            // just died on disk. The rule's group title is the same thing the main panel's row header
+                            // shows, so a revived-later group is still named something the reader recognises.
+                            Label = f.HasAction ? f.Action.Label : f.GroupTitleOrTitle,
                             Findings = new List<Finding>(),
-                            Label = f.Action.Label,
                             Caution = CautionFor(f.RuleId),
-                            Irreversible = IsIrreversible(f.RuleId)
+                            Irreversible = IsIrreversible(f.RuleId),
+                            NeedsRevive = true   // cleared below by the first finding that still has a live Action
                         };
                         decisionByRule[f.RuleId] = g;
+                    }
+                    if (f.HasAction)
+                    {
+                        // A live delegate anywhere in the group makes it runnable, and its label beats the fallback.
+                        g.NeedsRevive = false;
+                        g.Label = f.Action.Label;
                     }
                     g.Findings.Add(f);
                     g.SavingsBytes += s;
@@ -150,6 +184,32 @@ namespace PerfLint.Core
                 .ThenBy(m => m.RuleId, System.StringComparer.Ordinal)
                 .ToList();
             return plan;
+        }
+
+        /// <summary>
+        /// What running a <see cref="DecisionGroup.NeedsRevive"/> group does BEFORE its own confirmation appears, said
+        /// per rule because the rules do wildly different things and one sentence for all of them was wrong.
+        ///
+        /// Shipped as exactly that mistake for one commit: every revivable group was labelled "Addressables may ask
+        /// you to save modified scenes", including ASSET.DUP001, whose rescan is DuplicateAssetScanner re-hashing the
+        /// project and never touches Addressables. Tim caught it in a screenshot. Same failure the cross-reference
+        /// rule exists to prevent — a sentence about one capability printed next to another.
+        /// </summary>
+        public static string RescanNoteFor(string ruleId)
+        {
+            // The Addressables family runs Unity's own analysis, which REFUSES to start while any scene is dirty:
+            // it puts up a modal "Modified Scenes must be saved to continue" and blocks the editor until answered.
+            // Measured on a real project holding the main thread for six minutes.
+            if (!string.IsNullOrEmpty(ruleId) && ruleId.StartsWith("ASSET.AA", System.StringComparison.Ordinal))
+                return L.Tr("Re-scans this rule first — Addressables' analysis will not run while scenes are unsaved and asks you to save them.",
+                            "执行前会先重扫该规则——Addressables 的分析不允许存在未保存的场景，会先要求你保存。");
+
+            if (ruleId == "ASSET.DUP001")
+                return L.Tr("Re-scans this rule first, which re-hashes every asset in the project — on a large project that is not quick.",
+                            "执行前会先重扫该规则——它要对全工程资产重新哈希，大工程上不会很快。");
+
+            return L.Tr("Re-scans this rule first, to restore the action itself.",
+                        "执行前会先重扫该规则，以恢复该操作本身。");
         }
 
         /// <summary>
@@ -185,6 +245,7 @@ namespace PerfLint.Core
         /// auto/waste tier; every trade-off, reversible or not, is left for the user to run in the editor where its
         /// own confirmation dialog carries the full warning). Single source of truth, unit-tested.
         /// </summary>
-        internal static bool IsIrreversible(string ruleId) => ruleId == "ASSET.DUP001";
+        /// <summary>Deletes files / cannot be undone via Edit &gt; Undo. ASSET.DUP001 (duplicate merge) is the one such rule today. Public so any surface offering to run it can warn honestly and refuse to do it inline.</summary>
+        public static bool IsIrreversible(string ruleId) => ruleId == "ASSET.DUP001";
     }
 }

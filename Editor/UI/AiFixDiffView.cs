@@ -14,10 +14,12 @@ namespace PerfLint.UI
     /// </summary>
     public static class AiFixDiffView
     {
-        private static readonly Color RedHeader = new Color(0.93f, 0.45f, 0.45f);
-        private static readonly Color GreenHeader = new Color(0.45f, 0.80f, 0.50f);
-
-        private static readonly Color RiskColor = new Color(0.95f, 0.70f, 0.20f);
+        // The shared palette, not three more opinions of it. Properties rather than static readonly fields: a field
+        // initialiser samples the editor skin once, the first time the type is touched, and keeps that answer for the
+        // rest of the domain — so switching theme would leave every diff in the product coloured for the old one.
+        private static Color RedHeader => PerfLintStyle.Bad;
+        private static Color GreenHeader => PerfLintStyle.Good;
+        private static Color RiskColor => PerfLintStyle.Amber;
 
         /// <summary>Appends the proposal's diff block to <paramref name="area"/> (without clearing it or adding an apply button).</summary>
         public static void BuildDiffBlocks(VisualElement area, ScriptFixProposal p)
@@ -28,17 +30,18 @@ namespace PerfLint.UI
             // but they can still be applied manually, so the risk must be spelled out clearly here for the user to glance at before deciding.
             if (p.BehaviorRisk)
             {
-                var warn = new Label("⚠ " + L.Tr("AI flagged a possible behavior change: ", "AI 提示此修复可能改变行为：") +
-                                     (string.IsNullOrEmpty(p.RiskReason) ? L.Tr("review carefully before applying.", "请仔细复核后再应用。") : p.RiskReason))
+                // The shared caveat block: an amber fill plus an amber rule, with the sentence in it written as a
+                // sentence. It used to be amber text on an amber wash with no rule — one hue three times, at about
+                // half the contrast of ordinary body text, which is the exact shape of the bug the Autopilot's
+                // caveats were fixed for. The block says "caution"; the writing in it is just writing.
+                var warn = PerfLintStyle.Note(PerfLintStyle.NoteWarning);
+                warn.style.marginTop = 6;
+                warn.Add(new Label("⚠ " + L.Tr("AI flagged a possible behavior change: ", "AI 提示此修复可能改变行为：") +
+                                   (string.IsNullOrEmpty(p.RiskReason) ? L.Tr("review carefully before applying.", "请仔细复核后再应用。") : p.RiskReason))
                 {
-                    style =
-                    {
-                        whiteSpace = WhiteSpace.Normal, color = RiskColor, unityFontStyleAndWeight = FontStyle.Bold,
-                        marginTop = 6, marginBottom = 2,
-                        paddingTop = 3, paddingBottom = 3, paddingLeft = 6, paddingRight = 6,
-                        backgroundColor = new Color(0.95f, 0.70f, 0.20f, 0.12f)
-                    }
-                };
+                    style = { whiteSpace = WhiteSpace.Normal, color = PerfLintStyle.Ink,
+                              unityFontStyleAndWeight = FontStyle.Bold }
+                });
                 area.Add(warn);
             }
 
@@ -166,9 +169,11 @@ namespace PerfLint.UI
 
         private static string Clip(string s) => s.Length <= 80 ? s : s.Substring(0, 77) + "…";
 
+        /// <summary>The "N unchanged lines" markers around a file diff. A white at 0.45 washes out to nothing on a
+        /// light editor — the palette's quiet tint is stated per skin instead.</summary>
         private static Label Dim(string text) => new Label(text)
         {
-            style = { color = new Color(1, 1, 1, 0.45f), marginTop = 4, unityFontStyleAndWeight = FontStyle.Italic }
+            style = { color = PerfLintStyle.Dimmer, marginTop = 4, unityFontStyleAndWeight = FontStyle.Italic }
         };
 
         private static Label Header(string text, Color color, float marginTop) => new Label(text)

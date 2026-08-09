@@ -35,16 +35,65 @@ namespace PerfLint.Runtime
             return findings;
         }
 
+        /// <summary>
+        /// Merged frames needed before the game-side series may carry a verdict. Below this the median is being taken
+        /// over too few points to trust, and the whole-frame counter — thousands of samples, wrong scope — is the
+        /// better of two imperfect answers.
+        /// </summary>
+        /// <summary>
+        /// Below this many merged game-side frames, the game's own series is too short to take a median from and the
+        /// whole-frame counter is used instead. Shared with <see cref="RuntimeSessionStore"/>, which has to make the
+        /// same call for the Autopilot's PerfMeasurement — two copies of this number would be two chances to disagree
+        /// about whether a session can be judged at all.
+        /// </summary>
+        internal const int MinGameFrameSamples = 10;
+
         private static void FrameRate(RuntimeProfileResult r, List<Finding> findings)
         {
             var ft = r.FrameTimeNs;
             if (ft == null || !ft.HasData) return;
 
+            // Judged on the GAME's frame time when it is available.
+            //
+            // In the Editor the main thread runs EditorLoop and PlayerLoop in the same frame, and EditorLoop is the
+            // editor drawing its own windows. Measured on urp3dsample from two clean windows: 8.42 ms total = 5.41
+            // game + 2.75 editor, and 8.95 = 5.82 + 2.88 — about a third of the frame, and it would not exist on a
+            // device. Verdicts drawn from the whole frame therefore fail a project for work it does not ship.
+            //
+            // The MEDIAN is what makes this safe on the smaller sample. The game-side series comes from the merged
+            // frames (tens), not the counter's full window (thousands), so a p95 or a max off it would be shaky —
+            // which is exactly why FPS002 and FPS003 still use the counter. A median does not need the tail.
+            var gameFt = r.GameFrameTimeNs;
+            bool gameSide = gameFt != null && gameFt.HasData && gameFt.SampleCount >= MinGameFrameSamples;
+            var judged = gameSide ? gameFt : ft;
+
             // Use the MEDIAN (sustained) frame time, not the mean: a one-off level-gen/loading freeze inflates the mean (e.g. to "33 FPS") while the game
             // actually runs at 100 FPS steady-state. FPS001 is about *sustained* low frame rate; the catastrophic freezes are reported separately by FPS003.
-            double medMs = ft.Median / 1_000_000.0;
+            double medMs = judged.Median / 1_000_000.0;
             if (medMs <= 0) return;
             double fps = 1000.0 / medMs;
+
+            // The whole-frame figure stays on screen: it is what the editor actually spent, the reader can see it in
+            // the Profiler, and a verdict that quietly disagrees with a number they can look up reads as a bug.
+            double wholeMs = ft.Median / 1_000_000.0;
+            string scopeNote = gameSide && wholeMs > medMs
+                ? L.Tr($" This is your game's own main-thread time (inside PlayerLoop). The whole editor frame measured {wholeMs:0.0} ms — the difference is the Editor drawing its own windows, which a build does not do, so it is excluded from this verdict. ",
+                       $"这是你游戏自己的主线程耗时（PlayerLoop 内）。整个编辑器帧测得 {wholeMs:0.0} ms——差值是编辑器在画它自己的窗口，打包后不存在，因此不计入本判定。")
+                : gameSide
+                    ? ""
+                    : L.Tr(" This is the whole editor frame: the game's own share could not be isolated for this sample, so treat it as an upper bound on your frame cost. ",
+                           "这是整个编辑器帧的耗时：本次采样未能单独分出游戏自己的部分，请把它当作帧开销的**上界**。");
+
+            // How much of that frame was the GAME. In the Editor the main thread runs EditorLoop and PlayerLoop in
+            // the same frame, and EditorLoop is the editor drawing its own windows — measured on urp3dsample from two
+            // clean windows: 8.42 ms total = 5.41 game + 2.75 editor, and 8.95 = 5.82 + 2.88. **A third of the frame
+            // being reported is the editor**, and nothing said so.
+            //
+            // Stated, not judged on. The verdicts below still use the whole frame, because that is what the frame
+            // actually took and because PlayerLoop's total is not the same quantity as a frame's wall clock (VSync
+            // waits and render-thread sync sit outside it). Moving the thresholds onto it would rewrite every FPS
+            // verdict and invalidate every baseline on an equivalence nobody has checked. What the reader gets is the
+            // split, so a "45 FPS" that is really 68 FPS of game plus the editor is legible as such.
 
             if (medMs > 33.3) // < 30 FPS sustained
             {
@@ -55,6 +104,7 @@ namespace PerfLint.Runtime
                     title: L.Tr($"Low sustained frame rate: median {fps:0} FPS (main thread {medMs:0.0} ms/frame)", $"运行时持续帧率偏低：中位 {fps:0} FPS（主线程 {medMs:0.0} ms/帧）"),
                     detail: L.Tr($"The median main-thread frame time during sampling was {medMs:0.0} ms (~{fps:0} FPS), below 30 FPS — a sustained slowdown, not a one-off spike. ", $"采样期间主线程中位帧时间 {medMs:0.0} ms（约 {fps:0} FPS），低于 30 FPS——是持续性偏慢，而非一次性尖刺。") +
                             L.Tr("The main thread is the bottleneck. Expand the \"CPU Hotspots\" below to find the most expensive methods, then optimize line by line with the script GC analysis in the main panel. ", "主线程是瓶颈所在域。展开下方「CPU 热点」定位最耗时的方法，并结合主面板的脚本 GC 分析逐行优化。") +
+                            scopeNote +
                             L.Tr("(Your frame-rate target depends on your platform; mobile typically aims for 30/60 FPS.)", "（帧率目标取决于你的目标平台，移动端通常以 30/60 FPS 为线。）")));
             }
             else if (medMs > 22.2) // < 45 FPS sustained
@@ -65,7 +115,8 @@ namespace PerfLint.Runtime
                     severity: Severity.Warning,
                     title: L.Tr($"Moderate sustained frame rate: median {fps:0} FPS (main thread {medMs:0.0} ms/frame)", $"运行时持续帧率中等：中位 {fps:0} FPS（主线程 {medMs:0.0} ms/帧）"),
                     detail: L.Tr($"The median main-thread frame time during sampling was {medMs:0.0} ms (~{fps:0} FPS). If you target 60 FPS and need more headroom, ", $"采样期间主线程中位帧时间 {medMs:0.0} ms（约 {fps:0} FPS）。若目标 60 FPS 仍有余量需优化，") +
-                            L.Tr("expand the \"CPU Hotspots\" below to find the main cost centers.", "可展开下方「CPU 热点」定位主要耗时点。")));
+                            L.Tr("expand the \"CPU Hotspots\" below to find the main cost centers.", "可展开下方「CPU 热点」定位主要耗时点。") +
+                            scopeNote));
             }
         }
 
@@ -304,14 +355,24 @@ namespace PerfLint.Runtime
                 severity: sev,
                 title: L.Tr($"Runtime stutter spike: ~{displayMs:0} ms ({displayMs / System.Math.Max(avgMs, 0.01):0}x the {avgMs:0.0} ms average){titleSuffix}", $"运行时卡顿尖刺：约 {displayMs:0} ms（均值 {avgMs:0.0} ms 的 {displayMs / System.Math.Max(avgMs, 0.01):0} 倍）{titleSuffix}"),
                 detail: intro + deepNote + attribution + (string.IsNullOrEmpty(tail) ? "" : "\n" + tail) + extraNote,
-                targetPath: capturedCulprit,
+                targetPath: ScannerUtil.ScriptTarget(capturedCulprit, capturedMethod),
                 ping: string.IsNullOrEmpty(capturedCulprit) ? (System.Action)null : () => ScannerUtil.OpenScript(capturedCulprit, capturedMethod),
                 codeFile: offerLineAnalysis ? capturedCulprit : null);
         }
 
         private static void GcPerFrame(RuntimeProfileResult r, List<Finding> findings)
         {
-            var gc = r.GcPerFrameBytes;
+            // The game's allocation when the merge could read it, the process counter only as a fallback.
+            //
+            // "GC Allocated In Frame" counts the whole editor process, and in the Editor the process is not the game.
+            // Measured inside one Play Mode session on urp3dsample: 55 KB, 308 KB and 456 KB per frame at different
+            // moments — running an eval moved it eightfold — while PlayerLoop's subtree held a flat 2778 B and
+            // equalled the sum of its own GC.Alloc leaves. Every consequence of using the counter here was wrong in
+            // the same direction: 55 KB tripped the Critical threshold that 2.8 KB does not, the attribution appeared
+            // to explain only 9% when it in fact explains ~all of the game's allocation, and a real fix to game code
+            // moved the figure 0.4% because the signal was 5% of what was being measured.
+            bool gameSide = r.GameGcPerFrameBytes != null && r.GameGcPerFrameBytes.HasData;
+            var gc = gameSide ? r.GameGcPerFrameBytes : r.GcPerFrameBytes;
             if (gc == null || !gc.HasData) return;
 
             // Use the MEDIAN (sustained) per-frame allocation, not the mean: a level-gen/loading burst allocates MBs on a few frames and inflates the mean,
@@ -324,7 +385,17 @@ namespace PerfLint.Runtime
             if (medBytes >= 1024)
             {
                 Severity sev = medBytes >= 8 * 1024 ? Severity.Critical : Severity.Warning;
-                string intro = L.Tr($"During sampling, a median of {Human(medBytes)} of managed-heap allocation was produced per frame (peak {Human(maxBytes)}) — a sustained per-frame allocation (not a one-off level-gen burst; those are attributed per-culprit by the runtime stutter-spike findings above). Sustained per-frame allocation periodically triggers GC and causes stutter. ", $"采样期间每帧中位产生 {Human(medBytes)} 托管堆分配（峰值 {Human(maxBytes)}）——这是持续性的每帧分配（而非一次性关卡生成爆发，后者已由上方运行时尖刺 finding 逐 culprit 归因）。持续的每帧分配会周期性触发 GC、造成卡顿。");
+                // Said once, up front, because the reader may well have the Profiler open next to this showing a much
+                // larger number — and the difference between the two is the point, not a discrepancy to hide.
+                string scopeEn = gameSide ? " inside your game's PlayerLoop" : "";
+                string scopeCn = gameSide ? "游戏 PlayerLoop 内，" : "";
+                // When the game's share could not be isolated, the caveat is a sentence of its own rather than a
+                // parenthetical: it changes how every figure above it should be read, and burying it inside a
+                // bracket next to the peak is how a reader skips it.
+                string processNote = gameSide ? "" : L.Tr(
+                    "This figure is the whole editor process, not your game alone — this sample could not isolate the game's own share, so treat it as an upper bound. ",
+                    "这个数字是整个编辑器进程的口径，不只是你的游戏——本次采样未能分离出游戏自己的那部分，请当成上界看。");
+                string intro = L.Tr($"During sampling, a median of {Human(medBytes)} of managed-heap allocation was produced per frame{scopeEn} (peak {Human(maxBytes)}) — a sustained per-frame allocation (not a one-off level-gen burst; those are attributed per-culprit by the runtime stutter-spike findings above). Sustained per-frame allocation periodically triggers GC and causes stutter. ", $"采样期间每帧中位产生 {Human(medBytes)} 托管堆分配（{scopeCn}峰值 {Human(maxBytes)}）——这是持续性的每帧分配（而非一次性关卡生成爆发，后者已由上方运行时尖刺 finding 逐 culprit 归因）。持续的每帧分配会周期性触发 GC、造成卡顿。") + processNote;
 
                 var site = r.TopGcSite;
                 if (site != null && !string.IsNullOrEmpty(site.ScriptPath))
@@ -332,43 +403,80 @@ namespace PerfLint.Runtime
                     // Runtime attribution: point Locate at the actual per-frame allocator we measured this session, not the static "Script GC" panel.
                     string method = MethodNameOf(site.Method);
                     string sitePath = site.ScriptPath;
+                    int siteLine = site.Line;
+
+                    // A callstack knows the exact line; a Deep Profile marker knew only the method, and the line had
+                    // to be guessed by scanning the file for a declaration. Prefer the measured one when present.
+                    string target = siteLine > 0 ? sitePath + ":" + siteLine : ScannerUtil.ScriptTarget(sitePath, method);
+                    string atLine = siteLine > 0 ? L.Tr($" line {siteLine}", $" 第 {siteLine} 行") : "";
+
+                    // Package code cannot be edited in place, so the advice differs in kind — not in tone. Naming it
+                    // is still the useful move: the component can be removed, replaced, or knowingly accepted.
+                    string pkgName = site.IsPackage ? PackageNameOf(sitePath) : null;
+                    string advice = site.IsPackage
+                        ? L.Tr($"This is package code{(pkgName != null ? $" (`{pkgName}`)" : "")}, so the allocation is not yours to edit — but it is yours to decide about. Locate opens the exact line. The options are to remove or replace the component that runs it, restrict it to when it is actually needed, or accept the cost knowingly. ",
+                               $"这段代码在包里{(pkgName != null ? $"（`{pkgName}`）" : "")}，分配不是你能直接改的——但要不要留着是你的决定。Locate 会打开确切那一行。可选的做法：移除或替换跑它的那个组件、限制它只在真正需要时运行，或者明知代价地接受它。")
+                        : L.Tr("Click Locate to open it, then cut its allocations at the source (cache buffers/arrays instead of allocating each call, avoid per-frame GetComponent / LINQ / string concatenation / boxing; if it's a level-gen batch, allocate once and reuse). ",
+                               "点 Locate 打开它，从源头减少分配（缓存 buffer/数组而非每次新建、避免每帧 GetComponent/LINQ/字符串拼接/装箱；若是关卡生成的批量分配，改成分配一次复用）。");
+
+                    // How much of the headline this attribution actually accounts for. The two figures come from
+                    // different instruments — the headline from the "GC Allocated In Frame" counter, the attribution
+                    // from GC.Alloc samples — and on urp3dsample they differ 30-fold. Printing the site without the
+                    // ratio lets a 3% finding read as the cause; printing the ratio costs one sentence.
+                    double covered = site.SampledBytesPerFrame;
+                    double coverPct = covered > 0 && medBytes > 0 ? 100.0 * covered / medBytes : 0;
+                    // Only stated when it is genuinely partial. At near-full coverage the sentence would be noise,
+                    // and at zero we do not know the coverage at all (marker attribution, or a restored session).
+                    string coverage = coverPct > 0 && coverPct < 80
+                        ? L.Tr($"\n\n**These callstacks account for {Human(covered)}/frame — about {coverPct:0}% of the {Human(medBytes)} measured.** The rest allocated without a recorded callstack, so it cannot be attributed from this sample; the site below is the largest of what WAS attributed, not necessarily the largest overall. ",
+                               $"\n\n**这些调用栈合计 {Human(covered)}/帧，约占实测 {Human(medBytes)} 的 {coverPct:0}%。**其余部分分配时没有留下调用栈，本次采样无法归因；下面这个是**已归因部分**里最大的，不一定是整体最大的。")
+                        : "";
+
                     findings.Add(new Finding(
                         ruleId: "RUN.GC001",
                         domain: Domain.Runtime,
                         severity: sev,
                         title: L.Tr($"Runtime GC allocation: median {Human(medBytes)}/frame — heaviest allocator {site.Method}", $"运行时 GC 分配：中位 {Human(medBytes)}/帧——分配最大的是 {site.Method}"),
-                        detail: intro +
-                                L.Tr($"**Runtime attribution: the heaviest per-frame allocator measured was `{site.Method}` (up to ~{Human(site.BytesPerFrame)} in a single frame).** Click Locate to open it, then cut its allocations at the source (cache buffers/arrays instead of allocating each call, avoid per-frame GetComponent / LINQ / string concatenation / boxing; if it's a level-gen batch, allocate once and reuse). ", $"**运行时归因：本次单帧分配最大的是 `{site.Method}`（单帧最高约 {Human(site.BytesPerFrame)}）。**点 Locate 打开它，从源头减少分配（缓存 buffer/数组而非每次新建、避免每帧 GetComponent/LINQ/字符串拼接/装箱；若是关卡生成的批量分配，改成分配一次复用）。") +
-                                L.Tr("(No line-level Script-GC scan is offered here — the runtime allocation is inside this method's logic/subtree, not a static allocation pattern; Locate + manual review is the reliable path.)", "（这里不提供逐行「脚本 GC」扫描——运行时分配来自该方法的逻辑/子树，而非静态可识别的分配模式；Locate 打开人工审阅更可靠。）"),
-                        targetPath: sitePath,
-                        ping: () => ScannerUtil.OpenScript(sitePath, method)));
-                }
-                else if (!r.WasDeepProfile)
-                {
-                    // Couldn't attribute because Deep Profile was OFF → the Hierarchy has only coarse markers (BehaviourUpdate, etc.) that don't map to a
-                    // method. Don't send the user to an (often empty) static panel — tell them the one action that unlocks function-level GC attribution.
-                    findings.Add(new Finding(
-                        ruleId: "RUN.GC001",
-                        domain: Domain.Runtime,
-                        severity: sev,
-                        title: L.Tr($"Runtime GC allocation: median {Human(medBytes)}/frame (peak {Human(maxBytes)}) — enable Deep Profile to pinpoint the source", $"运行时 GC 分配：中位 {Human(medBytes)}/帧（峰值 {Human(maxBytes)}）——开 Deep Profile 才能定位来源"),
-                        detail: intro +
-                                L.Tr("**Deep Profile is OFF**, so these allocations can't be attributed to a specific method — the Hierarchy only has coarse markers. Turn on the \"Deep Profile\" toggle at the top of this panel and re-sample; this finding will then pinpoint the allocating function and Locate straight to it. ", "**未开启 Deep Profile**,无法把这些分配归因到具体方法——Hierarchy 只有粗粒度 marker。点本面板顶部的「Deep Profile」开关后重新采样,本条即可定位到分配函数并直接 Locate 过去。") +
-                                L.Tr("(Deep Profile has high overhead — use it for localization, not for measuring real frame rate.)", "（Deep Profile 开销大,仅用于定位,别用来测真实帧率。）")));
-                        // No Locate/Ping: without Deep Profile there is no function to open, and the static panel would likely be empty.
+                        detail: intro + coverage +
+                                L.Tr($"**Runtime attribution: the heaviest per-frame allocator measured was `{site.Method}`{atLine} (up to ~{Human(site.BytesPerFrame)} in a single frame).** ", $"**运行时归因：本次单帧分配最大的是 `{site.Method}`{atLine}（单帧最高约 {Human(site.BytesPerFrame)}）。**") +
+                                advice +
+                                // This used to read "no line-level Script-GC scan is offered here" while the card
+                                // rendered a "Line-level analysis" button right underneath it — the finding denying a
+                                // capability the UI was offering. The button is correct to exist (sometimes the
+                                // method really does contain a GetComponent or a LINQ chain the static scan names);
+                                // what was wrong is promising it will find something. So this says what the scan can
+                                // and cannot see, and the panel says the same thing when it comes up empty.
+                                L.Tr("(\"Line-level analysis\" re-scans this file for known allocation patterns — GetComponent / LINQ / string concatenation and the like. It may well find nothing: a measured allocation can take a shape the static patterns don't describe, such as boxing, a per-call closure, or a call into a package. Locate plus reading the line is the reliable path either way.)", "（「逐行分析」会按已知分配模式重扫这个文件——GetComponent / LINQ / 字符串拼接之类。它很可能什么都查不到：实测到的分配可能是静态模式描述不了的形状，比如装箱、每次调用产生的闭包、或调进某个包里。无论如何，Locate 打开那一行自己读，是更可靠的路径。）"),
+                        // Resolved NOW so it survives persistence: the method name lives in a closure, and a closure
+                        // does not come back from disk — a restored "heaviest allocator MouseLock.Update()" could
+                        // otherwise only highlight the file in the Project window.
+                        targetPath: target,
+                        ping: siteLine > 0
+                            ? (System.Action)(() => ScannerUtil.OpenScriptAtLine(sitePath, siteLine))
+                            : () => ScannerUtil.OpenScript(sitePath, method)));
                 }
                 else
                 {
-                    // Deep Profile was ON but no dominant runtime allocator resolved → the allocation is genuinely spread thin, or lands inside a third-party
-                    // package / engine call that isn't a user script. Point to the static Script GC analysis (which shows a helpful empty-state when it can't see it).
+                    // No dominant allocator resolved. There used to be two branches here, split on whether Deep
+                    // Profile was on, and the OFF one told the user to switch it on and re-sample. Both are gone,
+                    // because the premise is gone: GC.Alloc callstacks are recorded on every sample now, so "we
+                    // could not attribute this" no longer has a toggle as its remedy.
+                    //
+                    // That advice was worse than merely obsolete. On urp3dsample the entire per-frame GC was one
+                    // Visual Effect Graph binder, and enabling Deep Profile could not have revealed it either — the
+                    // package-path filter ran after resolution and discarded the only answer. The finding sent people
+                    // to pay two recompiles and two re-samples for a result that was structurally unreachable.
+                    //
+                    // What is left is the honest case: the allocation really is spread thin, or lands somewhere no
+                    // managed frame maps to a file in this project.
                     findings.Add(new Finding(
                         ruleId: "RUN.GC001",
                         domain: Domain.Runtime,
                         severity: sev,
                         title: L.Tr($"Runtime GC allocation: median {Human(medBytes)}/frame (peak {Human(maxBytes)}) — spread across many sites", $"运行时 GC 分配：中位 {Human(medBytes)}/帧（峰值 {Human(maxBytes)}）——分散在多处"),
                         detail: intro +
-                                L.Tr("No single runtime method dominates the allocation (it's spread across many sites, or lands inside a third-party package / engine call). Check the main PerfLint panel's \"Script GC / per-frame allocation\" analysis for line-level patterns (GetComponent / string concatenation / LINQ, etc.); ", "没有单一运行时方法主导分配（分散在多处,或落在第三方包/引擎调用里）。到主 PerfLint 面板的「脚本 GC / 每帧分配」分析里看逐行分配模式（GetComponent/字符串拼接/LINQ 等）;") +
-                                L.Tr("if it finds nothing, record a GC.Alloc sample in the Unity Profiler (CPU module → \"GC Alloc\" column) to catch boxing / package / engine allocations the static scan can't see.", "若查不到,用 Unity Profiler 录一段 GC.Alloc（CPU 模块的「GC Alloc」列）来捕获静态扫描看不到的装箱/包/引擎分配。"),
+                                L.Tr("No single method dominates the allocation. The allocation callstacks recorded during this sample either spread evenly across many sites, or land in code with no source file in this project (engine internals, IL-generated or dynamically emitted code). ", "没有单一方法主导这次分配。本次采样记录的分配调用栈要么均匀分散在多处，要么落在本工程里没有源文件的代码上（引擎内部、IL 生成或动态发射的代码）。") +
+                                L.Tr("Check the main PerfLint panel's \"Script GC / per-frame allocation\" analysis for line-level patterns (GetComponent / string concatenation / LINQ, etc.) — a static pattern spread over many call sites shows up there even when no single one stands out at runtime.", "到主 PerfLint 面板的「脚本 GC / 每帧分配」分析里看逐行分配模式（GetComponent/字符串拼接/LINQ 等）——一个分布在很多调用点上的静态模式，即使运行时没有单一大户，在那里也看得见。"),
                         ping: () => PerfLint.UI.PerfLintWindow.OpenWindow().FocusOnScriptGcRules()));
                 }
             }
@@ -396,8 +504,23 @@ namespace PerfLint.Runtime
                     ruleId: "RUN.MEM002",
                     domain: Domain.Runtime,
                     severity: Severity.Warning,
-                    title: L.Tr($"Managed heap keeps growing: +{Human(gcGrowth)} ({Human(gc.First)} → {Human(gc.Last)})", $"托管堆持续增长：+{Human(gcGrowth)}（{Human(gc.First)} → {Human(gc.Last)}）"),
-                    detail: L.Tr($"The managed heap (GC Used Memory) grew monotonically by {Human(gcGrowth)} within the sampling window. ", $"托管堆（GC Used Memory）在采样窗口内单调增长 {Human(gcGrowth)}。") +
+                    // The figure is TrendDelta — the second half's average minus the first half's — so the evidence
+                    // beside it is those two averages. It used to print First → Last, the very pair TrendDelta was
+                    // chosen over ("more resilient to single-frame spikes / endpoint noise"), and the two disagree
+                    // whenever the window happens to end just after a collection. Seen on screen:
+                    // "+29.2 MB (776.8 MB → 776.7 MB)" — a claim of growth evidenced by a fall.
+                    //
+                    // "Monotonically" went with it: comparing two half-averages cannot establish that a curve only
+                    // ever rose. What it establishes is what the sentence now says.
+                    title: L.Tr($"Managed heap keeps growing: +{Human(gcGrowth)} ({Human(gc.FirstHalfAvg)} → {Human(gc.SecondHalfAvg)} across the sample)", $"托管堆持续增长：+{Human(gcGrowth)}（采样前后半段均值 {Human(gc.FirstHalfAvg)} → {Human(gc.SecondHalfAvg)}）"),
+                    detail: L.Tr($"The managed heap (GC Used Memory) averaged {Human(gcGrowth)} more over the second half of the sampling window than over the first. ", $"托管堆（GC Used Memory）在采样窗口后半段的均值比前半段高 {Human(gcGrowth)}。") +
+                            // The two absolute figures in the title are the EDITOR PROCESS's heap, and without this
+                            // they read as the game's. Seen live on urp3dsample: "791.2 MB → 826.3 MB" on a sample
+                            // scene whose own managed heap is a tiny fraction of that — the Editor's own heap is
+                            // hundreds of MB before the game loads. The GROWTH is still the signal (which is why this
+                            // rule uses TrendDelta and MetricScope already classes GcUsedBytes as ContentPlusEditor);
+                            // the baseline it grows from is simply not the reader's.
+                            L.Tr("Those two figures are the whole Editor process's heap, not your game's — the Editor alone accounts for hundreds of MB before your scene loads, so read the GROWTH, not the absolute size. ", "标题里那两个绝对值是**整个编辑器进程**的堆，不是你游戏的——编辑器自身在场景加载前就有几百 MB，所以要看**增长量**，别看绝对大小。") +
                             L.Tr("The managed heap should fall back to a baseline after GC; a steadily rising baseline points more clearly to a **C#-side object leak** (held by strong references and unreclaimable) ", "托管堆在 GC 后本应回落到基线，基线被持续抬高更明确地指向 **C# 侧对象泄漏**（被强引用无法回收），") +
                             L.Tr("rather than ordinary asset loading.\n\n", "而非普通的资源加载。\n\n") +
                             L.Tr("Frequent causes (by prevalence):\n", "高频成因（按常见度）：\n") +
@@ -430,16 +553,26 @@ namespace PerfLint.Runtime
                         breakdown += L.Tr(". The growth is mainly on the **managed-heap side**: see RUN.MEM002 (C# object leak direction).", "。主要涨在**托管堆侧**：见 RUN.MEM002（C# 对象泄漏方向）。");
                     else if (gfxGrowth > growth * 0.5 && gfxGrowth > 30L * 1024 * 1024)
                         breakdown += L.Tr(". The growth is mainly on the **graphics-resources side**: check for RenderTextures new'd at runtime without Release(), and repeatedly loaded textures/materials that are never unloaded (call Resources.UnloadUnusedAssets when appropriate).", "。主要涨在**图形资源侧**：排查运行时 new 的 RenderTexture 未 Release()、重复加载未卸载的纹理/材质（适时 Resources.UnloadUnusedAssets）。");
+                    // The Deep Profile half of this sentence is gated on Deep Profile having actually been on. It used
+                    // to print unconditionally, so a run sampled with the toggle OFF was told its memory growth might
+                    // be Deep Profile's buffers and advised to turn Deep Profile off — an instruction to undo
+                    // something never done. Same shape as the compute-bound empty state that told people to enable a
+                    // toggle they had already enabled; that one was fixed by reading live state, and this one was
+                    // left. The measurement knows: r.WasDeepProfile.
                     else if (otherGrowth > growth * 0.5)
-                        breakdown += L.Tr(". Most of the growth falls **outside the managed heap/graphics**, mostly native allocations (containers/audio/physics) — it may also be Profiler buffer overhead from Editor + Deep Profile itself. **Turn off Deep Profile or re-test on device** before deciding whether it's a real leak.", "。大部分增长**未落入托管堆/图形**，多为 native 分配（容器/音频/物理）——也可能是 Editor + Deep Profile 自身的 Profiler 缓冲开销，**建议关掉 Deep Profile 或在真机复测**再判断是否真泄漏。");
+                        breakdown += r.WasDeepProfile
+                            ? L.Tr(". Most of the growth falls **outside the managed heap/graphics**, mostly native allocations (containers/audio/physics) — it may also be Profiler buffer overhead from Editor + Deep Profile itself. **Turn off Deep Profile or re-test on device** before deciding whether it's a real leak.", "。大部分增长**未落入托管堆/图形**，多为 native 分配（容器/音频/物理）——也可能是 Editor + Deep Profile 自身的 Profiler 缓冲开销，**建议关掉 Deep Profile 或在真机复测**再判断是否真泄漏。")
+                            : L.Tr(". Most of the growth falls **outside the managed heap/graphics**, mostly native allocations (containers/audio/physics). Some of it belongs to the Editor rather than your game — **re-test on device** before deciding whether it's a real leak.", "。大部分增长**未落入托管堆/图形**，多为 native 分配（容器/音频/物理）。其中一部分属于编辑器而非你的游戏——**建议在真机复测**再判断是否真泄漏。");
                 }
 
                 findings.Add(new Finding(
                     ruleId: "RUN.MEM001",
                     domain: Domain.Runtime,
                     severity: Severity.Info,
-                    title: L.Tr($"Runtime memory keeps growing: +{Human(growth)} ({Human(mem.First)} → {Human(mem.Last)})", $"运行时内存持续增长：+{Human(growth)}（{Human(mem.First)} → {Human(mem.Last)}）"),
-                    detail: L.Tr($"Total Used Memory grew by {Human(growth)} within the sampling window. **This may be a memory leak, or it may be normal asset loading / cache warm-up** — it needs verification: ", $"采样窗口内 Total Used Memory 增长了 {Human(growth)}。**可能是内存泄漏，也可能是正常的资源加载/缓存预热**，需复核：") +
+                    // Same pairing as MEM002: the number is a difference of half-averages, so the pair beside it is
+                    // those averages rather than the endpoints it was chosen over.
+                    title: L.Tr($"Runtime memory keeps growing: +{Human(growth)} ({Human(mem.FirstHalfAvg)} → {Human(mem.SecondHalfAvg)} across the sample)", $"运行时内存持续增长：+{Human(growth)}（采样前后半段均值 {Human(mem.FirstHalfAvg)} → {Human(mem.SecondHalfAvg)}）"),
+                    detail: L.Tr($"Total Used Memory averaged {Human(growth)} more over the second half of the sampling window than over the first. **This may be a memory leak, or it may be normal asset loading / cache warm-up** — it needs verification: ", $"Total Used Memory 在采样窗口后半段的均值比前半段高 {Human(growth)}。**可能是内存泄漏，也可能是正常的资源加载/缓存预热**，需复核：") +
                             L.Tr("re-sample during steady-state play (without loading new scenes/assets); if memory still grows monotonically, take and compare snapshots with the Unity Memory Profiler to pinpoint it.", "请在稳定运行（无加载新场景/资源）的状态下重新采样一段，若内存仍单调增长，再用 Unity Memory Profiler 抓快照对比定位。") +
                             breakdown));
             }
@@ -459,6 +592,8 @@ namespace PerfLint.Runtime
                 void CheckMem(string key, string label, double floorBytes)
                 {
                     if (r.CategoryCounters.TryGetValue(key, out var s) && s != null && s.HasData && s.TrendDelta >= floorBytes && s.Last > s.First)
+                        // These are already gated on Last > First above, so the endpoints agree with the direction
+                        // and may be shown — unlike MEM001/MEM002, which trigger on the trend alone.
                         grown.Add($"{label} +{Human(s.TrendDelta)} ({Human(s.First)} → {Human(s.Last)})");
                 }
 
@@ -543,8 +678,23 @@ namespace PerfLint.Runtime
                 severity: Severity.Info,
                 title: L.Tr($"Large graphics assets in memory: {assets[0].Name} {Human(assets[0].Bytes)} + more", $"显存占用大的图形资源：{assets[0].Name} {Human(assets[0].Bytes)} 等"),
                 detail: L.Tr("The biggest textures / render targets / meshes currently loaded (by runtime memory):\n  • ", "当前加载的最大纹理/渲染目标/网格（按运行时内存）：\n  • ") + string.Join("\n  • ", lines) + "\n\n" +
-                        L.Tr("Check whether each needs its current resolution/format: compress textures (ASTC / BCn) instead of RGBA32, lower an oversized import Max Size, generate mipmaps only where needed, and Release() runtime RenderTextures you no longer use. Whether a size is 'too big' depends on your platform's VRAM budget. ", "逐个确认是否需要当前分辨率/格式：纹理用压缩格式（ASTC / BCn）而非 RGBA32、调低过大的导入 Max Size、按需生成 mipmap，运行时不再用的 RenderTexture 及时 Release()。是否『过大』取决于目标平台显存预算。") +
-                        L.Tr("(Editor-only render targets — Game/Scene view, editor windows, gizmos — are filtered out; an occasional editor-internal asset may still slip through.) ", "（编辑器专用渲染目标——Game/Scene 视图、编辑器窗口、Gizmo——已过滤；个别编辑器内部资源仍可能漏网。）") +
+                        // Import-settings advice belongs to imported assets, and the list does not always contain
+                        // any. Printed unconditionally it contradicted the closing line two sentences later — "compress
+                        // textures, lower the import Max Size" above "these are runtime render targets, not project
+                        // assets". Seen live: six entries, every one of them a RenderTexture. canLocate already knows
+                        // which case this is; it was only being used to swap the last sentence.
+                        (canLocate
+                            ? L.Tr("Check whether each needs its current resolution/format: compress textures (ASTC / BCn) instead of RGBA32, lower an oversized import Max Size, generate mipmaps only where needed, and Release() runtime RenderTextures you no longer use. Whether a size is 'too big' depends on your platform's VRAM budget. ", "逐个确认是否需要当前分辨率/格式：纹理用压缩格式（ASTC / BCn）而非 RGBA32、调低过大的导入 Max Size、按需生成 mipmap，运行时不再用的 RenderTexture 及时 Release()。是否『过大』取决于目标平台显存预算。")
+                            : L.Tr("Whether a size is 'too big' depends on your platform's VRAM budget. ", "是否『过大』取决于目标平台显存预算。")) +
+                        L.Tr("(Editor-only render targets — Game/Scene view, editor windows, gizmos, the Profiler's own capture buffers — are filtered out; an occasional editor-internal asset may still slip through.) ", "（编辑器专用渲染目标——Game/Scene 视图、编辑器窗口、Gizmo、Profiler 自己的截图缓冲——已过滤；个别编辑器内部资源仍可能漏网。）") +
+                        // Said because the list cannot say it for itself. A camera/depth/TAA target IS the game's
+                        // rendering cost — unlike the editor buffers filtered above — but its SIZE is the Game view's,
+                        // and nothing in "63.3 MB" tells the reader that. Seen live on a 4K Game view: three targets
+                        // at 3840x2160 totalling 126 MB, read as the project's graphics budget.
+                        (sb.RenderWidth > 0 && sb.RenderHeight > 0
+                            ? L.Tr($"Note the render resolution these were allocated at: {sb.RenderWidth}x{sb.RenderHeight} — the Game view's size, not your target device's. Camera, depth and post-processing targets scale with it, so on a device rendering at a lower resolution they are correspondingly smaller. Imported texture assets in the list do not change. ",
+                                   $"注意这些目标是按 {sb.RenderWidth}×{sb.RenderHeight} 分配的——那是 Game 视图的尺寸，不是目标设备的。相机、深度、后处理目标都随它缩放，设备上按更低分辨率渲染时会相应变小。列表里导入的纹理资产则不受影响。")
+                            : "") +
                         closingLine,
                 ping: canLocate ? (System.Action)sb.SelectTopMemoryAssets : null));
         }
@@ -590,7 +740,7 @@ namespace PerfLint.Runtime
                 bool isWebGL = UnityEditor.EditorUserBuildSettings.activeBuildTarget == UnityEditor.BuildTarget.WebGL;
                 string detail = isWebGL
                     ? L.Tr("**The WebGL platform cannot provide GPU frame time** — browsers/WebGL don't expose GPU timing (timer queries). This is an inherent platform limitation, ", "**WebGL 平台无法提供 GPU 帧时间**——浏览器/WebGL 不暴露 GPU 计时（timer query），这是平台固有限制，") +
-                      L.Tr("not a sampling error, and it can't be solved by enabling the Profiler's GPU module. To gauge GPU load, look at **indirect indicators** instead: this panel's ", "不是采样出错，也无法通过开 Profiler 的 GPU 模块解决。判断 GPU 负载请改看**间接指标**：本面板的 ") +
+                      L.Tr("not a sampling error, and it can't be solved by enabling the Profiler's GPU module. To gauge GPU load, look at **indirect indicators** instead: the measured ", "不是采样出错，也无法通过开 Profiler 的 GPU 模块解决。判断 GPU 负载请改看**间接指标**：实测的 ") +
                       L.Tr("Draw Calls / Batches / SetPass / triangles, plus scene overdraw and texture/RT VRAM.\n", "Draw Call / Batch / SetPass / 三角面，以及场景 overdraw、纹理/RT 显存。\n") +
                       L.Tr("Also note: in editor Play Mode, even with the build target set to WebGL, rendering uses the **editor's own GPU**, not the real WebGL runtime — ", "另注意：编辑器 Play Mode 即便目标平台设为 WebGL，渲染走的也是**编辑器自身的显卡**，并非真实 WebGL 运行环境——") +
                       L.Tr("to measure real WebGL frame time, use browser-side tools like Chrome DevTools / Spector.js.", "要测真实 WebGL 的帧时间，需在浏览器侧用 Chrome DevTools / Spector.js 等工具。")
@@ -598,7 +748,7 @@ namespace PerfLint.Runtime
                       L.Tr("(FrameTimingManager often returns 0 in the editor, and frame data has no GPU column) — this is a Unity-version/editor limitation, not a PerfLint error. ", "（FrameTimingManager 在编辑器常返回 0、帧数据也无 GPU 列）——这是 Unity 版本/编辑器限制，非 PerfLint 出错。") +
                       L.Tr("How to investigate: (1) after upgrading to a 2022+ editor, PerfLint can read the Profiler \"GPU ms\" column directly; (2) enable the \"GPU\" module in the Unity Profiler window ", "排查：① 升级到 2022+ 编辑器后 PerfLint 可直接读 Profiler「GPU ms」列；② 在 Unity Profiler 窗口开「GPU」模块") +
                       L.Tr("to view GPU cost directly; (3) a device/Standalone build with Player ▸ Frame Timing Stats checked is more likely to produce data than the editor. ", "直接查看 GPU 耗时；③ 真机/Standalone 构建 + 勾 Player ▸ Frame Timing Stats 比编辑器更可能出数。") +
-                      L.Tr("Until then, use this panel's Draw Calls / Batches / SetPass / triangles as an indirect gauge of GPU load.", "在此之前，用本面板的 Draw Call / Batch / SetPass / 三角面作为 GPU 负载的间接判断。");
+                      L.Tr("Until then, use the measured Draw Calls / Batches / SetPass / triangles as an indirect gauge of GPU load.", "在此之前，用实测的 Draw Call / Batch / SetPass / 三角面作为 GPU 负载的间接判断。");
 
                 findings.Add(new Finding(
                     ruleId: "RUN.GPU001",
@@ -608,6 +758,30 @@ namespace PerfLint.Runtime
                         ? L.Tr("GPU frame time unavailable (inherent WebGL platform limitation, not an error)", "GPU 帧时间不可用（WebGL 平台固有限制，非错误）")
                         : L.Tr("GPU frame time unavailable — can't tell whether the GPU is the bottleneck", "GPU 帧时间不可用——无法判断 GPU 是否为瓶颈"),
                     detail: detail));
+                return;
+            }
+
+            // Refuse the verdict when the GPU series isn't a per-frame series.
+            //
+            // Comparing "GPU ms" against "CPU ms" is only meaningful if both are per-frame averages over the same
+            // frames. GPU timings come from FrameTimingManager sampled on an editor callback, and a sample count
+            // that exceeds the frame count proves the readings were duplicated rather than measured once per frame —
+            // at which point the average describes the editor's tick pattern, not the GPU. Saying "GPU idle, CPU is
+            // the bottleneck" off that would send someone optimizing the wrong half of their frame, which is worse
+            // than saying nothing. Real case: a 304-frame session carrying 2000 GPU samples reported 0.2 ms of GPU
+            // for a scene submitting 14M triangles per frame.
+            if (r.FrameCount > 0 && gpu.SampleCount > r.FrameCount * 1.2)
+            {
+                findings.Add(new Finding(
+                    ruleId: "RUN.GPU001",
+                    domain: Domain.Runtime,
+                    severity: Severity.Info,
+                    title: L.Tr("GPU frame time looks unreliable in this session — not judging CPU vs GPU",
+                                "本次采样的 GPU 帧时间不可信——不做 CPU/GPU 瓶颈判定"),
+                    detail: L.Tr($"This session recorded {gpu.SampleCount} GPU timings across {r.FrameCount} frames. More timings than frames means the same reading was picked up repeatedly instead of once per frame, so the average describes the sampling cadence rather than the GPU, and comparing it against CPU frame time would be meaningless.\n\n",
+                                 $"本次采样在 {r.FrameCount} 帧里记录了 {gpu.SampleCount} 个 GPU 计时。计时数多于帧数，说明同一个读数被重复采入、而非每帧采一次，因此该平均值反映的是采样节奏而不是 GPU，拿它和 CPU 帧时间比大小没有意义。\n\n") +
+                            L.Tr("Sample again — a fresh session records one GPU timing per frame. If it persists, the platform/graphics API likely isn't reporting frame timings, and the measured Draw Calls / SetPass / triangle figures are the honest indirect gauge of GPU load.",
+                                 "请重新采样——新的会话每帧只记录一个 GPU 计时。若仍然如此，多半是当前平台/图形 API 不上报帧计时，此时请用实测的 Draw Call / SetPass / 三角面作为 GPU 负载的诚实间接指标。")));
                 return;
             }
 
@@ -626,7 +800,12 @@ namespace PerfLint.Runtime
                     title: L.Tr($"GPU-bound: GPU {gpuMs:0.0} ms vs CPU {cpuMs:0.0} ms/frame (peak GPU {gpuMax:0.0} ms)", $"GPU 瓶颈：GPU {gpuMs:0.0} ms vs CPU {cpuMs:0.0} ms/帧（峰值 GPU {gpuMax:0.0} ms）"),
                     detail: L.Tr($"GPU frame time ({gpuMs:0.0} ms) exceeds the main-thread CPU frame time ({cpuMs:0.0} ms), meaning the GPU is the current frame-rate cap. ", $"GPU 帧时间（{gpuMs:0.0} ms）超过主线程 CPU 帧时间（{cpuMs:0.0} ms），说明 GPU 是当前帧率上限。") +
                             L.Tr("Optimization directions (ordered by payoff):\n", "优化方向（按效益排序）：\n") +
-                            L.Tr("1. Reduce triangle count or enable LOD (see RUN.GPU002);\n", "1. 减少三角面数或开启 LOD（见 RUN.GPU002）；\n") +
+                            // Gated cross-ref: RUN.GPU002 is only emitted above the triangle threshold, so pointing
+                            // at it unconditionally sends a GPU-bound project with modest geometry to a finding that
+                            // was never generated. Same discipline the two RUN.GPU004 references already follow.
+                            (r.Triangles != null && r.Triangles.HasData && r.Triangles.Avg >= TriangleFindingThreshold
+                                ? L.Tr("1. Reduce triangle count or enable LOD (see RUN.GPU002);\n", "1. 减少三角面数或开启 LOD（见 RUN.GPU002）；\n")
+                                : L.Tr("1. Reduce triangle count or enable LOD;\n", "1. 减少三角面数或开启 LOD；\n")) +
                             L.Tr("2. Reduce overdraw: fewer stacked transparent objects, enable Early-Z / Depth Prepass;\n", "2. 降低 Overdraw：减少半透明物体层叠、开启 Early-Z/Depth Prepass；\n") +
                             L.Tr("3. Simplify shader instructions: avoid heavy computation in the fragment shader; move what you can to the vertex stage;\n", "3. 精简 Shader 指令：避免在 Fragment Shader 里做复杂计算，能在顶点做的不放片元；\n") +
                             L.Tr("4. Lower the resolution or enable Dynamic Resolution;\n", "4. 降低分辨率或开启动态分辨率（Dynamic Resolution）；\n") +
@@ -646,13 +825,16 @@ namespace PerfLint.Runtime
             // GPU ≈ CPU (0.6–1.15×): both sides are balanced; no finding is generated to avoid noise.
         }
 
+        /// <summary>Average triangles per frame at which RUN.GPU002 is emitted. Shared so anything REFERRING to that finding can ask whether it exists.</summary>
+        internal const double TriangleFindingThreshold = 300_000;
+
         private static void TriangleDensity(RuntimeProfileResult r, List<Finding> findings)
         {
             var tri = r.Triangles;
             if (tri == null || !tri.HasData) return;
 
             double avgTri = tri.Avg;
-            if (avgTri < 300_000) return;
+            if (avgTri < TriangleFindingThreshold) return;
 
             Severity sev = avgTri >= 600_000 ? Severity.Critical : Severity.Warning;
 
@@ -678,8 +860,9 @@ namespace PerfLint.Runtime
                         string label = m.InstanceCount > 1
                             ? L.Tr($"{m.MeshName} (×{m.InstanceCount})", $"{m.MeshName}（×{m.InstanceCount}）")
                             : m.MeshName;
+                        // Both: the closure is what a live session clicks, the paths are what survives to disk.
                         (locateTargets ??= new List<Finding.LocateTarget>()).Add(
-                            new Finding.LocateTarget(label, () => sb.SelectMeshExamples(rank)));
+                            new Finding.LocateTarget(label, () => sb.SelectMeshExamples(rank), sb.MeshExamplePaths(rank)));
                     }
                 }
             }
@@ -829,6 +1012,38 @@ namespace PerfLint.Runtime
                 ping: () => sb.SelectInstancedExamples()));
         }
 
+        /// <summary>
+        /// The sampled-frame hit rate, phrased as evidence rather than as a verdict.
+        ///
+        /// This is the sentence a hotspot conclusion actually rests on: not "the editor's frame rate is low" (which is a property
+        /// of this machine and drifts ±13% between identical runs), but "the same code path was on the main thread in N of the M
+        /// representative frames we looked at". The counts always ship with the percentage — a rate is worth exactly as much as
+        /// its denominator, and the merge budget makes that denominator vary between projects. Persistence is asserted only from
+        /// the confidence bound, never from the raw rate, so 1-of-1 can't be spent as "100% of frames".
+        /// Returns "" when the sampler didn't track presence: no data means no sentence, not a hedged one.
+        /// </summary>
+        private static string HitRateDetail(Hotspot h)
+        {
+            if (h == null || !h.HasHitRate) return "";
+
+            string counts = L.Tr($"\n\n**Sampled-frame hit: {h.HitFrames}/{h.SampledFrames} ({h.HitRatePercent:0}%)** — ",
+                                 $"\n\n**采样帧命中：{h.HitFrames}/{h.SampledFrames}（{h.HitRatePercent:0}%）**——");
+
+            if (h.IsSustained)
+                return counts +
+                    L.Tr($"this marker was doing main-thread work in {h.HitFrames} of the {h.SampledFrames} representative frames examined, so it is a sustained per-frame cost, not a one-off. That persistence — not the editor's frame rate — is what makes this hotspot worth acting on: it describes your code path, so it carries over to the target device even though the millisecond figures above do not.",
+                         $"该 marker 在检查的 {h.SampledFrames} 个代表帧中有 {h.HitFrames} 帧在主线程上干活，属持续性的每帧开销，而非一次性。**让这条热点值得动手的是这个持续性，不是编辑器帧率**：它描述的是你的代码路径，故可迁移到目标设备——上面的毫秒数则不可。");
+
+            if (h.IsIntermittent)
+                return counts +
+                    L.Tr($"it only showed up in {h.HitFrames} of the {h.SampledFrames} representative frames, so this is periodic or occasional work, not a fixed per-frame cost. Optimise 'which frames trigger it, and why' — cutting a per-frame cost that isn't paid every frame won't move the average as much as the millisecond figure suggests.",
+                         $"它只出现在 {h.SampledFrames} 个代表帧中的 {h.HitFrames} 帧，属周期性/偶发工作，而非每帧固定开销。优化应聚焦「哪些帧触发、为何触发」——按每帧开销去砍一个并非每帧都付的成本，均值不会像上面的毫秒数暗示的那样降下来。");
+
+            return counts +
+                L.Tr($"{h.SampledFrames} representative frames aren't enough to say whether this is sustained or occasional (the true share lies roughly between {h.HitRateLowerBoundPercent:0}% and {h.HitRateUpperBoundPercent:0}%). Sample for longer to sharpen it.",
+                     $"{h.SampledFrames} 个代表帧还不足以判定它是持续还是偶发（真实占比大致在 {h.HitRateLowerBoundPercent:0}%–{h.HitRateUpperBoundPercent:0}% 之间）。采样时间拉长可以让这个判定更锐利。");
+        }
+
         private static void Hotspots(RuntimeProfileResult r, List<Finding> findings)
         {
             if (!r.HotspotsAvailable)
@@ -864,6 +1079,8 @@ namespace PerfLint.Runtime
                     ? L.Tr($"\n\n⚠ **Intermittent stutter spike**: the single-frame peak {h.PeakMsPerFrame:0.0} ms is far above the average {h.SelfMsPerFrame:0.00} ms — this isn't a sustained per-frame cost but a periodic/occasional burst on certain frames (e.g. scheduled recomputation, bursty loading, instantiation peaks). Optimization should focus on 'which frames, and why triggered', not treat it as a fixed per-frame cost.", $"\n\n⚠ **偶发卡顿尖刺**：单帧峰值 {h.PeakMsPerFrame:0.0} ms 远高于平均 {h.SelfMsPerFrame:0.00} ms——它不是每帧持续耗时，而是周期性/偶发地在某些帧爆发（如定时重算、突发加载、实例化峰值）。优化应聚焦『哪些帧、为何触发』，而非当作每帧固定开销。")
                     : "";
 
+                string hitDetail = HitRateDetail(h);
+
                 if (h.IsScript && IsPackageScript(h.ScriptPath))
                 {
                     // Hotspot is in a third-party package (under Packages/): usually read-only, library source shouldn't be edited, so don't guide toward line-level analysis / AI Fix
@@ -881,8 +1098,8 @@ namespace PerfLint.Runtime
                         detail: L.Tr($"Main-thread self-time hotspot \"{h.Marker}\" averages {h.SelfMsPerFrame:0.00} ms per frame, about {h.SharePercent:0.0}% of frame time. ", $"主线程 self-time 热点「{h.Marker}」平均每帧 {h.SelfMsPerFrame:0.00} ms，占帧时间约 {h.SharePercent:0.0}%。") +
                                 L.Tr($"This hotspot is inside {pkgLabel}, third-party code — you generally shouldn't edit library source directly (package re-import overwrites it, and it breaks official support), so no line-level analysis / AI Fix is offered here. ", $"该热点在{pkgLabel}内，属第三方代码——通常不应直接改库源码（包重导入会覆盖、且断官方支持），因此这里不提供逐行分析/AI Fix。") +
                                 L.Tr("The fix belongs at the **usage layer**: reduce call frequency (e.g. spread pathfinding/recomputation across frames, add throttling), reduce precision or scale (a coarser graph, fewer nodes/iterations), ", "优化应落在**用法层**：降低调用频率（如把寻路/重算分摊到多帧、加节流）、降低精度或规模（更粗的图、更少节点/迭代）、") +
-                                L.Tr("cache and reuse results, or evaluate a lighter alternative. Click Locate to open the source and help you find where you initiate the call.", "缓存结果复用、或评估更轻的替代实现。点 Locate 打开源码可帮你定位到自己发起调用的位置。") + spikeDetail,
-                        targetPath: capturedPath,
+                                L.Tr("cache and reuse results, or evaluate a lighter alternative. Click Locate to open the source and help you find where you initiate the call.", "缓存结果复用、或评估更轻的替代实现。点 Locate 打开源码可帮你定位到自己发起调用的位置。") + hitDetail + spikeDetail,
+                        targetPath: ScannerUtil.ScriptTarget(capturedPath, capturedMethod),
                         ping: () => ScannerUtil.OpenScript(capturedPath, capturedMethod)));
                 }
                 else if (h.IsScript)
@@ -896,8 +1113,8 @@ namespace PerfLint.Runtime
                         title: L.Tr($"CPU hotspot (script): {h.Marker} — {msText} ({h.SharePercent:0.0}%)", $"CPU 热点（脚本）：{h.Marker} — {msText}（{h.SharePercent:0.0}%）"),
                         detail: L.Tr($"Main-thread self-time hotspot \"{h.Marker}\" averages {h.SelfMsPerFrame:0.00} ms per frame, about {h.SharePercent:0.0}% of frame time. ", $"主线程 self-time 热点「{h.Marker}」平均每帧 {h.SelfMsPerFrame:0.00} ms，占帧时间约 {h.SharePercent:0.0}%。") +
                                 L.Tr("Runtime has confirmed this script is a CPU hotspot. Click \"Line-level analysis\" — there are two cases: (1) if the cost is per-frame allocation, the main panel pinpoints the lines and AI Fix can patch them; ", "运行时已证实此脚本是 CPU 热点。点「逐行分析」——分两种情况：① 若开销来自每帧分配，主面板会逐行定位、AI Fix 可一键修复；") +
-                                L.Tr("(2) if the analysis finds nothing, the hotspot is compute-bound (heavy loops/math, not allocation) — line-level GC analysis can't flag that; optimize the algorithm instead: do less per frame (throttle / spread across frames), cache results, or reduce iteration counts. The panel will tell you which case this is.", "② 若分析查不到东西，说明是计算密集型热点（重循环/数学，而非分配）——逐行 GC 分析标不出来，应改优化算法：每帧少干活（节流/分摊多帧）、缓存结果、减少迭代次数。面板会告诉你属于哪种情况。") + spikeDetail,
-                        targetPath: capturedPath,
+                                L.Tr("(2) if the analysis finds nothing, the hotspot is compute-bound (heavy loops/math, not allocation) — line-level GC analysis can't flag that; optimize the algorithm instead: do less per frame (throttle / spread across frames), cache results, or reduce iteration counts. The panel will tell you which case this is.", "② 若分析查不到东西，说明是计算密集型热点（重循环/数学，而非分配）——逐行 GC 分析标不出来，应改优化算法：每帧少干活（节流/分摊多帧）、缓存结果、减少迭代次数。面板会告诉你属于哪种情况。") + hitDetail + spikeDetail,
+                        targetPath: ScannerUtil.ScriptTarget(capturedPath, capturedMethod),
                         ping: () => ScannerUtil.OpenScript(capturedPath, capturedMethod),
                         codeFile: capturedPath));
                 }
@@ -909,7 +1126,7 @@ namespace PerfLint.Runtime
                         severity: sev,
                         title: L.Tr($"CPU hotspot: {h.Marker} — {msText} ({h.SharePercent:0.0}%)", $"CPU 热点：{h.Marker} — {msText}（{h.SharePercent:0.0}%）"),
                         detail: L.Tr($"Main-thread self-time hotspot \"{h.Marker}\" averages {h.SelfMsPerFrame:0.00} ms per frame, about {h.SharePercent:0.0}% of frame time. ", $"主线程 self-time 热点「{h.Marker}」平均每帧 {h.SelfMsPerFrame:0.00} ms，占帧时间约 {h.SharePercent:0.0}%。") +
-                                L.Tr("This marker couldn't be mapped to a project script (it may be an engine subsystem or third-party code); to dig deeper, expand the call stack for this marker in the Unity Profiler.", "该 marker 未能映射到工程脚本（可能是引擎子系统或第三方代码），如需深挖可在 Unity Profiler 中按此 marker 展开调用栈。") + spikeDetail));
+                                L.Tr("This marker couldn't be mapped to a project script (it may be an engine subsystem or third-party code); to dig deeper, expand the call stack for this marker in the Unity Profiler.", "该 marker 未能映射到工程脚本（可能是引擎子系统或第三方代码），如需深挖可在 Unity Profiler 中按此 marker 展开调用栈。") + hitDetail + spikeDetail));
                 }
             }
 
@@ -940,8 +1157,8 @@ namespace PerfLint.Runtime
                         severity: Severity.Info,
                         title: L.Tr("Want hotspots pinpointed to specific script methods? Enable Deep Profile and re-sample", "想把热点定位到具体脚本方法？开启 Deep Profile 再采样"),
                         detail: L.Tr("This run's hotspots are coarse-grained markers (e.g. BehaviourUpdate aggregates the Update of all scripts), so they can't be narrowed to a specific script. ", "本次热点为粗粒度 marker（如 BehaviourUpdate 聚合了所有脚本的 Update），未能精确到某个脚本。") +
-                                L.Tr("Turn on the \"Deep Profile\" toggle at the top of this panel (or in the Unity Profiler window), then re-enter Play Mode and sample; markers will refine to ClassName.Method(), ", "用本面板顶部的「Deep Profile」开关开启（或在 Unity Profiler 窗口开启）后重新进入 Play Mode 采样，marker 会细化为 ClassName.Method()，") +
-                                L.Tr("and this panel can then map hotspots to scripts and offer Locate / line-level analysis. Note that Deep Profile has high overhead — use it for localization only, not for measuring real frame rate.", "本面板即可把热点映射到脚本并提供 Locate / 逐行分析。注意 Deep Profile 开销很大，仅用于定位、勿用于测真实帧率。")));
+                                L.Tr("Turn on the \"Deep Profile\" toggle at the top of the PerfLint Runtime panel, Tools ▸ PerfLint ▸ Runtime Profiler (or in the Unity Profiler window), then re-enter Play Mode and sample; markers will refine to ClassName.Method(), ", "在 PerfLint Runtime 面板（Tools ▸ PerfLint ▸ Runtime Profiler）顶部打开「Deep Profile」开关（或在 Unity Profiler 窗口开启）后重新进入 Play Mode 采样，marker 会细化为 ClassName.Method()，") +
+                                L.Tr("and hotspots can then be mapped to scripts with Locate / line-level analysis. Note that Deep Profile has high overhead — use it for localization only, not for measuring real frame rate.", "之后即可把热点映射到脚本并提供 Locate / 逐行分析。注意 Deep Profile 开销很大，仅用于定位、勿用于测真实帧率。")));
                 }
             }
         }

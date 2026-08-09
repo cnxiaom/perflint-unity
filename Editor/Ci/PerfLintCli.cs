@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 using PerfLint.Core;
+using PerfLint.Runtime;
 using UnityEditor;
 using UnityEngine;
 
@@ -30,6 +31,14 @@ namespace PerfLint.Ci
     ///   # exit code: 0 = ok, 2 = error
     /// </code>
     ///
+    /// Fast export from what is already on disk (no rescan), including the last Play Mode measurement:
+    /// <code>
+    ///   Unity -batchmode -quit -projectPath &lt;proj&gt; \
+    ///     -executeMethod PerfLint.Ci.PerfLintCli.ExportLastReport \
+    ///     [-perflintReportHtml report.html] [-perflintOpenScene Assets/Scenes/Main.unity]
+    ///   # exit code: 0 = ok, 2 = nothing scanned yet / scene not found
+    /// </code>
+    ///
     /// The exit code and the JSON file are the machine-readable contract. The console
     /// line (prefixed PERFLINT_GATE / PERFLINT_REPORT) is a convenience for log greps.
     /// All of it is stable English and intentionally NOT localized.
@@ -48,6 +57,64 @@ namespace PerfLint.Ci
         public static void ExportReport()
         {
             ExitWith(ExportReportCore);
+        }
+
+        /// <summary>
+        /// Write the report from what is already on disk — the last scan plus the last Play Mode measurement — without
+        /// rescanning. Seconds instead of minutes, which is what makes it usable for "let me just look at the current
+        /// state", and it is the only export that can include a runtime measurement without re-entering Play Mode.
+        /// Exits 2 when nothing has been scanned yet.
+        /// </summary>
+        public static void ExportLastReport()
+        {
+            ExitWith(() =>
+            {
+                var opts = GateOptions.FromCommandLine(Environment.GetCommandLineArgs());
+                var path = string.IsNullOrEmpty(opts.ReportHtmlPath)
+                    ? Path.Combine(Directory.GetCurrentDirectory(), "PerfLintReport.html")
+                    : opts.ReportHtmlPath;
+
+                var restored = ScanResultStore.Load();
+                if (restored?.Result == null)
+                {
+                    Emit("PERFLINT_REPORT: ERROR no persisted scan — run a scan first (RunGate/ExportReport, or the editor panel)");
+                    return 2;
+                }
+
+                // A runtime measurement only counts for the scene it was taken in — the same rule the panel applies.
+                // Batch mode starts with no scene loaded, so without -perflintOpenScene the check can never pass;
+                // opening the sampled scene here is what makes a headless export able to carry the measurement.
+                if (!string.IsNullOrEmpty(opts.OpenScenePath))
+                {
+                    if (!File.Exists(opts.OpenScenePath))
+                    {
+                        Emit("PERFLINT_REPORT: ERROR scene not found: " + opts.OpenScenePath);
+                        return 2;
+                    }
+                    UnityEditor.SceneManagement.EditorSceneManager.OpenScene(
+                        opts.OpenScenePath, UnityEditor.SceneManagement.OpenSceneMode.Single);
+                }
+
+                var result = restored.Result;
+                var session = RuntimeSessionStore.Load();
+                var loaded = RuntimeSessionStore.ScenesInScope();
+                var display = RuntimeSessionStore.Merge(result, session, loaded);
+                WriteText(path, BuildHtml(display));
+
+                int runtimeCount = display.Findings.Count - result.Findings.Count;
+                Emit("PERFLINT_REPORT: OK path=" + path
+                     + " grade=" + display.HealthGrade() + " score=" + display.HealthScore()
+                     + " findings=" + display.Findings.Count
+                     + " runtimeFindings=" + runtimeCount);
+
+                // Never drop a measurement silently — an omitted runtime block reads as "nothing was measured".
+                if (session != null && session.Findings.Count > 0 && runtimeCount == 0)
+                    Emit("PERFLINT_REPORT: runtime measurement EXCLUDED — recorded in scene(s) ["
+                         + string.Join(", ", session.Scenes) + "] but ["
+                         + string.Join(", ", loaded) + "] is open; pass -perflintOpenScene <path> to include it");
+
+                return 0;
+            });
         }
 
         static int RunGateCore()
@@ -106,8 +173,16 @@ namespace PerfLint.Ci
                 Debug.Log(LogTag + " interactive editor — not exiting. Exit code would be " + code + ".");
         }
 
-        static string BuildHtml(ScanResult result) =>
-            HtmlReport.Build(result, Application.productName, DateTime.Now.ToString("yyyy-MM-dd HH:mm"));
+        // Folds in the measured runtime block when a Play Mode session applies to the scenes currently open, so a
+        // report exported headlessly carries the same evidence the editor's export does.
+        static string BuildHtml(ScanResult result)
+        {
+            var session = RuntimeSessionStore.Load();
+            var evidence = RuntimeSessionStore.Applies(session, RuntimeSessionStore.ScenesInScope())
+                ? session.ToEvidence()
+                : null;
+            return HtmlReport.Build(result, Application.productName, DateTime.Now.ToString("yyyy-MM-dd HH:mm"), evidence);
+        }
 
         static void WriteText(string path, string content)
         {
@@ -153,20 +228,23 @@ namespace PerfLint.Ci
         public readonly string GateJsonPath;
         /// <summary>Optional path to also write the HTML report during a gate run.</summary>
         public readonly string ReportHtmlPath;
+        /// <summary>Scene to open before exporting. Only meaningful for ExportLastReport, where it decides whether a runtime measurement is in scope.</summary>
+        public readonly string OpenScenePath;
 
-        public GateOptions(int minScore, int maxCritical, int maxWarning, string gateJsonPath, string reportHtmlPath)
+        public GateOptions(int minScore, int maxCritical, int maxWarning, string gateJsonPath, string reportHtmlPath, string openScenePath = null)
         {
             MinScore = minScore;
             MaxCritical = maxCritical;
             MaxWarning = maxWarning;
             GateJsonPath = gateJsonPath;
             ReportHtmlPath = reportHtmlPath;
+            OpenScenePath = openScenePath;
         }
 
         public static GateOptions FromCommandLine(string[] args)
         {
             int minScore = -1, maxCritical = 0, maxWarning = -1;
-            string gateJson = null, reportHtml = null;
+            string gateJson = null, reportHtml = null, openScene = null;
 
             if (args != null)
             {
@@ -179,11 +257,12 @@ namespace PerfLint.Ci
                         case "-perflintMaxWarning": maxWarning = ParseInt(NextArg(args, i), maxWarning); break;
                         case "-perflintGateJson": gateJson = NextArg(args, i); break;
                         case "-perflintReportHtml": reportHtml = NextArg(args, i); break;
+                        case "-perflintOpenScene": openScene = NextArg(args, i); break;
                     }
                 }
             }
 
-            return new GateOptions(minScore, maxCritical, maxWarning, gateJson, reportHtml);
+            return new GateOptions(minScore, maxCritical, maxWarning, gateJson, reportHtml, openScene);
         }
 
         static string NextArg(string[] args, int i) => (i + 1 < args.Length) ? args[i + 1] : null;

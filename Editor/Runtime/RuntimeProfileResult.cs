@@ -91,18 +91,77 @@ namespace PerfLint.Runtime
         public double SharePercent { get; }     // Fraction of main-thread frame time
         public string ScriptPath { get; }       // May be null/empty: the .cs asset path this marker maps to
 
+        /// <summary>
+        /// How many of the representative (uniformly sampled) frames this marker did main-thread work in.
+        /// Together with <see cref="SampledFrames"/> this is the **sampled-frame hit rate** — the reason a hotspot conclusion
+        /// is allowed to be stated at all: "the same user code path occupies the main thread in the great majority of sampled
+        /// frames" is a claim about the code path, not about this machine's frame rate, so it survives machine drift (which
+        /// contaminates whole-frame time by ±13%) essentially untouched. 0 when the sampler did not track it.
+        /// </summary>
+        public int HitFrames { get; }
+
+        /// <summary>
+        /// The denominator: representative frames actually examined during the merge. Ships with the rate on purpose —
+        /// a hit rate is only as strong as the number of frames behind it, and the merge budget makes that number vary.
+        /// </summary>
+        public int SampledFrames { get; }
+
         public bool IsScript => !string.IsNullOrEmpty(ScriptPath);
 
         /// <summary>Peak is significantly higher than average (≥2×) → occasional spike rather than a sustained hotspot.</summary>
         public bool IsSpiky => PeakMsPerFrame >= SelfMsPerFrame * 2;
 
-        public Hotspot(string marker, double selfMsPerFrame, double peakMsPerFrame, double sharePercent, string scriptPath)
+        /// <summary>False when the sampler didn't track presence (legacy/degraded paths) — callers must then say nothing about persistence.</summary>
+        public bool HasHitRate => SampledFrames > 0;
+
+        /// <summary>Share of representative frames this marker appeared in (0–100). Quote it with <see cref="HitFrames"/>/<see cref="SampledFrames"/>, never alone.</summary>
+        public double HitRatePercent => SampledFrames > 0 ? 100.0 * HitFrames / SampledFrames : 0;
+
+        // 95% Wilson score interval. The point estimate alone would let 1-of-1 read as "100% of frames" — the bound is what
+        // keeps a small denominator from being spent as confidence. 8/8 → lower bound 68%; 24/24 → 86%; 1/1 → 21%.
+        private const double WilsonZ = 1.96;
+
+        /// <summary>Lower bound of the 95% confidence interval on the hit rate (0–100). This, not the raw rate, is what may be treated as confidence.</summary>
+        public double HitRateLowerBoundPercent => WilsonBound(HitFrames, SampledFrames, -1);
+
+        /// <summary>Upper bound of the 95% confidence interval on the hit rate (0–100).</summary>
+        public double HitRateUpperBoundPercent => WilsonBound(HitFrames, SampledFrames, +1);
+
+        /// <summary>Confident (95%) that the marker runs in more than 60% of frames → a sustained per-frame cost, safe to describe as "every frame".</summary>
+        public const double SustainedLowerBoundPercent = 60.0;
+        /// <summary>Confident (95%) that the marker runs in fewer than half the frames → periodic/occasional, not a fixed per-frame cost.</summary>
+        public const double IntermittentUpperBoundPercent = 50.0;
+
+        public bool IsSustained    => HasHitRate && HitRateLowerBoundPercent >= SustainedLowerBoundPercent;
+        public bool IsIntermittent => HasHitRate && HitRateUpperBoundPercent < IntermittentUpperBoundPercent;
+
+        /// <summary>Wilson score bound for hits/samples, sign −1 = lower, +1 = upper. Returns a percentage clamped to [0,100]; 0 when there is no denominator.</summary>
+        public static double WilsonBound(int hits, int samples, int sign)
+        {
+            if (samples <= 0) return 0;
+            if (hits < 0) hits = 0;
+            if (hits > samples) hits = samples;
+
+            double n = samples;
+            double p = hits / n;
+            double z2 = WilsonZ * WilsonZ;
+            double denom = 1.0 + z2 / n;
+            double center = (p + z2 / (2 * n)) / denom;
+            double margin = (WilsonZ / denom) * Math.Sqrt(p * (1 - p) / n + z2 / (4 * n * n));
+            double v = center + sign * margin;
+            return Math.Max(0.0, Math.Min(1.0, v)) * 100.0;
+        }
+
+        public Hotspot(string marker, double selfMsPerFrame, double peakMsPerFrame, double sharePercent, string scriptPath,
+            int hitFrames = 0, int sampledFrames = 0)
         {
             Marker = marker;
             SelfMsPerFrame = selfMsPerFrame;
             PeakMsPerFrame = peakMsPerFrame;
             SharePercent = sharePercent;
             ScriptPath = scriptPath;
+            HitFrames = hitFrames;
+            SampledFrames = sampledFrames;
         }
     }
 
@@ -165,9 +224,52 @@ namespace PerfLint.Runtime
         public string ScriptPath { get; }
         public string Method { get; }
         public double BytesPerFrame { get; }
-        public GcAllocSite(string scriptPath, string method, double bytesPerFrame)
+
+        /// <summary>
+        /// 1-based line the allocation was recorded at, or 0 when unknown.
+        ///
+        /// Non-zero only for callstack attribution: a Deep Profile marker names a method and nothing finer, whereas a
+        /// stack frame carries the exact line. Locate uses it when present and falls back to finding the method
+        /// declaration when not.
+        /// </summary>
+        public int Line { get; }
+
+        /// <summary>
+        /// The allocation is inside a package rather than the user's own scripts.
+        ///
+        /// Recorded rather than filtered. Package allocations used to be dropped during attribution, on the reasoning
+        /// that we only report what the user can change — but dropping the only answer produces silence, not
+        /// restraint: urp3dsample's entire per-frame GC is one Visual Effect Graph binder, and GC001 responded with
+        /// "this sample couldn't pin it to a method" and a suggestion to enable Deep Profile, which could not have
+        /// helped either because the filter runs after resolution. "Your allocation is in this package method" is
+        /// actionable — the binder can be removed, replaced, or accepted — and it is the truth.
+        /// </summary>
+        public bool IsPackage { get; }
+
+        /// <summary>
+        /// What ALL the allocation samples in this session added up to, per frame — the denominator for how much of
+        /// the measured allocation this attribution explains. 0 when unknown (marker-name attribution, or a restored
+        /// session).
+        ///
+        /// Carried because the two figures a GC finding shows come from different instruments and can disagree by an
+        /// order of magnitude. The headline is the "GC Allocated In Frame" counter; the attribution is built from
+        /// GC.Alloc samples in the frame hierarchy. Measured on urp3dsample: counter 96 KB/frame, samples in those
+        /// same frames 2.8 KB — 2.9% coverage. Printing "heaviest allocator X (up to ~2.2 KB)" under a 55 KB headline
+        /// with no ratio invites the reader to take 3% for the cause, which is the kind of confident wrongness this
+        /// project treats as worse than saying nothing.
+        ///
+        /// Why the remaining allocation carries no sample is UNRESOLVED. EditorLoop's subtree holds no GC.Alloc
+        /// samples either, so "it is the editor's" is unproven; and the editor records no profiler frames at all
+        /// outside Play Mode, so there is no idle baseline to compare against. Until that is settled the honest move
+        /// is to state the coverage, not to explain it.
+        /// </summary>
+        public double SampledBytesPerFrame { get; }
+
+        public GcAllocSite(string scriptPath, string method, double bytesPerFrame, int line = 0, bool isPackage = false,
+            double sampledBytesPerFrame = 0)
         {
             ScriptPath = scriptPath; Method = method; BytesPerFrame = bytesPerFrame;
+            Line = line; IsPackage = isPackage; SampledBytesPerFrame = sampledBytesPerFrame;
         }
     }
 
@@ -219,6 +321,46 @@ namespace PerfLint.Runtime
         /// <summary>Top steady-state per-frame GC allocator (runtime attribution for RUN.GC001), or null when none dominant / GC column unavailable.</summary>
         public GcAllocSite TopGcSite { get; }
 
+        /// <summary>
+        /// Per-frame allocation inside PlayerLoop — the GAME's allocation, as opposed to
+        /// <see cref="GcPerFrameBytes"/>, which is the whole editor process. Null when the merge could not read it
+        /// (no hotspot merge, or an older session).
+        ///
+        /// The two are not variations on one number. Measured inside a single Play Mode session on urp3dsample: the
+        /// counter read 55 KB, 308 KB and 456 KB per frame at different moments — running an eval moved it eightfold
+        /// — while PlayerLoop's subtree held a flat 2778 B the whole time, and that subtree total equalled the sum of
+        /// the GC.Alloc leaves beneath it. So the counter is dominated by whatever the editor is doing, and a finding
+        /// or a before/after comparison built on it is measuring the wrong process.
+        ///
+        /// A lower bound rather than the truth — but a narrow one, and the gap has been measured rather than assumed.
+        /// The GC column is a SUBTREE total, so an allocation needs no marker of its own, only some marker above it
+        /// inside PlayerLoop, which every Update/LateUpdate/coroutine has; PlayerLoop's column equalled the sum of
+        /// the GC.Alloc leaves beneath it exactly (2778 = 2778). And scanning all 32 thread views for top-level GC
+        /// columns — not merely for the leaves, which depend on callstack recording — found allocation on the main
+        /// thread only. That matches how Unity works: Job System and Burst code uses unmanaged containers and does
+        /// not allocate managed memory at all.
+        ///
+        /// What genuinely stays invisible is managed allocation on a Task or Thread the user started themselves.
+        /// </summary>
+        public MetricStats GameGcPerFrameBytes { get; }
+
+        /// <summary>
+        /// Main-thread nanoseconds spent inside PlayerLoop — the GAME's work — where <see cref="FrameTimeNs"/> is the
+        /// whole editor frame. Null when the merge could not read it.
+        ///
+        /// Measured on urp3dsample, twice, from clean windows: 8.42 ms total = 5.41 game + 2.75 editor; 8.95 = 5.82 +
+        /// 2.88. **About a third of a measured frame is the editor drawing its own windows**, and nothing on screen
+        /// said so.
+        ///
+        /// Reported, not judged on. Unlike the GC pair — where the counter was dominated by allocation with no
+        /// relation to the game and swapping was clearly right — the frame-time counter is a real measurement of a
+        /// real frame; the editor's share of it genuinely happens, it just would not happen on a device. And
+        /// PlayerLoop's total is not a drop-in replacement: it is main-thread work inside the player loop, not a
+        /// frame's wall clock (VSync waits and render-thread sync sit outside it). Moving the FPS verdicts onto it
+        /// would change every threshold and invalidate every baseline on an unverified equivalence.
+        /// </summary>
+        public MetricStats GameFrameTimeNs { get; }
+
         /// <summary>Per-object-category counters over the sampling window (e.g. "GameObject Count", "Texture Memory") — used by RUN.MEM003 to name which category of objects/assets grew (leak-suspect: not destroyed). May be null; individual entries may have no data on unsupported platforms.</summary>
         public IReadOnlyDictionary<string, MetricStats> CategoryCounters { get; }
 
@@ -243,8 +385,12 @@ namespace PerfLint.Runtime
             SceneBatchingSnapshot sceneBatching = null,
             IReadOnlyList<WorstFrameInfo> worstFrames = null,
             GcAllocSite topGcSite = null,
-            IReadOnlyDictionary<string, MetricStats> categoryCounters = null)
+            IReadOnlyDictionary<string, MetricStats> categoryCounters = null,
+            MetricStats gameGcPerFrameBytes = null,
+            MetricStats gameFrameTimeNs = null)
         {
+            GameGcPerFrameBytes = gameGcPerFrameBytes;
+            GameFrameTimeNs = gameFrameTimeNs;
             DurationSeconds = durationSeconds;
             FrameCount = frameCount;
             FrameTimeNs = frameTimeNs;
@@ -275,13 +421,18 @@ namespace PerfLint.Runtime
         /// </summary>
         public RuntimeProfileResult WithHotspots(
             IReadOnlyList<Hotspot> hotspots, bool hotspotsAvailable, IReadOnlyList<WorstFrameInfo> worstFrames = null,
-            MetricStats gpuOverride = null, GcAllocSite topGcSite = null) =>
+            MetricStats gpuOverride = null, GcAllocSite topGcSite = null, MetricStats gameGcPerFrame = null,
+            MetricStats gameFrameTime = null) =>
             new RuntimeProfileResult(
                 DurationSeconds, FrameCount, FrameTimeNs, GcPerFrameBytes, TotalMemoryBytes,
                 TotalReservedBytes, GcUsedBytes, GfxUsedBytes,
                 DrawCalls, SetPassCalls, Batches, Triangles, Vertices,
                 (gpuOverride != null && gpuOverride.HasData) ? gpuOverride : GpuFrameTimeNs,
-                hotspots, hotspotsAvailable, WasDeepProfile, SceneBatching, worstFrames, topGcSite, CategoryCounters);
+                hotspots, hotspotsAvailable, WasDeepProfile, SceneBatching, worstFrames, topGcSite, CategoryCounters,
+                // The merge is where this can be read at all, so a merge that produced one wins; otherwise keep what
+                // this result already had rather than dropping it.
+                gameGcPerFrame ?? GameGcPerFrameBytes,
+                gameFrameTime ?? GameFrameTimeNs);
 
         /// <summary>Convenience overload: a single worst frame → a one-item list. Used by tests and simple callers.</summary>
         public RuntimeProfileResult WithHotspots(

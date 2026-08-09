@@ -127,6 +127,33 @@ namespace PerfLint.UI
             return (i >= 0 && i < names.Length) ? names[i] : i.ToString();
         }
 
+        /// <summary>
+        /// The most recently built deck, so <see cref="Reveal"/> can open one that is already on screen. Weakly held
+        /// in the sense that it is allowed to be stale: a Foldout outlives nothing here, and after a domain reload
+        /// this is null until the window rebuilds. Every read guards for both.
+        /// </summary>
+        private static Foldout _live;
+
+        /// <summary>
+        /// Opens the Runtime Profiler with this deck EXPANDED — the destination PERF.TEXSTR001's own text names
+        /// ("tune Memory Budget / Max Level Reduction in the Texture Streaming section") and, until now, had no button
+        /// for. That finding needs it more than most: it reports how much could stream, and on a scene whose pool
+        /// (27.8 MB measured) sits under the budget (512 MB) the honest answer is that turning streaming on changes
+        /// nothing until the budget comes down. Sending someone to a collapsed foldout they have to find is the same
+        /// as not sending them.
+        ///
+        /// Setting the pref alone is not enough: Build runs once per window instance and an instance survives domain
+        /// reloads with its tree intact, so a window that is already open would never re-read it. The live deck is
+        /// opened directly — guarded, because it may belong to a window that has since been closed.
+        /// </summary>
+        public static void Reveal()
+        {
+            EditorPrefs.SetBool(ExpandedPref, true);
+            PerfLintRuntimeWindow.Open();
+            var fold = _live;
+            if (fold != null && fold.panel != null) fold.value = true;
+        }
+
         public static VisualElement Build()
         {
             var fold = new Foldout
@@ -134,6 +161,7 @@ namespace PerfLint.UI
                 text = L.Tr("Texture Streaming (Mipmap Streaming) tuning", "Texture Streaming（Mipmap 串流）调参"),
                 value = EditorPrefs.GetBool(ExpandedPref, false)
             };
+            _live = fold;
             fold.RegisterValueChangedCallback(e => EditorPrefs.SetBool(ExpandedPref, e.newValue));
             fold.style.marginBottom = 8;
 
@@ -144,7 +172,7 @@ namespace PerfLint.UI
             var stateLine = new Label { style = { whiteSpace = WhiteSpace.Normal, unityFontStyleAndWeight = FontStyle.Bold } };
             var savingLine = new Label { style = { whiteSpace = WhiteSpace.Normal, marginTop = 2 } };
             var budgetLine = new Label { style = { whiteSpace = WhiteSpace.Normal, marginTop = 2 } };
-            var countsLine = new Label { style = { fontSize = 11, opacity = 0.85f, whiteSpace = WhiteSpace.Normal, marginTop = 2 } };
+            var countsLine = new Label { style = { fontSize = 11, color = PerfLintStyle.Dim, whiteSpace = WhiteSpace.Normal, marginTop = 2 } };
             body.Add(stateLine);
             body.Add(savingLine);
             body.Add(budgetLine);
@@ -196,7 +224,7 @@ namespace PerfLint.UI
                 body.Add(field);
             }
 
-            var reset = new Button(() =>
+            var reset = PerfLintStyle.AsSecondary(new Button(() =>
             {
                 QualitySettings.streamingMipmapsMemoryBudget = DefaultBudgetMb;
                 QualitySettings.streamingMipmapsRenderersPerFrame = DefaultRenderersPerFrame;
@@ -205,7 +233,7 @@ namespace PerfLint.UI
                 QualitySettings.streamingMipmapsAddAllCameras = true;
                 OnUserEdit();
             })
-            { text = L.Tr("Reset parameters to Unity defaults", "参数重置为 Unity 默认值") };
+            { text = L.Tr("Reset parameters to Unity defaults", "参数重置为 Unity 默认值") });
             reset.style.marginTop = 4;
             reset.style.alignSelf = Align.FlexStart;
             body.Add(reset);
@@ -217,36 +245,31 @@ namespace PerfLint.UI
                                     "参数属于「当前质量级别」（开关标签上有显示）——若游戏运行时会切质量级别，请在实际运行的那个级别上调。" +
                                     "建议逐场景调：把预算往下压到出现超预算提示/画质开始受损，再回退一档。不必追全局最优——验证为正优化的一组参数就够了。"))
             {
-                style = { fontSize = 10, opacity = 0.6f, whiteSpace = WhiteSpace.Normal, marginTop = 4, unityFontStyleAndWeight = FontStyle.Italic }
+                style = { fontSize = 10, color = PerfLintStyle.Dimmer, whiteSpace = WhiteSpace.Normal, marginTop = 4, unityFontStyleAndWeight = FontStyle.Italic }
             });
 
             // ── "Keep the tuned values" bar: edit mode only, when a play-mode snapshot differs from the
             //    (Unity-reverted) settings. Inserted at the top of the body so it's impossible to miss. ──
-            var keepRow = new VisualElement
-            {
-                style =
-                {
-                    display = DisplayStyle.None, marginBottom = 4,
-                    paddingTop = 6, paddingBottom = 6, paddingLeft = 8, paddingRight = 8,
-                    backgroundColor = new Color(0.30f, 0.45f, 0.25f, 0.25f),
-                    borderLeftWidth = 3, borderLeftColor = new Color(0.45f, 0.80f, 0.50f)
-                }
-            };
-            var keepLabel = new Label { style = { whiteSpace = WhiteSpace.Normal } };
+            var keepRow = PerfLintStyle.Note(PerfLintStyle.NoteGood);
+            keepRow.style.display = DisplayStyle.None;
+            keepRow.style.marginBottom = 4;
+            // Ink, not green: the block is already green. A prompt written in its own block's hue is the same
+            // signal twice at half the contrast, and this one is a question the reader has to answer.
+            var keepLabel = new Label { style = { whiteSpace = WhiteSpace.Normal, color = PerfLintStyle.Ink } };
             keepRow.Add(keepLabel);
             var keepButtons = new VisualElement { style = { flexDirection = FlexDirection.Row, marginTop = 4 } };
-            var applyBtn = new Button(() =>
+            var applyBtn = PerfLintStyle.AsCompact(new Button(() =>
             {
                 ApplySnapshot();
                 keepRow.style.display = DisplayStyle.None;
             })
-            { text = L.Tr("Apply to Quality Settings", "应用到 Quality Settings") };
-            var discardBtn = new Button(() =>
+            { text = L.Tr("Apply to Quality Settings", "应用到 Quality Settings") });
+            var discardBtn = PerfLintStyle.AsCompact(new Button(() =>
             {
                 ClearSnapshot();
                 keepRow.style.display = DisplayStyle.None;
             })
-            { text = L.Tr("Discard", "丢弃") };
+            { text = L.Tr("Discard", "丢弃") });
             discardBtn.style.marginLeft = 4;
             keepButtons.Add(applyBtn);
             keepButtons.Add(discardBtn);
@@ -311,12 +334,12 @@ namespace PerfLint.UI
                 {
                     budgetLine.text = L.Tr($"⚠ Over budget: cameras want {Mb(desired)} but the budget caps at {Mb(target)} — textures are rendering below their ideal mip (quality being traded). Raise Memory Budget if this looks bad.",
                                            $"⚠ 超预算：相机期望 {Mb(desired)}，预算封顶到 {Mb(target)}——部分纹理在低于理想的 Mip 级渲染（画质在被牺牲）。若画面明显变糊，调高 Memory Budget。");
-                    budgetLine.style.color = new Color(0.95f, 0.70f, 0.20f);
+                    budgetLine.style.color = PerfLintStyle.Amber;
                 }
                 else
                 {
                     budgetLine.text = L.Tr("Budget OK: every texture is at the mip level the cameras want.", "预算充足：所有纹理都在相机期望的 Mip 级别渲染。");
-                    budgetLine.style.color = new Color(0.45f, 0.80f, 0.50f);
+                    budgetLine.style.color = PerfLintStyle.Good;
                 }
                 countsLine.text = L.Tr($"streaming textures {Texture.streamingTextureCount} · renderers {Texture.streamingRendererCount} · pending loads {Texture.streamingTexturePendingLoadCount} · mip uploads {Texture.streamingMipmapUploadCount} · non-streaming {Texture.nonStreamingTextureCount} ({Mb(Texture.nonStreamingTextureMemory)})",
                                        $"串流纹理 {Texture.streamingTextureCount} · Renderer {Texture.streamingRendererCount} · 待加载 {Texture.streamingTexturePendingLoadCount} · Mip 上传 {Texture.streamingMipmapUploadCount} · 非串流 {Texture.nonStreamingTextureCount}（{Mb(Texture.nonStreamingTextureMemory)}）");

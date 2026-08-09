@@ -64,7 +64,45 @@ namespace PerfLint.Scanners
             }
         }
 
-        /// <summary>Moves a single asset into the shared group (creates it if absent; must carry BundledAssetGroupSchema to participate in builds).</summary>
+        /// <summary>
+        /// The <see cref="FindingAction.Preflight"/> text for extracting <paramref name="assetPath"/>: non-null only
+        /// when the asset still has byte-identical twins, because making it an Addressables entry pins it by address
+        /// and the DUP001 merge can never delete an entry — so extracting now costs the pair its last way out.
+        ///
+        /// Not a refusal, and deliberately NOT shown from inside <see cref="Extract"/>: actions must not put up UI
+        /// (the UI owns every prompt), and a warning raised inside Run arrives after the user has read the "low risk"
+        /// confirmation and pressed it. Returns text; the UI decides when to show it, which is first.
+        /// </summary>
+        public static PreflightWarning PreflightForExtract(string assetPath)
+        {
+            var twins = IdenticalTwinsFromLastScan(assetPath);
+            if (twins.Count == 0) return null;
+
+            string list = string.Join("\n  ", twins.Take(4));
+            if (twins.Count > 4) list += L.Tr($"\n  … and {twins.Count - 4} more", $"\n  …另有 {twins.Count - 4} 份");
+            string message = L.Tr(
+                $"This asset is byte-for-byte identical to {twins.Count} other file(s):\n  {list}\n\n" +
+                "Making it Addressable pins it by address, and the duplicate-asset merge (ASSET.DUP001) can never delete an entry. Merge these copies into one FIRST, then extract the survivor — otherwise this pair stops being mergeable.",
+                $"该资源与另 {twins.Count} 个文件逐字节相同：\n  {list}\n\n" +
+                "设为 Addressable 会把它按 address 钉住，而重复资产合并（ASSET.DUP001）永远删不掉一个条目。请先把这些副本合并成一份、再提取保留的那份——否则这一组就不再可合并了。");
+
+            // The duplicate group's finding is filed under its ordinally-first member (DuplicateAssetScanner sorts the
+            // group and reports group[0]), so reconstructing that here makes the jump land on THAT row rather than on
+            // all 32 duplicate groups. The rule is guaranteed to be in the report: the twins came out of its findings.
+            var members = new List<string>(twins) { assetPath };
+            members.Sort(StringComparer.Ordinal);
+            return new PreflightWarning(message,
+                jumpRuleId: "ASSET.DUP001",
+                jumpQuery: members[0],
+                jumpLabel: L.Tr("Go to the duplicate group", "去合并这一组"));
+        }
+
+        /// <summary>
+        /// Moves a single asset into the shared group (creates it if absent; must carry BundledAssetGroupSchema to
+        /// participate in builds). Shows no UI of its own — the twin warning is <see cref="PreflightForExtract"/>,
+        /// which the UI asks before its confirmation. <see cref="ExtractMany"/> does not come through here; a batch
+        /// has nobody to ask per item, so it dedups its own work list by content instead.
+        /// </summary>
         public static FixResult Extract(string assetPath)
         {
             try
@@ -118,7 +156,22 @@ namespace PerfLint.Scanners
 
                 int extracted = 0, skippedReadOnly = 0, failed = 0;
                 string firstError = null;
-                var paths = assetPaths.Where(p => !string.IsNullOrEmpty(p)).Distinct().ToList();
+                var requested = assetPaths.Where(p => !string.IsNullOrEmpty(p)).Distinct().ToList();
+
+                // Two entries in this list can be the SAME BYTES under different paths, and extracting both is
+                // actively harmful: it pins two copies of one asset in the shared group (deduplicating nothing) and
+                // turns both into Addressables entries, which ASSET.DUP001's merge can never delete — an entry is
+                // loaded by address, and a GUID redirect cannot repair that. Measured on a real project: 4 of its 8
+                // unmergeable duplicate groups had been created this way, by this very action. So one copy per
+                // content class is extracted and the rest are left for the merge, which can actually remove them.
+                var paths = new List<string>();
+                var leftForDedup = new List<string>();
+                foreach (var contentClass in ScannerUtil.GroupByIdenticalContent(requested))
+                {
+                    paths.Add(contentClass[0]);
+                    for (int i = 1; i < contentClass.Count; i++) leftForDedup.Add(contentClass[i]);
+                }
+
                 for (int i = 0; i < paths.Count; i++)
                 {
                     if (EditorUtility.DisplayCancelableProgressBar(
@@ -150,6 +203,9 @@ namespace PerfLint.Scanners
                 if (skippedReadOnly > 0)
                     sb.AppendLine(L.Tr($"Skipped {skippedReadOnly} read-only package asset(s) (Packages/… — Unity won't mark these Addressable; replace with a project-local copy to dedup).",
                                        $"跳过 {skippedReadOnly} 个只读包资源（Packages/… Unity 不允许标记为 Addressable；需换成项目内副本才能去重）。"));
+                if (leftForDedup.Count > 0)
+                    sb.AppendLine(L.Tr($"Left {leftForDedup.Count} asset(s) alone: byte-for-byte identical to one that was extracted. Marking each of them Addressable would pin the same bytes in the group more than once and make them undeletable by the duplicate-asset merge — an entry is loaded by address, which a reference redirect cannot repair. Merge them first (rule ASSET.DUP001), then re-scan.",
+                                       $"另有 {leftForDedup.Count} 个资源未提取：它们与已提取的那一份逐字节相同。逐个标记为 Addressable 会把同一份字节在 group 里钉住多份，而且会让重复资产合并再也删不掉它们——条目按 address 加载，引用重定向修不了。请先用 ASSET.DUP001 合并，再重新扫描。"));
                 if (failed > 0)
                     sb.AppendLine(L.Tr($"Failed {failed}. First error: {firstError}", $"失败 {failed} 个。首个错误：{firstError}"));
                 if (before >= 0 && after >= 0)
@@ -177,6 +233,39 @@ namespace PerfLint.Scanners
                 EditorUtility.ClearProgressBar();
                 return FixResult.Fail(L.Tr($"Batch extraction failed: {e.Message}", $"批量提取失败：{e.Message}"));
             }
+        }
+
+        /// <summary>
+        /// The byte-identical copies of <paramref name="assetPath"/>, read off the last scan's ASSET.DUP001 findings.
+        ///
+        /// Read rather than recomputed: proving it directly means sizing every asset in the project and hashing the
+        /// same-size ones, which is most of what makes the duplicate scan slow — too much to spend on a single button
+        /// press. The scan already did that work, so the answer is a lookup. It is therefore only as fresh as the last
+        /// scan: a group merged since then may still be listed here, which costs the user a dialog they can dismiss.
+        /// Silent and empty when nothing has been scanned, or when the report holds no DUP001 findings at all —
+        /// gating on the finding actually existing, not on the rule being conceivable.
+        /// </summary>
+        private static IReadOnlyList<string> IdenticalTwinsFromLastScan(string assetPath)
+        {
+            var twins = new List<string>();
+            if (string.IsNullOrEmpty(assetPath)) return twins;
+            try
+            {
+                if (!ScanResultStore.Exists()) return twins;
+                var restored = ScanResultStore.Load();
+                var findings = restored?.Result?.Findings;
+                if (findings == null) return twins;
+                foreach (var f in findings)
+                {
+                    if (f == null || f.RuleId != "ASSET.DUP001" || f.Group == null) continue;
+                    if (!f.Group.Contains(assetPath)) continue;
+                    foreach (var p in f.Group)
+                        if (!string.Equals(p, assetPath, StringComparison.Ordinal) && !twins.Contains(p))
+                            twins.Add(p);
+                }
+            }
+            catch { /* no readable report: say nothing rather than guess */ }
+            return twins;
         }
 
         private enum ExtractOutcome { Extracted, SkippedReadOnly, Failed }

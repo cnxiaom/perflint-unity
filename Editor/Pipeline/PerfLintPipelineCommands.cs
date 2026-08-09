@@ -18,7 +18,7 @@ namespace PerfLint.Ci.Pipeline
     ///
     /// These run in the live editor and RETURN a result (they never call EditorApplication.Exit).
     /// <see cref="PerfLintFix"/> modifies your open project — the same deterministic fixes the editor's
-    /// "Fix All" applies, undoable via Edit &gt; Undo — and requires Pro. Scanning and the gate are free.
+    /// "Fix All" applies, recoverable from version control rather than via Edit &gt; Undo — and requires Pro. Scanning and the gate are free.
     /// For headless CI (no editor running) use the batchmode entry points instead
     /// (PerfLint.Ci.PerfLintCli.RunGate / RunFix; see the docs).
     /// </summary>
@@ -198,7 +198,7 @@ namespace PerfLint.Ci.Pipeline
             dto.message = "Applied " + applied + " fixes (" + failed + " failed) in scope: " + scope
                           + ". Grade " + before.HealthGrade() + "→" + after.HealthGrade()
                           + ", saved ~" + (savedMem / (1024 * 1024)) + " MB memory. " + reviewAfter
-                          + " need review. Edit > Undo reverts what was just applied.";
+                          + " need review. Edit > Undo does NOT revert this — restore from version control if you want it back.";
             return dto;
         }
     }

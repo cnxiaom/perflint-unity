@@ -160,6 +160,12 @@ https://github.com/cnxiaom/perflint-unity.git
 
 想锁版本就在后面加 tag，例如 `…perflint-unity.git#v1.0.0`。要求 **Unity 2021.3 及以上**（含 Unity 6）。
 
+### 把界面切成中文
+
+**Tools ▸ PerfLint ▸ Language ▸ 中文 (Chinese)** —— 已经打开的窗口会立刻跟着切。
+
+注意一点：**之前扫出来的问题会保留它当时被写下的语言**，因为那些文字是扫描时生成好存下来的。切完语言重扫一次，它们就会用你选的语言重新生成。
+
 ## 从安装到修完，几分钟
 
 1. **用 UPM 装。** 按 Git URL 添加包 —— 不用注册，不用登录。

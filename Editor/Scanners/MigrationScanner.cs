@@ -21,6 +21,11 @@ namespace PerfLint.Scanners
     ///   MIG.LegacyInputApi — old UnityEngine.Input still used when the backend is set to "New Input System only" (fails at runtime, Warning).
     ///   MIG.ApiCompatLevel — Player Settings' Api Compatibility Level is an obsolete (.NET 2.0) or .NET Framework level (project-level; Warning/Info, report-only).
     ///   MIG.AsmdefBrokenRef — an .asmdef under Assets/ references assemblies that don't resolve (likely renamed/removed during a migration; project-level, Warning, report-only).
+    ///   MIG.SerializeFieldOnNonField — [SerializeField] attached to an enum/class/method: silently accepted on older editors,
+    ///     CS0592 on Unity 6. A delayed-action upgrade blocker that costs nothing until the day you move.
+    ///   MIG.RenderGraphMissing — a ScriptableRenderPass that only implements the Compatibility-Mode Execute() while the project renders through
+    ///     Render Graph (the Unity 6 default): it compiles cleanly and silently contributes nothing. The one rule here that compile-error
+    ///     ingestion can never reach — there is no error to ingest.
     /// Render pipeline migration (Built-in→URP/HDRP material conversion) is heavier work; deferred to V2.
     /// </summary>
     public sealed class MigrationScanner : IScanner, IFileScanner
@@ -137,6 +142,59 @@ namespace PerfLint.Scanners
                 SeverityFn = unity2023_1Plus => unity2023_1Plus ? Severity.Critical : Severity.Warning
             },
             new ApiRule {
+                // Member access only (".cameraColorTarget"), and \b keeps the *Handle successors out:
+                // in "cameraColorTargetHandle" the character after the match is a word char, so \b fails there.
+                Pattern = new Regex(@"\.(cameraColorTarget|cameraDepthTarget)\b", RegexOptions.Compiled),
+                RuleId = "MIG.CameraColorTarget", Title = () => L.Tr("Removed API: cameraColorTarget / cameraDepthTarget (URP)", "已移除 API：cameraColorTarget / cameraDepthTarget（URP）"),
+                Detail = () => L.Tr("URP's ScriptableRenderer.cameraColorTarget / cameraDepthTarget are deprecated since Unity 2022.1 and error-level from 2023.2 — "
+                         + "on Unity 6 they no longer compile, and the property body itself throws. Use cameraColorTargetHandle / cameraDepthTargetHandle. "
+                         + "This is not a plain rename: the type changes from RenderTargetIdentifier to RTHandle, so the variables/fields receiving it and everything "
+                         + "downstream (Blit targets, ConfigureTarget, SetComputeTextureParam) must move to RTHandle as well. "
+                         + "PerfLint's Migration Assistant can rewrite the file for you (AI Migrate), or migrate the pass by hand.",
+                         "URP 的 ScriptableRenderer.cameraColorTarget / cameraDepthTarget 自 Unity 2022.1 废弃、2023.2 起为 error 级——"
+                         + "在 Unity 6 上无法编译，且属性本身实现就是抛异常。改用 cameraColorTargetHandle / cameraDepthTargetHandle。"
+                         + "这不是单纯改名：类型从 RenderTargetIdentifier 变成 RTHandle，接收它的变量/字段以及下游用法"
+                         + "（Blit 目标、ConfigureTarget、SetComputeTextureParam）都要一并改为 RTHandle。"
+                         + "可用迁移助手整体重写此文件（AI Migrate），或人工迁移该 pass。"),
+                RequiresUnity2022_1 = true,
+                AllowAiFix = false,
+                // #breakingFrom(2023.2): error-level there. IsAtLeast2023_2 is read from the live engine rather than
+                // from the caller's flag — the caller only carries a 2023.1 threshold, and 2023.1 is still warning-level.
+                SeverityFn = _ => IsAtLeast2023_2(Application.unityVersion) ? Severity.Critical : Severity.Warning
+            },
+            new ApiRule {
+                Pattern = new Regex(@"\bVolumeComponentMenuForRenderPipeline\b", RegexOptions.Compiled),
+                RuleId = "MIG.VolumeComponentMenuForRenderPipeline", Title = () => L.Tr("Removed API: VolumeComponentMenuForRenderPipeline", "已移除 API：VolumeComponentMenuForRenderPipeline"),
+                Detail = () => L.Tr("VolumeComponentMenuForRenderPipelineAttribute is error-level obsolete from Unity 2023.1 — custom Volume components using it no longer compile on Unity 6. "
+                         + "Split it into two attributes: [VolumeComponentMenu(\"Post-processing/Your Effect\")] for the menu path, and "
+                         + "[SupportedOnRenderPipeline(typeof(UniversalRenderPipelineAsset))] for the pipeline filter. "
+                         + "Mind the type: SupportedOnRenderPipeline takes the pipeline *Asset* type (UniversalRenderPipelineAsset / HDRenderPipelineAsset), "
+                         + "not the pipeline type (UniversalRenderPipeline) the old attribute took.",
+                         "VolumeComponentMenuForRenderPipelineAttribute 自 Unity 2023.1 起为 error 级废弃——用到它的自定义 Volume 组件在 Unity 6 无法编译。"
+                         + "拆成两个特性：菜单路径用 [VolumeComponentMenu(\"Post-processing/Your Effect\")]，"
+                         + "管线过滤用 [SupportedOnRenderPipeline(typeof(UniversalRenderPipelineAsset))]。"
+                         + "注意类型不同：SupportedOnRenderPipeline 接收管线 **Asset** 类型（UniversalRenderPipelineAsset / HDRenderPipelineAsset），"
+                         + "而不是旧特性接收的管线类型（UniversalRenderPipeline）。"),
+                RequiresUnity2023_1 = true,
+                SeverityFn = _ => Severity.Critical // error-level obsolete from 2023.1 → blocks compilation wherever this rule is active
+            },
+            new ApiRule {
+                // Static class → only ever appears as a member access; requiring the dot keeps user-defined
+                // identifiers that merely contain the word out of the results.
+                Pattern = new Regex(@"\bXRGraphics\s*\.", RegexOptions.Compiled),
+                RuleId = "MIG.XRGraphics", Title = () => L.Tr("Removed API: XRGraphics (URP)", "已移除 API：XRGraphics（URP）"),
+                Detail = () => L.Tr("URP's XRGraphics helper was removed in the Unity 6 URP line, so code referencing it fails with CS0103 (the name does not exist). "
+                         + "It only ever forwarded to the XR module, so the replacement is a rename: XRGraphics.enabled → UnityEngine.XR.XRSettings.enabled, "
+                         + "XRGraphics.eyeTextureResolutionScale → XRSettings.eyeTextureResolutionScale, XRGraphics.renderViewportScale → XRSettings.renderViewportScale.",
+                         "URP 的 XRGraphics 辅助类在 Unity 6 的 URP 线上已移除，引用它的代码报 CS0103（名称不存在）。"
+                         + "它本来就只是转发给 XR 模块，所以替换是改名级：XRGraphics.enabled → UnityEngine.XR.XRSettings.enabled，"
+                         + "XRGraphics.eyeTextureResolutionScale → XRSettings.eyeTextureResolutionScale，XRGraphics.renderViewportScale → XRSettings.renderViewportScale。"),
+                // Reflect over THIS project's URP rather than pin a version: the release that dropped XRGraphics is
+                // hard to pin (still present in URP 14 / 2022.3, gone on 6000.3), and asking the engine costs nothing.
+                ActiveWhen = () => XRGraphicsRemoved,
+                SeverityFn = _ => Severity.Critical // the type is gone → CS0103, guaranteed compile error wherever this is active
+            },
+            new ApiRule {
                 Pattern = new Regex(@"\bParticleEmitter\b|\bParticleRenderer\b|\bParticleAnimator\b", RegexOptions.Compiled),
                 RuleId = "MIG.LegacyParticles", Title = () => L.Tr("Removed: legacy particle components", "已移除：Legacy 粒子组件"),
                 Detail = () => L.Tr("Legacy particles (ParticleEmitter/Renderer/Animator) have been removed. Use the Shuriken Particle System. This is a structural replacement, so it must be migrated by hand; no one-click fix.",
@@ -235,6 +293,209 @@ namespace PerfLint.Scanners
             var lines = ReadLines(path);
             if (lines == null) yield break;
             foreach (var f in ScanSource(lines, path, unity2022_1Plus, unity2023_1Plus, newInputOnly)) yield return f;
+
+            // Both of these need more than one line to decide, so they sit outside the line-by-line ScanSource:
+            // one looks at the declaration an attribute is attached to, the other at the whole file's entry points.
+            foreach (var f in ScanSerializeFieldTargets(lines, path, SerializeFieldIsFieldOnly)) yield return f;
+
+            var rg = ScanRenderGraphPass(lines, path, RenderGraphActive);
+            if (rg != null) yield return rg;
+        }
+
+        // ── [SerializeField] on a declaration that isn't a field ──────────────────────────────────
+        // Matches the attribute anywhere in a bracket group (so "[SerializeField, Tooltip(…)]" counts), but never
+        // "[field: SerializeField]" — the targeted form on an auto-property is legal and compiles everywhere.
+        private static readonly Regex SerializeFieldAttr = new Regex(@"\[[^\]]*\bSerializeField\b[^\]]*\]", RegexOptions.Compiled);
+        private static readonly Regex FieldTargetedSerializeField = new Regex(@"\bfield\s*:\s*SerializeField\b", RegexOptions.Compiled);
+        // Only shapes that CANNOT be a field. Everything else — including anything ambiguous — stays silent.
+        private static readonly Regex NonFieldTypeDecl = new Regex(@"\b(enum|class|struct|interface|delegate|event)\s+\w", RegexOptions.Compiled);
+        private static readonly Regex VoidMethodDecl = new Regex(@"\bvoid\s+\w+\s*\(", RegexOptions.Compiled);
+
+        /// <summary>
+        /// Pure logic: classify the declaration an attribute is attached to. Returns "type" or "method" when it
+        /// definitely is NOT a field, and null for fields and for anything we cannot be certain about — a field
+        /// declaration wrongly reported here would send the user to delete an attribute that is doing real work,
+        /// so silence is the default.
+        /// </summary>
+        internal static string ClassifyNonFieldDeclaration(string decl)
+        {
+            if (string.IsNullOrEmpty(decl)) return null;
+            if (NonFieldTypeDecl.IsMatch(decl)) return "type";
+            if (VoidMethodDecl.IsMatch(decl)) return "method";
+            return null;
+        }
+
+        /// <summary>
+        /// Pure logic: find <c>[SerializeField]</c> sitting on an enum/class/method rather than a field.
+        /// Measured, not assumed: on Unity 2022.3 the compiler accepts this silently (a clean project, zero errors),
+        /// and on Unity 6 the same code fails with CS0592 — so a project that upgrades finds a batch of these at once,
+        /// and they hide behind whichever assembly failed first. The attribute never did anything on a non-field, so
+        /// the fix is to delete it, on any version.
+        /// <paramref name="serializeFieldIsFieldOnly"/> comes from reflecting over THIS engine's
+        /// <c>AttributeUsage</c>, which decides whether this already blocks compilation (Critical) or is still just
+        /// dead weight waiting for the upgrade (Warning).
+        /// </summary>
+        internal static IEnumerable<Finding> ScanSerializeFieldTargets(string[] lines, string path, bool serializeFieldIsFieldOnly)
+        {
+            if (lines == null) yield break;
+
+            for (int ln = 0; ln < lines.Length; ln++)
+            {
+                string code = StripNonCode(lines[ln]);
+                if (!SerializeFieldAttr.IsMatch(code)) continue;
+                if (FieldTargetedSerializeField.IsMatch(code)) continue;
+
+                // The declaration is whatever follows the last ']' on this line; if nothing does, it is the next
+                // line that is neither blank nor another attribute. Reading the same line FIRST is what keeps the
+                // common "[SerializeField] private Foo m_foo;" from being judged by the line below it.
+                string decl = null;
+                int close = code.LastIndexOf(']');
+                if (close >= 0 && close + 1 < code.Length)
+                {
+                    string rest = code.Substring(close + 1).Trim();
+                    if (rest.Length > 0) decl = rest;
+                }
+                for (int j = ln + 1; decl == null && j < lines.Length; j++)
+                {
+                    string c = StripNonCode(lines[j]).Trim();
+                    if (c.Length == 0 || c.StartsWith("[")) continue;
+                    decl = c;
+                }
+
+                string kind = ClassifyNonFieldDeclaration(decl);
+                if (kind == null) continue;
+
+                string cap = path;
+                int line = ln + 1;
+                bool isType = kind == "type";
+                yield return new Finding(
+                    ruleId: "MIG.SerializeFieldOnNonField",
+                    domain: Domain.Migration,
+                    severity: serializeFieldIsFieldOnly ? Severity.Critical : Severity.Warning,
+                    title: L.Tr("[SerializeField] on something that isn't a field", "[SerializeField] 贴在了非字段上"),
+                    detail: L.Tr($"This [SerializeField] is attached to a {(isType ? "type declaration" : "method")}, not a field. "
+                            + "SerializeField only ever applied to fields, so it has never done anything here — but older editors accept it silently "
+                            + "(measured: a project full of these compiles clean on 2022.3), while Unity 6 rejects it with CS0592 and the assembly stops building. "
+                            + "That makes it a delayed-action upgrade blocker: it costs nothing today and breaks the build the day you move to Unity 6, "
+                            + "usually as a batch, and usually hidden behind whichever assembly failed first. Delete the attribute — on any version, "
+                            + "removing it changes no behaviour. (The targeted form [field: SerializeField] on an auto-property is a different thing and is legal.)",
+                            $"这个 [SerializeField] 贴在{(isType ? "类型声明" : "方法")}上，不是字段。"
+                            + "SerializeField 从来就只对字段生效，所以它在这里从没起过作用——但老版本编辑器会静默接受"
+                            + "（实测：满是这种写法的工程在 2022.3 上编译全绿），而 Unity 6 直接报 CS0592、该程序集停止构建。"
+                            + "这是一个延迟生效的升级阻塞点：今天零代价，等你升到 Unity 6 那天集中爆发，而且通常被最先失败的那个程序集挡在后面看不见。"
+                            + "删掉这个特性即可——在任何版本上删它都不改变行为。（自动属性上的定向写法 [field: SerializeField] 是另一回事，合法。）"),
+                    targetPath: $"{path}:{line}",
+                    ping: () => OpenAt(cap, line),
+                    // Deleting one attribute is the textbook fragment-level edit.
+                    codeFile: cap,
+                    codeLine: line);
+            }
+        }
+
+        /// <summary>
+        /// Whether <c>SerializeField</c> carries <c>AttributeUsage(AttributeTargets.Field)</c> on THIS engine — i.e.
+        /// whether misplacing it is already a compile error (CS0592) rather than silently-accepted dead weight.
+        /// Reflected rather than pinned to a version: measured false on 2022.3 and true on 6000.3, with the exact
+        /// changeover in between unknown. Internal and writable so tests can drive both paths.
+        /// </summary>
+        internal static bool SerializeFieldIsFieldOnly = ComputeSerializeFieldIsFieldOnly();
+
+        private static bool ComputeSerializeFieldIsFieldOnly()
+        {
+            try
+            {
+                var usage = (System.AttributeUsageAttribute)System.Attribute.GetCustomAttribute(
+                    typeof(SerializeField), typeof(System.AttributeUsageAttribute));
+                return usage != null && usage.ValidOn == System.AttributeTargets.Field;
+            }
+            catch { return false; }
+        }
+
+        // ── Render Graph silent-no-op detection ───────────────────────────────────────────────────
+        // Inheritance list only ("class X : ScriptableRenderPass" / ", ScriptableRenderPass"), so a bare mention
+        // elsewhere in the file does not qualify it.
+        private static readonly Regex DerivesFromRenderPass = new Regex(@"[:,]\s*ScriptableRenderPass\b", RegexOptions.Compiled);
+        // The compatibility-mode entry point. Matching the parameter type (not just the method name) keeps
+        // unrelated Execute() methods out.
+        private static readonly Regex CompatibilityExecute = new Regex(@"\boverride\s+void\s+Execute\s*\(\s*ScriptableRenderContext\b", RegexOptions.Compiled);
+        private static readonly Regex RecordRenderGraphMember = new Regex(@"\bRecordRenderGraph\b", RegexOptions.Compiled);
+
+        /// <summary>
+        /// Pure logic: does this file define a ScriptableRenderPass that implements ONLY the Compatibility-Mode
+        /// <c>Execute(ScriptableRenderContext, …)</c> and never <c>RecordRenderGraph</c>? Under Render Graph — the
+        /// Unity 6 default — URP's base RecordRenderGraph only logs a warning and skips the pass: the effect is
+        /// silently gone while the file still compiles cleanly. No compile error, no inspector warning, nothing in
+        /// the editor points at it — which is exactly why this needs a rule (compile-error ingestion can never see it).
+        /// Returns null when it does not apply: not a pass, already implements RecordRenderGraph, or Render Graph
+        /// is not the active path (Compatibility Mode on / pre-Unity-6 / URP absent).
+        /// </summary>
+        internal static Finding ScanRenderGraphPass(string[] lines, string path, bool renderGraphActive)
+        {
+            return ScanRenderGraphPass(lines, path, renderGraphActive, CompatibilityModeReachable);
+        }
+
+        /// <summary>
+        /// Overload taking the "can this project still fall back to Compatibility Mode?" answer explicitly, so the
+        /// advice never points at a switch that isn't there. From Unity 6.3 URP hides the setting and strips the
+        /// code unless URP_COMPATIBILITY_MODE is in Player Settings' Scripting Define Symbols — advice that says
+        /// "turn it back on under Project Settings ▸ Graphics" sends those users hunting for a menu that is gone.
+        /// </summary>
+        internal static Finding ScanRenderGraphPass(string[] lines, string path, bool renderGraphActive, bool compatibilityModeReachable)
+        {
+            if (!renderGraphActive || lines == null || lines.Length == 0) return null;
+
+            bool derivesFromPass = false, hasRecordRenderGraph = false;
+            int executeLine = 0;
+            for (int ln = 0; ln < lines.Length; ln++)
+            {
+                string code = StripNonCode(lines[ln]);
+                if (code.Trim().Length == 0) continue;
+                if (!derivesFromPass && DerivesFromRenderPass.IsMatch(code)) derivesFromPass = true;
+                if (!hasRecordRenderGraph && RecordRenderGraphMember.IsMatch(code)) hasRecordRenderGraph = true;
+                if (executeLine == 0 && CompatibilityExecute.IsMatch(code)) executeLine = ln + 1;
+            }
+            // A dual-shape pass (both entry points present) is what a correct migration looks like → stay silent.
+            if (!derivesFromPass || hasRecordRenderGraph || executeLine == 0) return null;
+
+            string cap = path;
+            int capLine = executeLine;
+            return new Finding(
+                ruleId: "MIG.RenderGraphMissing",
+                domain: Domain.Migration,
+                // Critical on observed behaviour, not on a guess: URP's ScriptableRenderPass.RecordRenderGraph base
+                // implementation logs "does not have an implementation of the RecordRenderGraph method … the render
+                // pass will have no effect" and returns. The pass contributes nothing to the frame.
+                severity: Severity.Critical,
+                title: L.Tr("Render pass does nothing under Render Graph", "Render Graph 下此 render pass 完全不执行"),
+                detail: L.Tr("This ScriptableRenderPass only implements the Compatibility Mode entry point (Execute(ScriptableRenderContext, …)), "
+                        + "but this project renders through Render Graph — the Unity 6 default. URP's base RecordRenderGraph implementation just logs a "
+                        + "warning and skips the pass, so this effect contributes nothing to the frame. It still compiles cleanly, which is why nothing "
+                        + "else in the editor flags it: the only symptom is that the effect is gone.\n"
+                        + "Two ways out. (1) Migrate the pass: implement RecordRenderGraph(RenderGraph, ContextContainer) — for a direct port, "
+                        + "renderGraph.AddUnsafePass<PassData> plus builder.SetRenderFunc lets you keep the existing command logic, and the camera targets "
+                        + "come from frameData.Get<UniversalResourceData>().activeColorTexture. PerfLint's Migration Assistant can rewrite the file for you (AI Migrate). "
+                        + (compatibilityModeReachable
+                            ? "(2) As a stopgap, turn Compatibility Mode back on under Edit ▸ Project Settings ▸ Graphics ▸ Render Graph — the old path runs again, "
+                              + "but it is deprecated and you lose the Render Graph optimizations."
+                            : "(2) There is no quick fallback left on this Unity version: URP hides the Compatibility Mode setting from 6.3 and strips its code. "
+                              + "Reaching it means adding URP_COMPATIBILITY_MODE to Edit ▸ Project Settings ▸ Player ▸ Scripting Define Symbols, which Unity itself labels "
+                              + "\"not recommended or supported\" and is slated for removal — so treat it as a few days' breathing room at most, not a destination. Migrating the pass is the real fix."),
+                        "此 ScriptableRenderPass 只实现了 Compatibility Mode 的入口（Execute(ScriptableRenderContext, …)），"
+                        + "而本工程走的是 Render Graph——Unity 6 的默认路径。URP 基类的 RecordRenderGraph 实现只会打一条警告然后跳过该 pass，"
+                        + "所以这个效果对画面毫无贡献。它照样编译通过，所以编辑器里没有任何别的东西会提示你：唯一的症状就是效果没了。\n"
+                        + "两条出路。(1) 迁移该 pass：实现 RecordRenderGraph(RenderGraph, ContextContainer)——要直迁的话，"
+                        + "renderGraph.AddUnsafePass<PassData> 配 builder.SetRenderFunc 可以保留原有的命令逻辑，相机目标从 "
+                        + "frameData.Get<UniversalResourceData>().activeColorTexture 取。可用迁移助手整体重写此文件（AI Migrate）。"
+                        + (compatibilityModeReachable
+                            ? "(2) 过渡方案：在 Edit ▸ Project Settings ▸ Graphics ▸ Render Graph 里重新打开 Compatibility Mode——旧路径会重新执行，"
+                              + "但它已被废弃，且会失去 Render Graph 的优化。"
+                            : "(2) 当前 Unity 版本已经没有快速退路：URP 从 6.3 起隐藏了 Compatibility Mode 设置并剥离其代码。"
+                              + "要够到它得在 Edit ▸ Project Settings ▸ Player ▸ Scripting Define Symbols 里加 URP_COMPATIBILITY_MODE，"
+                              + "而 Unity 自己把这条标注为「不推荐、不支持」且已列入移除计划——所以最多把它当几天喘息时间，不是归宿。迁移该 pass 才是真正的修法。")),
+                targetPath: $"{path}:{executeLine}",
+                // Deliberately no codeFile: porting a pass to Render Graph rewrites its whole structure — beyond
+                // what a fragment-level AI Fix can do (same call as WWW / RenderTargetHandle).
+                ping: () => OpenAt(cap, capLine));
         }
 
         /// <summary>Pure logic: match deprecated APIs / legacy input APIs against already-loaded source lines (no file I/O, making it easy to verify false positives/negatives in end-to-end unit tests).</summary>
@@ -610,6 +871,115 @@ namespace PerfLint.Scanners
         /// <summary>Whether that [Obsolete] is error-level ([Obsolete(msg, true)] → CS0619, blocks compilation) — decides Critical vs Warning.</summary>
         internal static bool GetInstanceIdObsoleteIsError = MemberObsoleteIsError(typeof(UnityEngine.Object), "GetInstanceID");
 
+        /// <summary>
+        /// Whether URP is installed in THIS project but no longer exposes XRGraphics (dropped in the Unity 6 URP
+        /// line). Reflected over the loaded assemblies instead of pinned to a version number — the exact URP release
+        /// that removed it is hard to pin (present in URP 14, gone in URP 17), and asking the engine is zero-guess.
+        /// False when URP is absent (the rule is moot there). Internal and writable so tests can drive both paths.
+        /// </summary>
+        internal static bool XRGraphicsRemoved = ComputeXRGraphicsRemoved();
+
+        private static bool ComputeXRGraphicsRemoved()
+        {
+            try
+            {
+                System.Reflection.Assembly urp = null;
+                foreach (var a in System.AppDomain.CurrentDomain.GetAssemblies())
+                    if (a.GetName().Name == "Unity.RenderPipelines.Universal.Runtime") { urp = a; break; }
+                if (urp == null) return false; // URP not installed → no XRGraphics call site can exist
+                return urp.GetType("UnityEngine.Rendering.Universal.XRGraphics") == null;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Find a type by full name across the loaded assemblies. Type.GetType needs an assembly-qualified name,
+        /// and guessing which package assembly owns an SRP type is exactly how this went wrong once already
+        /// (RenderGraphSettings was assumed to live in Core, and actually lives in URP) — so ask, don't guess.
+        /// </summary>
+        private static System.Type FindLoadedType(string fullName)
+        {
+            try
+            {
+                foreach (var a in System.AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    var t = a.GetType(fullName);
+                    if (t != null) return t;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>
+        /// Whether this project actually renders through URP's Render Graph — Unity 6+, URP installed, and
+        /// Compatibility Mode (Render Graph disabled) turned OFF. That is the exact condition under which a
+        /// ScriptableRenderPass implementing only the compatibility Execute() silently does nothing.
+        /// Anything we cannot determine → false, i.e. report nothing: a wrong "your custom rendering is dead"
+        /// costs far more than staying silent. Internal and writable so tests can drive both paths.
+        /// </summary>
+        internal static bool RenderGraphActive = ComputeRenderGraphActive();
+
+        /// <summary>
+        /// Whether this project can still fall back to Compatibility Mode at all. URP compiles the real
+        /// getter/setter only under the URP_COMPATIBILITY_MODE define; without it the property degrades to
+        /// <c>get =&gt; false</c> plus an error-level obsolete setter, and the Graphics settings UI hides the toggle
+        /// (Unity 6.3). Detected by asking whether that setter is error-obsolete — no version guessing, and it
+        /// keeps the finding's advice pointing at something that actually exists. Unknown → false (advise migration,
+        /// which is correct either way). Internal and writable so tests can drive both wordings.
+        /// </summary>
+        internal static bool CompatibilityModeReachable = ComputeCompatibilityModeReachable();
+
+        private static bool ComputeCompatibilityModeReachable()
+        {
+            try
+            {
+                var settingsType = FindLoadedType("UnityEngine.Rendering.Universal.RenderGraphSettings")
+                                   ?? FindLoadedType("UnityEngine.Rendering.RenderGraphSettings");
+                if (settingsType == null) return false;
+
+                var setter = settingsType.GetProperty("enableRenderCompatibilityMode")?.GetSetMethod();
+                if (setter == null) return false; // no setter at all → not reachable
+
+                var obsolete = (System.ObsoleteAttribute)System.Attribute.GetCustomAttribute(
+                    setter, typeof(System.ObsoleteAttribute), inherit: true);
+                // Error-level obsolete on the setter is exactly the stripped "define is missing" shape.
+                return obsolete == null || !obsolete.IsError;
+            }
+            catch { return false; }
+        }
+
+        private static bool ComputeRenderGraphActive()
+        {
+            try
+            {
+                // RenderGraph became the default in Unity 6; on older editors the compatibility path IS the path.
+                if (!(Application.unityVersion ?? "").StartsWith("6000")) return false;
+
+                // Verified on a live 6000.3.20f1 editor: this type is in the URP package's
+                // Unity.RenderPipelines.Universal.Runtime assembly and the UnityEngine.Rendering.Universal
+                // namespace — NOT in Core, which is where an assembly-qualified guess first sent it and made this
+                // whole check silently return false. The Core name is kept as a fallback in case it ever moves.
+                var settingsType = FindLoadedType("UnityEngine.Rendering.Universal.RenderGraphSettings")
+                                   ?? FindLoadedType("UnityEngine.Rendering.RenderGraphSettings");
+                if (settingsType == null) return false; // no URP RenderGraph settings → rule is moot
+
+                var getter = typeof(UnityEngine.Rendering.GraphicsSettings).GetMethod(
+                    "GetRenderPipelineSettings",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                if (getter == null || !getter.IsGenericMethodDefinition) return false;
+
+                // Throws when no SRP asset is active — caught below and read as "cannot determine".
+                object settings = getter.MakeGenericMethod(settingsType).Invoke(null, null);
+                if (settings == null) return false;
+
+                var prop = settingsType.GetProperty("enableRenderCompatibilityMode");
+                if (prop == null) return false;
+                return !(bool)prop.GetValue(settings);
+            }
+            catch { return false; }
+        }
+
         /// <summary>Reflection: does the public parameterless instance method carry [Obsolete] on the current engine?</summary>
         internal static bool MemberIsObsolete(System.Type type, string methodName)
         {
@@ -645,6 +1015,20 @@ namespace PerfLint.Scanners
             if (major > 2022 && major < 6000) return true; // 2023 / 2024…
             if (major == 2022) return minor >= 1;          // 2022.1+
             return false;                                  // 2021 and earlier
+        }
+
+        /// <summary>Whether the current Unity is ≥ 2023.2 (including Unity 6 = 6000.x), i.e. the version line where URP's cameraColorTarget/cameraDepthTarget turn error-level.</summary>
+        internal static bool IsAtLeast2023_2(string version)
+        {
+            if (string.IsNullOrEmpty(version)) return false;
+            var parts = version.Split('.');
+            if (!int.TryParse(parts[0], out int major)) return false;
+            int minor = parts.Length > 1 && int.TryParse(parts[1], out int m) ? m : 0;
+
+            if (major >= 6000) return true;                // Unity 6+ (6000.x)
+            if (major > 2023 && major < 6000) return true; // 2024 / 2025…
+            if (major == 2023) return minor >= 2;          // 2023.2+
+            return false;                                  // 2022 and earlier
         }
 
         /// <summary>Whether the current Unity is ≥ 2023.1 (including Unity 6 = 6000.x), i.e. the version line where FindObjectOfType and similar are deprecated.</summary>

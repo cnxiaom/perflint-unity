@@ -125,7 +125,36 @@ namespace PerfLint.Core
         {
             public readonly string Label;
             public readonly Action Ping;
-            public LocateTarget(string label, Action ping) { Label = label; Ping = ping; }
+            /// <summary>
+            /// Scene-hierarchy paths of the objects <see cref="Ping"/> would select, when the producer can name them.
+            ///
+            /// Ping is a closure over live analysis data, so it dies with the domain — which made a restored runtime
+            /// finding able to describe the heaviest meshes in its text and unable to take you to any of them. Naming
+            /// the objects is what lets the session store persist the capability instead of only the sentence.
+            /// Null when a target has no nameable objects; nothing is inferred from its absence.
+            /// </summary>
+            public readonly IReadOnlyList<string> ObjectPaths;
+
+            /// <summary>
+            /// Optional second line, drawn indented under <see cref="Label"/> — for the qualifier a row needs but a
+            /// single line cannot hold ("mostly SomeModel.fbx (~51.5 MB)").
+            ///
+            /// A second line rather than more text in the Label because indentation has to come from layout: UI
+            /// Toolkit collapses leading spaces in a wrapping Label, so a hierarchy built out of spaces renders
+            /// completely flat (observed in the field — every "mostly …" line sat hard against the row above it).
+            /// </summary>
+            public readonly string Detail;
+
+            /// <summary>
+            /// The asset this target reveals, when it is an asset. Ping is a closure and cannot survive a domain
+            /// reload or reach an exported report; this path is what lets <c>ScanResultStore</c> rebuild the Ping
+            /// and lets the HTML report name the target. Null for scene-object targets (see <see cref="ObjectPaths"/>).
+            /// </summary>
+            public readonly string AssetPath;
+
+            public LocateTarget(string label, Action ping, IReadOnlyList<string> objectPaths = null,
+                                string detail = null, string assetPath = null)
+            { Label = label; Ping = ping; ObjectPaths = objectPaths; Detail = detail; AssetPath = assetPath; }
         }
 
         /// <summary>Per-target Locate actions rendered as their own rows/buttons in the finding body. Null/empty = none (the title-row <see cref="Ping"/> is the only Locate).</summary>

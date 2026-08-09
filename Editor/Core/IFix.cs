@@ -3,8 +3,13 @@ namespace PerfLint.Core
     /// <summary>
     /// A single executable automatic fix. Design notes (from the product spec's "controllable and reversible" principle):
     /// - Preview() must be callable before Apply(), so the user can clearly see what will be changed.
-    /// - Apply() returns a result; the caller is responsible for enrolling the change into Undo (the fix executor
-    ///   wraps Undo.RecordObject / AssetDatabase transactions uniformly), enabling one-click undo.
+    /// - Apply() returns a result. NOTE: the "fix executor wraps Undo.RecordObject uniformly" this used to describe
+    ///   was never written — there is no Undo.RecordObject anywhere in the package, and an editor probe confirms the
+    ///   undo group is unchanged across an Apply(). Every implementation mutates an AssetImporter and calls
+    ///   SaveAndReimport, which Unity does not record. Import settings are still recoverable (version control, or
+    ///   re-editing the setting), so user-facing copy says THAT rather than promising Ctrl+Z.
+    ///   Implementing real undo means restoring the previous importer state AND forcing a reimport on
+    ///   Undo.undoRedoPerformed; until that exists, do not reintroduce the promise.
     /// </summary>
     public interface IFix
     {

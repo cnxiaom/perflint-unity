@@ -1,0 +1,320 @@
+/* ==========================================================================
+   PerfLint's windows — the few things C# inline styles cannot express.
+
+   Written for the Autopilot and now worn by all five windows. That is the
+   point of the rename: the Autopilot was where this was worked out, not what
+   it is for. Everything below is loaded through PerfLintStyle.Apply, which is
+   also where the C# half of the same palette lives (Ink/Dim/Good/Bad/Amber —
+   the tints a StyleSheet cannot reach because they are chosen per finding).
+
+   Two of them, and both were missing until this file existed:
+
+   1. THEME COLOURS. `var(--unity-colors-*)` resolves against whichever editor
+      skin is running, so one value is correct on both. Hand-picked greys in C#
+      are correct on exactly the skin they were eyeballed against — and this
+      window's were picked on a dark 6.3, which is why it read as a foreign
+      panel rather than an editor window.
+
+   2. :hover / :active. There is no inline equivalent; a Button that sets its
+      background in C# also loses the editor's own hover feedback, so every
+      custom button in here was dead to the touch. Anything that sets those
+      colours must therefore do it HERE, not inline, or the inline value wins
+      and the pseudo-states never paint.
+
+   Tokens follow the reference plugin Tim set as the bar (com.ivanmurzak.unity.mcp,
+   Apache-2.0, Editor/UI/uss/) — its numbers, our semantics. Nothing is copied
+   from it verbatim: what carries over is which properties do the work, and the
+   finding that a card should be tinted by its STATE rather than left neutral.
+   ========================================================================== */
+
+/* ── surfaces ─────────────────────────────────────────────────────────── */
+
+/* The window is the editor's window. Measured against the reference side by side: it runs on Unity's own
+   #383838, with content sitting straight on it; this window ran on #2A2B2E with a #45464A slab covering the
+   whole screen underneath everything — two layers of neutral grey before any content. That slab is what read
+   as "grey". It carried no meaning: the step strip above it already says where the screen begins. */
+.pl-window {
+    background-color: var(--unity-colors-window-background);
+}
+
+/* A block of supporting detail. Their treatment, and it is the opposite of what this window did: a nested
+   panel goes DARKER than what it sits on (and picks up a trace of blue), rather than lighter — lighter reads
+   as raised, i.e. as something you could click. */
+.pl-panel {
+    background-color: rgba(20, 40, 69, 0.2);
+}
+
+.pl-card {
+    background-color: var(--unity-colors-helpbox-background);
+    transition-duration: 150ms;
+}
+
+/* A tinted block is a DARK fill of its hue, plus a rule of the same hue one step brighter.
+
+   Both halves were wrong before and both were measured off the reference. Its blocks sit BELOW the window
+   grey, not above it: the panel behind "Claude Code" is rgba(20,40,69,0.2) over #383838 = #31353B, i.e.
+   darker and slightly blue. Mine were lighter washes (#3D4450), which is how a low-alpha tint over grey
+   ends up reading as grey with a hint of colour. And the rule matters as much as the fill — its
+   "Setup Required" callout is #413D38 with a #5C4F3B border, and without that border the fill alone is
+   just a smudge.
+
+   ONE value per hue, everywhere it appears. The blue below is used by the Info card, the round's action
+   block and every supporting panel — a colour picker moving between them must land on the same number,
+   which it did not before (four different blues on one screen). */
+
+.pl-card--critical {
+    background-color: rgba(69, 24, 24, 0.30);
+    border-color: rgba(224, 116, 116, 0.50);
+    border-width: 1px;
+}
+
+.pl-card--warning {
+    background-color: rgba(69, 52, 20, 0.30);
+    border-color: rgba(228, 186, 104, 0.45);
+    border-width: 1px;
+}
+
+.pl-card--info {
+    background-color: rgba(20, 40, 69, 0.20);
+    border-color: rgba(120, 174, 252, 0.40);
+    border-width: 1px;
+}
+
+/* The same two values again — a caveat block and an Info card are different things, but "blue" is one
+   colour in this window. */
+/* Green completes the set. The verify screen's verdict is the one place a block can be POSITIVE, and it was
+   the only tinted block left carrying its colour as a 3 px bar instead of as the block itself. */
+.pl-card--good {
+    background-color: rgba(24, 69, 40, 0.30);
+    border-color: rgba(110, 214, 140, 0.45);
+    border-width: 1px;
+}
+
+.pl-note--good {
+    background-color: rgba(24, 69, 40, 0.30);
+    border-color: rgba(110, 214, 140, 0.45);
+    border-width: 1px;
+    border-radius: 8px;
+}
+
+.pl-note--bad {
+    background-color: rgba(69, 24, 24, 0.30);
+    border-color: rgba(224, 116, 116, 0.50);
+    border-width: 1px;
+    border-radius: 8px;
+}
+
+.pl-note--warning {
+    background-color: rgba(69, 52, 20, 0.30);
+    border-color: rgba(228, 186, 104, 0.45);
+    border-width: 1px;
+    border-radius: 8px;
+}
+
+.pl-note--accent {
+    background-color: rgba(20, 40, 69, 0.20);
+    border-color: rgba(120, 174, 252, 0.40);
+    border-width: 1px;
+    border-radius: 8px;
+}
+
+/* ── buttons ──────────────────────────────────────────────────────────── */
+
+/* The one action a screen points at. Pale ink on a light accent, which reads as brighter than a saturated
+   fill of the same area without shouting. */
+.pl-primary {
+    min-height: 32px;
+    padding: 8px 16px;
+    background-color: rgb(175, 232, 230);
+    color: rgb(18, 20, 22);
+    border-width: 0;
+    border-radius: 8px;
+    transition-duration: 200ms;
+}
+
+.pl-primary:hover {
+    background-color: rgb(118, 231, 227);
+    transition-duration: 200ms;
+}
+
+.pl-primary:active {
+    background-color: rgb(250, 255, 234);
+    transition-duration: 50ms;
+}
+
+/* Everything else you can click.
+
+   The fill is an overlay, not a colour. It started as the reference's measured #464646, which is right on the
+   window (#383838, +14) and nearly invisible on a card (helpbox is #404040, so +6 — Tim read the Locate button
+   as "too dark", and measuring it agreed: the two buttons in that row have IDENTICAL fills, one just happens
+   to be bold). These buttons sit on three different surfaces — the window, a plain card, and a severity-tinted
+   card — so a fixed grey can only be correct on one of them. An overlay lifts by the same amount over all
+   three, and picks up the tint when there is one.
+
+   NEUTRAL GREY rather than white, and that is the one number here that changed when this stopped being one
+   window's stylesheet. A white overlay only ever LIGHTENS. On the dark skin that is the direction you want; on
+   the light one it lightens an already-light page and the button disappears — which did not matter while the
+   only window wearing this was the Autopilot, and mattered immediately when the main panel's nine toolbar
+   buttons stopped being stock editor buttons (those are correct on both skins) and started wearing this.
+
+   127-grey goes the right way on both: it lifts a dark surface and darkens a light one. The alphas below are
+   picked to land on the values the white overlay already produced on the dark skin, so nothing visibly moves
+   there — over #383838 (56): 56 + a·71, so 0.28 → 76, which is the 0.10 white overlay's 76. Hover 0.51 → 92
+   (was 92), active 0.73 → 108 (was 108), rule 0.45 → 88 (was 88). On the light skin (~#C8C8C8, 200) the same
+   alphas give 180 / 163 / 147 with a 167 rule — a button you can see, which is the whole point.
+
+   The idiom is not new here: .pl-tab below has always used a neutral grey, for exactly this reason. This class
+   was the one place still doing it the other way.
+
+   Geometry is still the reference's: rule #646464, radius 6, 30 high, 12 px label at #C8C8C8 — Install,
+   Help/Talk and Check are all exactly that one button.
+
+   min-height rather than height: their labels are one word and ours are sentences ("Measure anyway — checks
+   nothing broke · about 70s"), and a fixed 30 would clip the second line off.
+
+   The :hover rules are the entire point of this class existing. A Button that sets background-color in C#
+   loses BOTH its USS hover and the editor's own built-in one — which is why "Open the full panel" had no
+   highlight at all: it was styled inline from the day it was written. */
+.pl-secondary {
+    min-height: 30px;
+    padding: 6px 12px;
+    background-color: rgba(127, 127, 127, 0.28);
+    color: var(--unity-colors-default-text);
+    border-width: 1px;
+    border-color: rgba(127, 127, 127, 0.45);
+    border-radius: 6px;
+    transition-duration: 200ms;
+}
+
+.pl-secondary:hover {
+    background-color: rgba(127, 127, 127, 0.51);
+    border-color: rgba(127, 127, 127, 0.62);
+    transition-duration: 200ms;
+}
+
+.pl-secondary:active {
+    background-color: rgba(127, 127, 127, 0.73);
+    transition-duration: 50ms;
+}
+
+/* ── the step strip ───────────────────────────────────────────────────── */
+
+/* The three steps, as a segmented control with a live hover.
+ *
+ * Their colours moved here for the same reason every other control's did: a background set in C# outranks
+ * the :hover rule, so the strip was the last thing in the window that did not answer the mouse. Which step
+ * is current is a class rather than an inline fill, because only a class can also carry a hover state. */
+.pl-tab {
+    background-color: rgba(0, 0, 0, 0);
+    color: var(--unity-colors-helpbox-text);
+    border-width: 0;
+    border-radius: 7px;
+    transition-duration: 150ms;
+}
+
+.pl-tab:hover {
+    background-color: rgba(127, 127, 127, 0.14);
+    color: var(--unity-colors-default-text);
+    transition-duration: 150ms;
+}
+
+.pl-tab--on {
+    background-color: rgba(127, 127, 127, 0.24);
+    color: var(--unity-colors-default-text);
+}
+
+.pl-tab--on:hover {
+    background-color: rgba(127, 127, 127, 0.30);
+}
+
+/* A compact action, for the buttons that hang off a finding rather than off the screen.
+ *
+ * Theirs is height 20 / radius 4 / no border / 11 px — deliberately half the weight of a standalone button,
+ * which is what keeps a card's actions from competing with the card's own title. Ours keeps 12 px (the floor
+ * this window holds everywhere) and min-height, since our labels are phrases rather than single words. */
+.pl-compact {
+    min-height: 22px;
+    padding: 2px 8px;
+    /* The same neutral overlay as .pl-secondary, and for the same reason — see the note there. These are the
+       buttons ON a finding, so they also have to hold up over a severity-tinted card, not just over the window. */
+    background-color: rgba(127, 127, 127, 0.28);
+    color: var(--unity-colors-default-text);
+    border-width: 0;
+    border-radius: 4px;
+    font-size: 12px;
+    /* Bold — all of them, which is the point.
+     *
+     * Not decoration: the shared card UI used to mark only the Fix button bold, so on a row with two actions one
+     * was Normal and one Bold at the same size, on the same fill, with the same text colour — and measuring
+     * proved that was the ONLY difference between them (both enabled, both opacity 1). Side by side, the Normal
+     * one reads as disabled; Tim called it "wrong" twice before we found it. One tier of button, one look. Which
+     * action is the consequential one is said by the word on it, not by its weight. PerfLintStyle.AsCompact now
+     * clears any inline weight on the way in, because an inline value would outrank this line. */
+    -unity-font-style: bold;
+    transition-duration: 200ms;
+}
+
+.pl-compact:hover {
+    background-color: rgba(127, 127, 127, 0.51);
+    transition-duration: 200ms;
+}
+
+.pl-compact:active {
+    background-color: rgba(127, 127, 127, 0.73);
+    transition-duration: 50ms;
+}
+
+/* ── the same button, at toolbar density ──────────────────────────────── */
+
+/* Geometry only — the fill, the rule and all three states come from .pl-secondary, which this is always worn
+ * with. Nothing about the LOOK differs, and that is deliberate: two button appearances in one product is the
+ * thing this file exists to stop.
+ *
+ * It exists because .pl-secondary is sized for a sentence standing on its own line, and the main panel's
+ * toolbar is nine buttons on one row that does not wrap. At 30 high with 12 px of side padding that row grew
+ * by 4 px and every button by 8, which is enough to push "Free / Pro" off the right-hand edge on a narrow
+ * dock — the toolbar clips rather than wraps. Measured against the row it replaces (26 high), not guessed. */
+.pl-secondary--dense {
+    min-height: 26px;
+    padding: 3px 9px;
+}
+
+/* ── a primary that is also a stop ────────────────────────────────────── */
+
+/* Same box as .pl-primary, so a button that switches between them does not move by a pixel — only the fill
+ * changes. The Runtime panel is the case: one button is "Start Sampling" and then "Stop & Analyze", and the
+ * second has to read as something already running that you can end. A pale mint cannot say that.
+ *
+ * Deliberately not the severity red used for a Critical finding (rgba(224,116,116)) — that one means "this is
+ * wrong", and a recording in progress is not wrong. */
+.pl-danger {
+    min-height: 32px;
+    padding: 8px 16px;
+    background-color: rgb(198, 86, 86);
+    color: rgb(252, 244, 244);
+    border-width: 0;
+    border-radius: 8px;
+    transition-duration: 200ms;
+}
+
+.pl-danger:hover {
+    background-color: rgb(214, 102, 102);
+    transition-duration: 200ms;
+}
+
+.pl-danger:active {
+    background-color: rgb(232, 128, 128);
+    transition-duration: 50ms;
+}
+
+/* ── a small inert pill ───────────────────────────────────────────────── */
+
+/* A keyboard shortcut, a mode, a count — something to read, never something to click, which is why it has no
+ * hover. A neutral grey at low alpha rather than the white overlay these were written with: white lightens on
+ * a dark skin and washes out on a light one, so the chip was invisible on exactly one of the two. */
+.pl-chip {
+    background-color: rgba(127, 127, 127, 0.18);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 10px;
+}

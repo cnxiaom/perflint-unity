@@ -43,7 +43,15 @@ namespace PerfLint.Licensing
                 if (LicenseSettings.Status != "active") return false;
                 if (IsExpired()) return false;
                 // Offline grace: if more than GraceDays have elapsed since the last successful validation, force fallback to Free to prevent permanent offline bypass.
-                if ((DateTime.UtcNow - LicenseSettings.LastValidatedUtc).TotalDays > LicenseSettings.GraceDays)
+                // EXCEPT for a perpetual Asset Store buyout. That entitlement never expires, so letting it
+                // lapse because the machine happened to be offline for two weeks would (a) contradict the
+                // perpetual licence the customer actually bought and (b) behave exactly like the DRM that
+                // Asset Store submissions are told not to ship. Revocation still works: a refund makes the
+                // server answer with a definitive 4xx, and Validate() drops to Free on that — see the
+                // IsDefinitiveInvalid branch. Only *inconclusive* failures (offline, 5xx) are forgiven here,
+                // which is the same principle as the grace window itself, just without a deadline.
+                if (!LicenseSettings.IsPerpetualBuyout
+                    && (DateTime.UtcNow - LicenseSettings.LastValidatedUtc).TotalDays > LicenseSettings.GraceDays)
                     return false;
                 return true;
             }
@@ -76,9 +84,13 @@ namespace PerfLint.Licensing
             if (string.IsNullOrEmpty(LicenseSettings.Key)) return "Free";
             if (IsPro)
             {
-                string exp = string.IsNullOrEmpty(LicenseSettings.ExpiresAt)
-                    ? L.Tr("(perpetual / lifetime)", "（买断 / 永久）")
-                    : L.Tr("(valid until ", "（有效期至 ") + FormatExpiryLocal(LicenseSettings.ExpiresAt) + L.Tr(")", "）");
+                string exp;
+                if (LicenseSettings.IsPerpetualBuyout)
+                    exp = L.Tr("(Asset Store — perpetual)", "（Asset Store 买断 · 永久）");
+                else if (string.IsNullOrEmpty(LicenseSettings.ExpiresAt))
+                    exp = L.Tr("(perpetual / lifetime)", "（买断 / 永久）");
+                else
+                    exp = L.Tr("(valid until ", "（有效期至 ") + FormatExpiryLocal(LicenseSettings.ExpiresAt) + L.Tr(")", "）");
                 return "Pro " + exp;
             }
             if (IsExpired()) return L.Tr("Expired (please renew)", "已过期（请续费）");
@@ -125,6 +137,7 @@ namespace PerfLint.Licensing
                     LicenseSettings.Status = resp.Status;
                     LicenseSettings.ProductId = resp.ProductId;
                     LicenseSettings.ExpiresAt = resp.ExpiresAt ?? "";
+                    LicenseSettings.Provider = resp.Provider ?? "";
                     LicenseSettings.LastValidatedUtc = DateTime.UtcNow;
                     Raise();
                     onDone(true, L.Tr("Activated successfully.", "激活成功。"));
@@ -164,6 +177,10 @@ namespace PerfLint.Licensing
                     LicenseSettings.Status = resp.Status;
                     LicenseSettings.ProductId = resp.ProductId;
                     LicenseSettings.ExpiresAt = resp.ExpiresAt ?? "";
+                    // Only overwrite when the server actually named a channel. An older proxy deployment
+                    // omits the field, and blanking it here would silently demote a perpetual buyout to
+                    // "subscription" — which would then start expiring on the offline grace window.
+                    if (!string.IsNullOrEmpty(resp.Provider)) LicenseSettings.Provider = resp.Provider;
                     LicenseSettings.LastValidatedUtc = DateTime.UtcNow;
                     Raise();
                     onDone?.Invoke(IsPro, IsPro ? L.Tr("Verified.", "校验通过。") : L.Tr("License is no longer valid: ", "许可证已失效：") + resp.Status);

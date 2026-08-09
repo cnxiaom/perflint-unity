@@ -118,8 +118,9 @@ namespace PerfLint.Scanners
             // aggregate "up to ~X (est.)" line, never per-finding promises.
             bool effectivelyUncompressed = IsEffectivelyUncompressed(importer, platform);
             bool hasMips = importer.mipmapEnabled;
-            long uncompressedBytes = TextureStreamingScanner.EstimateBytes(w, h, true, hasMips);
-            long compressedBytes = TextureStreamingScanner.EstimateBytes(w, h, false, hasMips);
+            long Bytes(bool uncompressed, bool mips) => ImportedBytes(importer, path, w, h, uncompressed, mips);
+            long uncompressedBytes = Bytes(true, hasMips);
+            long compressedBytes = Bytes(false, hasMips);
 
             // PERF.TEX001 — Read/Write
             if (importer.isReadable && maxDim >= ReadWriteSizeThreshold)
@@ -129,16 +130,21 @@ namespace PerfLint.Scanners
                     domain: Domain.Performance,
                     severity: Severity.Warning,
                     title: L.Tr("Texture has Read/Write enabled", "纹理开启了 Read/Write"),
-                    detail: L.Tr($"'{file}' ({w}x{h}) has Read/Write Enabled, which keeps an uncompressed CPU copy in memory" +
-                            " (roughly doubling its footprint). Unless you call GetPixels/Texture2D.Apply at runtime, turn it off.",
-                            $"'{file}' ({w}x{h}) 开启了 Read/Write Enabled，会在内存中保留一份未压缩 CPU 副本" +
-                            "（约翻倍占用）。除非运行时需要 GetPixels/Texture2D.Apply，否则应关闭。"),
+                    // "roughly doubling" is measured and stays; "an uncompressed CPU copy" was measured to be
+                    // wrong. Two Windows builds differing only in this flag, per object in the Memory Profiler:
+                    // Skybox_T 64.1 -> 32.1 MB, its Native size 32.0 MB -> 504 bytes while Graphics stayed at
+                    // 32.1 MB. The CPU copy is the SAME size as the GPU one, i.e. the imported representation, in
+                    // whatever format that is. Every 2D texture in the pair doubled the same way.
+                    detail: L.Tr($"'{file}' ({w}x{h}) has Read/Write Enabled, which keeps a second copy of the imported texture in CPU memory" +
+                            " (doubling its footprint). Unless you call GetPixels/Texture2D.Apply at runtime, turn it off.",
+                            $"'{file}' ({w}x{h}) 开启了 Read/Write Enabled，会在 CPU 内存里额外保留一份导入后的贴图" +
+                            "（占用翻倍）。除非运行时需要 GetPixels/Texture2D.Apply，否则应关闭。"),
                     targetPath: path,
                     ping: () => ScannerUtil.PingAsset(path),
                     fix: new TextureToggleFix(path, readable: false),
                     // The CPU-side copy mirrors the imported representation, so turning Read/Write off reclaims
                     // roughly one imported-texture's worth of memory.
-                    estimatedMemorySavingsBytes: TextureStreamingScanner.EstimateBytes(w, h, effectivelyUncompressed, hasMips)));
+                    estimatedMemorySavingsBytes: Bytes(effectivelyUncompressed, hasMips)));
             }
 
             // PERF.TEX002 — Uncompressed format (resolves the effective compression state per active platform)
@@ -196,9 +202,7 @@ namespace PerfLint.Scanners
                     ping: () => ScannerUtil.PingAsset(path),
                     fix: new TextureToggleFix(path, mipmap: false),
                     // Exactly the mip-chain overhead: with-mips minus without-mips at this texture's compression state.
-                    estimatedMemorySavingsBytes:
-                        TextureStreamingScanner.EstimateBytes(w, h, effectivelyUncompressed, true)
-                        - TextureStreamingScanner.EstimateBytes(w, h, effectivelyUncompressed, false)));
+                    estimatedMemorySavingsBytes: Bytes(effectivelyUncompressed, true) - Bytes(effectivelyUncompressed, false)));
             }
 
             // PERF.TEX005 — Compression requested but the imported texture is actually uncompressed (silent fallback).
@@ -253,6 +257,34 @@ namespace PerfLint.Scanners
         /// effective Max Size clamp (the platform override if present, else the importer default), preserving aspect ratio.
         /// An unimported / sizeless source yields (0,0) — same neutral result the old <c>tex == null</c> path produced.
         /// </summary>
+        /// <summary>
+        /// Bytes the imported representation occupies, with a cubemap counted as the six faces it is.
+        ///
+        /// GetImportedSize answers for a flat image, and every estimate here used to take it at face value. For a
+        /// cubemap that is wrong twice over: the source is a lat-long strip whose dimensions are not the face's, and
+        /// there are six of them. Measured against a build: Skybox_T, an 8192x4096 source at Max Size 2048, imports
+        /// as six BC7 faces of 2048x2048 and cost 32.0 MB per copy in the player. Treated as one flat 2048x1024
+        /// image it was estimated at 2.0 MB -- sixteen times under, on the largest texture in the scene.
+        ///
+        /// The face size comes from the imported asset rather than from arithmetic on the source, because the layout
+        /// decides it (lat-long, cross, column, strip) and guessing per layout is how this goes wrong again. Loading
+        /// is gated to cubemaps, which a project has a handful of, so the scan loop's texture-upload budget is not
+        /// at stake -- and there is a fallback for when the asset cannot be loaded at all.
+        /// </summary>
+        internal static long ImportedBytes(TextureImporter importer, string assetPath, int w, int h,
+            bool uncompressed, bool mips)
+        {
+            if (importer == null || importer.textureShape != TextureImporterShape.TextureCube)
+                return TextureStreamingScanner.EstimateBytes(w, h, uncompressed, mips);
+
+            var cube = AssetDatabase.LoadAssetAtPath<Cubemap>(assetPath);
+            int face = cube != null && cube.width > 0
+                ? cube.width
+                : Mathf.Max(1, Mathf.Min(importer.maxTextureSize > 0 ? importer.maxTextureSize : int.MaxValue,
+                                         Mathf.Max(w, h)));
+            return TextureStreamingScanner.EstimateBytes(face, face, uncompressed, mips) * 6;
+        }
+
         internal static void GetImportedSize(TextureImporter importer, string platform, out int w, out int h)
         {
             importer.GetSourceTextureWidthAndHeight(out int sw, out int sh);

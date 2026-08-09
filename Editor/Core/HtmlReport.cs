@@ -25,7 +25,12 @@ namespace PerfLint.Core
         /// <summary>Maximum number of instance rows listed per rule (the remainder is collapsed with "… N more", preventing tens of thousands of entries from bloating the file).</summary>
         public const int MaxRowsPerRule = 50;
 
-        public static string Build(ScanResult result, string projectName, string generatedAtLocal)
+        /// <param name="runtime">
+        /// Optional measured runtime evidence. When present the report stops being purely a list of things that
+        /// might be wrong and carries what the game actually did — locally measured, never uploaded.
+        /// </param>
+        public static string Build(ScanResult result, string projectName, string generatedAtLocal,
+            RuntimeEvidence runtime = null)
         {
             if (result == null) throw new ArgumentNullException(nameof(result));
             projectName = string.IsNullOrEmpty(projectName) ? "Unity project" : projectName;
@@ -75,6 +80,44 @@ namespace PerfLint.Core
             Badge(sb, "fix", result.AutoFixableCount, L.Tr("One-click fixable", "可一键修复"));
             sb.Append("</section>");
 
+            // ── Measured runtime evidence (only when a Play Mode sample exists) ──
+            if (runtime != null && runtime.HasRows)
+            {
+                sb.Append("<section class=\"measured\">");
+                sb.Append("<h2 class=\"mh\">").Append(L.Tr("Measured at runtime", "运行时实测")).Append("</h2>");
+
+                sb.Append("<div class=\"mmeta\">")
+                  .Append(Esc(L.Tr($"{runtime.DurationSeconds:0.0}s sample · {runtime.FrameCount} frames",
+                                   $"采样 {runtime.DurationSeconds:0.0}s · {runtime.FrameCount} 帧")));
+                if (!string.IsNullOrEmpty(runtime.Scenes))
+                    sb.Append(" · ").Append(Esc(L.Tr($"scene: {runtime.Scenes}", $"场景：{runtime.Scenes}")));
+                if (!string.IsNullOrEmpty(runtime.CapturedAtLocal))
+                    sb.Append(" · ").Append(Esc(runtime.CapturedAtLocal));
+                sb.Append("</div>");
+
+                // A Deep Profile session is a localization aid, not a frame-time measurement — never let its numbers
+                // leave the tool without that attached.
+                if (runtime.WasDeepProfile)
+                    sb.Append("<div class=\"mwarn\">")
+                      .Append(Esc(L.Tr("Recorded with Deep Profile on — main-thread times are inflated several-fold and are not a real frame rate.",
+                                       "采样时开着 Deep Profile——主线程耗时被放大数倍，不是真实帧率。")))
+                      .Append("</div>");
+
+                sb.Append("<table class=\"mtab\">");
+                foreach (var row in runtime.Rows)
+                    sb.Append("<tr><th>").Append(Esc(row.Label)).Append("</th><td>").Append(Esc(row.Value)).Append("</td></tr>");
+                sb.Append("</table>");
+
+                // The honesty line that has to travel with the numbers wherever this file is shared: wall-clock timings
+                // belong to the machine that recorded them, and memory sampled in the editor includes the editor.
+                sb.Append("<div class=\"mnote\">")
+                  .Append(Esc(L.Tr("Measured in the Unity editor on the machine that generated this report. Timings are specific to that hardware, and memory figures include the editor itself — treat them as a baseline to improve against, not as device numbers.",
+                                   "在生成本报告的机器上、于 Unity 编辑器内测得。耗时与该硬件绑定，内存数字包含编辑器自身——请当作用于对比改善的基线，而非设备实测值。")))
+                  .Append("</div>");
+
+                sb.Append("</section>");
+            }
+
             // ── Per-domain → per-rule ──
             foreach (var domainGroup in result.ByDomain())
             {
@@ -110,6 +153,28 @@ namespace PerfLint.Core
                     string detail = items[0].Detail;
                     if (!string.IsNullOrEmpty(detail))
                         sb.Append("<div class=\"detail\">").Append(Esc(detail)).Append("</div>");
+
+                    // Per-target Locate rows. Buttons mean nothing in a static page, but the targets they point at
+                    // are content the report was otherwise dropping outright: a finding that lists the heaviest
+                    // assets in these rows exported as its summary text and nothing else.
+                    var targets = items[0].LocateTargets;
+                    if (targets != null && targets.Count > 0)
+                    {
+                        sb.Append("<ul class=\"targets\">");
+                        foreach (var t in targets)
+                        {
+                            sb.Append("<li><span class=\"li-title\">").Append(Esc(t.Label)).Append("</span>");
+                            // Only add the path when the label does not already carry it — a row labelled
+                            // "66.4 MB  Assets/Resources/…" printed its path a second time directly underneath.
+                            if (!string.IsNullOrEmpty(t.AssetPath) &&
+                                (string.IsNullOrEmpty(t.Label) || t.Label.IndexOf(t.AssetPath, StringComparison.Ordinal) < 0))
+                                sb.Append("<span class=\"li-path\">").Append(Esc(t.AssetPath)).Append("</span>");
+                            if (!string.IsNullOrEmpty(t.Detail))
+                                sb.Append("<span class=\"li-sub\">").Append(Esc(t.Detail)).Append("</span>");
+                            sb.Append("</li>");
+                        }
+                        sb.Append("</ul>");
+                    }
 
                     int shown = Math.Min(items.Count, MaxRowsPerRule);
                     sb.Append("<ul>");
@@ -216,6 +281,16 @@ namespace PerfLint.Core
             ".badge .bn{font-size:26px;font-weight:700;color:#e6edf3}.badge .bl{font-size:12px;color:#9aa7b4}" +
             ".badge.crit .bn{color:#ef5350}.badge.warn .bn{color:#f0b429}.badge.fix .bn{color:#4cc38a}" +
             "h2{margin:30px 0 12px;font-size:16px;color:#e6edf3;font-weight:600}.dimcount{color:#9aa7b4;font-weight:400;font-size:13px}" +
+            // Measured-runtime block: framed like the score card (this is evidence, not another complaint list).
+            ".measured{background:#161b22;border:1px solid #2a313c;border-radius:12px;padding:18px 20px;margin:6px 0 26px}" +
+            ".measured .mh{margin:0 0 4px;font-size:15px}" +
+            ".mmeta{color:#9aa7b4;font-size:12px;margin-bottom:12px}" +
+            ".mwarn{background:#2a2113;border:1px solid #6b5320;border-radius:8px;padding:9px 12px;color:#f0b429;font-size:12px;margin-bottom:12px}" +
+            ".mtab{width:100%;border-collapse:collapse}" +
+            ".mtab th{text-align:left;font-weight:500;color:#9aa7b4;font-size:13px;padding:6px 12px 6px 0;white-space:nowrap;vertical-align:top;width:1%}" +
+            ".mtab td{padding:6px 0;color:#e6edf3;font-size:13px;font-family:ui-monospace,Consolas,monospace}" +
+            ".mtab tr+tr th,.mtab tr+tr td{border-top:1px solid #232a34}" +
+            ".mnote{color:#7d8896;font-size:11px;line-height:1.5;margin-top:12px;border-top:1px solid #232a34;padding-top:10px}" +
             ".rule{border:1px solid #2a313c;border-radius:10px;margin:10px 0;overflow:hidden}" +
             ".rulehead{display:flex;align-items:center;gap:9px;padding:12px 16px;background:#1a2029;flex-wrap:wrap}" +
             ".rule>summary{cursor:pointer;list-style:none}.rule>summary::-webkit-details-marker{display:none}" +
@@ -231,7 +306,11 @@ namespace PerfLint.Core
             ".pill.sev-info{color:#5b9dff;border-color:rgba(91,157,255,.4)}" +
             ".pill.fix{color:#4cc38a;border-color:rgba(76,195,138,.4)}" +
             ".rcount{margin-left:auto;background:#2a313c;color:#e6edf3;border-radius:999px;padding:1px 9px;font-size:12px}" +
-            ".detail{padding:11px 16px;color:#9aa7b4;border-top:1px solid #2a313c;font-size:13px}" +
+            // pre-wrap, because findings write their detail as laid-out text — headed lists, indented sub-lines.
+            // Default HTML collapsing turned every one of them into a single run-on paragraph in the export.
+            ".detail{padding:11px 16px;color:#9aa7b4;border-top:1px solid #2a313c;font-size:13px;white-space:pre-wrap}" +
+            ".targets{list-style:none;margin:0;padding:2px 0 6px;border-top:1px solid #2a313c}" +
+            ".targets li{padding:4px 16px}.targets .li-sub{display:block;color:#6b7683;font-size:12px;margin-left:14px}" +
             ".rule ul{list-style:none;margin:0;padding:4px 0;border-top:1px solid #2a313c}.detail+ul{border-top:none}.rule ul:empty{display:none}" +
             ".rule li{padding:6px 16px;display:flex;flex-direction:column;gap:1px}" +
             ".rule li+li{border-top:1px solid rgba(42,49,60,.55)}" +

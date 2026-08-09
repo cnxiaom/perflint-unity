@@ -17,22 +17,31 @@ namespace PerfLint.Licensing
         public readonly string ProductId;
         public readonly string ExpiresAt;   // ISO-8601 or ""
         public readonly string InstanceId;
+        /// <summary>
+        /// Which billing channel issued this entitlement: "creem" / "dodo" (subscriptions) or "unity"
+        /// (an Asset Store one-time purchase, activated with an invoice number). The proxy has always
+        /// returned this field; it matters now because a perpetual buyout must not be treated like a
+        /// subscription — see <see cref="LicenseService.IsPro"/> and <see cref="CreditService"/>.
+        /// Empty when the server didn't say (older proxy deployments) — callers must tolerate that.
+        /// </summary>
+        public readonly string Provider;
 
         private LicenseResponse(bool ok, bool reached, long code, string error,
-            string status, string product, string expires, string instance)
+            string status, string product, string expires, string instance, string provider)
         {
             Ok = ok; ServerReached = reached; HttpCode = code; Error = error;
             Status = status; ProductId = product; ExpiresAt = expires; InstanceId = instance;
+            Provider = provider;
         }
 
-        public static LicenseResponse Success(long code, string status, string product, string expires, string instance)
-            => new LicenseResponse(true, true, code, null, status, product, expires, instance);
+        public static LicenseResponse Success(long code, string status, string product, string expires, string instance, string provider)
+            => new LicenseResponse(true, true, code, null, status, product, expires, instance, provider);
 
         public static LicenseResponse ServerError(long code, string error)
-            => new LicenseResponse(false, true, code, error, null, null, null, null);
+            => new LicenseResponse(false, true, code, error, null, null, null, null, null);
 
         public static LicenseResponse NetworkError(string error)
-            => new LicenseResponse(false, false, 0, error, null, null, null, null);
+            => new LicenseResponse(false, false, 0, error, null, null, null, null, null);
     }
 
     /// <summary>
@@ -105,6 +114,7 @@ namespace PerfLint.Licensing
             public string product_id;
             public string expires_at;
             public CreemInstance instance;
+            public string provider; // "creem" / "dodo" / "unity" — the proxy normalizes this for every channel
         }
         [Serializable] private class CreemInstance { public string id; }
 
@@ -119,7 +129,7 @@ namespace PerfLint.Licensing
                 if (lic == null || string.IsNullOrEmpty(lic.status))
                     return LicenseResponse.ServerError(code, L.Tr("Could not parse the license response: ", "无法解析许可证响应：") + Truncate(json, 300));
                 return LicenseResponse.Success(
-                    code, lic.status, lic.product_id, lic.expires_at, lic.instance?.id);
+                    code, lic.status, lic.product_id, lic.expires_at, lic.instance?.id, lic.provider);
             }
             catch (Exception ex)
             {
