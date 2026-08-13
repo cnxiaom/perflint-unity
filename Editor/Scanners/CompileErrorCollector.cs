@@ -29,6 +29,7 @@ namespace PerfLint.Scanners
     {
         private const string SessionKey = "PerfLint.CompileErrors.v1";
         private const string RestoredAssemblyKey = "__session_restored__";
+        private const string HarvestedAssemblyKey = "__console_harvest__";
 
         // assembly path -> that assembly's errors from its most recent compilation.
         private static readonly Dictionary<string, List<CollectedError>> ByAssembly =
@@ -52,9 +53,11 @@ namespace PerfLint.Scanners
                             errs.Add(new CollectedError { file = NormPath(m.file), line = m.line, message = m.message });
                 }
 
-                // A recompile of this assembly replaces its previous entry; the session-restored blob (assembly
-                // granularity unknown) is superseded by ANY live event — live data always wins over the snapshot.
+                // A recompile of this assembly replaces its previous entry; the synthetic sources (session blob,
+                // console harvest — neither knows which assembly it belongs to) are superseded by ANY live event.
+                // Live data always wins: a compilation round re-emits every failing assembly's messages.
                 ByAssembly.Remove(RestoredAssemblyKey);
+                ByAssembly.Remove(HarvestedAssemblyKey);
                 if (errs.Count > 0) ByAssembly[assemblyPath ?? ""] = errs;
                 else ByAssembly.Remove(assemblyPath ?? "");
 
@@ -69,6 +72,25 @@ namespace PerfLint.Scanners
             var all = new List<CollectedError>();
             foreach (var list in ByAssembly.Values) all.AddRange(list);
             return all;
+        }
+
+        /// <summary>
+        /// What a scan should read: the captured errors, or — when the editor says compilation failed and we have
+        /// nothing (the cold-start blind spot: the compile finished before this subscriber existed) — whatever the
+        /// Console still holds. Harvested errors are STORED, not just returned, so the per-finding facts that
+        /// AI Migrate builds from <see cref="Snapshot"/> see them too. Any live compilation event supersedes them.
+        /// </summary>
+        public static List<CollectedError> SnapshotOrHarvest()
+        {
+            var live = Snapshot();
+            if (live.Count > 0 || !EditorUtility.scriptCompilationFailed) return live;
+
+            if (!ConsoleCompileErrorHarvest.TryHarvest(out var harvested) || harvested == null || harvested.Count == 0)
+                return live;
+
+            ByAssembly[HarvestedAssemblyKey] = harvested;
+            SaveToSession();
+            return harvested;
         }
 
         // ── SessionState safety net ────────────────────────────────────────────────────────────────

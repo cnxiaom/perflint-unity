@@ -2,7 +2,30 @@
 
 User-facing changes to PerfLint for Unity. This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.7.1] — 2026-08-13
+
+### Added
+- **An AI agent connected to your open editor can now edit C# and shaders under compile verification.** `perflint_apply_verified` backs the file up first, applies the edit, and compiles it; if the edit fails to compile the file is restored byte-for-byte. The edit can be a targeted old-text/new-text replacement — the preferred form, physically incapable of truncating a file — or a whole-file rewrite. Shaders are verified by actively compiling the shader's passes and return their verdict immediately; C# reports through `perflint_verify_status`, because a successful compile reloads the domain. Free on both tiers: the model is yours, so no AI credit is spent.
+
+### Changed
+- **The keyboard shortcuts moved to `Ctrl/Cmd + Alt`.** Scan Project is now `Ctrl/Cmd + Alt + L` and the Runtime Profiler `Ctrl/Cmd + Alt + M`. The old bindings collided with commands you already had: `Ctrl+Shift+L` is Unity's own Edit ▸ Lighting ▸ Generate Lighting, and `Ctrl+Shift+K` is ProBuilder's New Shape Toggle — pressing either opened a "binding conflicts with multiple commands" dialog and ran neither. Both are rebindable in Edit ▸ Shortcuts.
+- **Your own API key now works on the free tier.** Bringing your own key used to require Pro. It is self-funded and goes straight to your provider — our service never sees the request — so there is nothing to meter and no reason to charge for it: unlimited AI Fix and Explain on either tier, with no credits consumed.
+- **Rule ids in agent commands accept the short form.** `GC003` finds `PERF.GC003` in `perflint_list_findings` and `perflint_fix`; a rule filter that matches nothing now names the closest rule ids in the scan instead of returning an empty list.
+- **The shader-variant screen now shows you where it is going.** Warm-up — the recommended, safe destination of the whole panel — is marked in green, and on-device capture in blue, instead of five identical grey blocks with nothing to tell them apart.
+- **Cards are visible as cards.** Every panel's blocks sat 1.13:1 against the window behind them — close enough to nothing that a screen full of cards read as one flat sheet of grey. They now carry a slightly lifted fill and a hairline edge, on both the dark and the light editor skin. Severity-coloured cards are unchanged.
+
+### Fixed
+- **Measuring with Deep Profile on no longer slows the editor to a crawl.** Deep Profile stretches every frame, and the stutter detector read those stretched frames as stutters — so it chased every single one, rebuilding call trees on the editor's update loop while the measurement was running, which stretched the next frame further still. It now judges a stutter against the run's own baseline whenever Deep Profile is on, and the capture that follows is capped per frame. What Deep Profile is for is unchanged: you still get the exact method names, and a real freeze is still caught.
+- **The health score is described where it actually appears.** The welcome screen and the README said a scan hands you a 0–100 project health score; the panel stopped showing one a while back. The score is unchanged and still free — it lives in the exported HTML report, the CLI output, and the JSON your agent reads.
+- **The README no longer claims one-click fixes can be undone with `Edit ▸ Undo`.** They cannot: import-setting changes are written through the asset importer, which Unity's undo stack does not record. The product has always said so at the moment you apply one — but the README said the opposite, in four places across both languages. Commit to version control first; the preview shows exactly what each fix will change before it runs.
+- **The shader-variant panel now reads like the rest of PerfLint.** Its body text and footnotes were a size or two below the floor the other panels hold, the capture count was set larger than any window title in the product, and the how-to and the record buttons sat outside the cards everything else lives in — so the screen had two different left edges. It also offered two "primary" buttons at once; Save is the one now.
+- **Comments AI Migrate and AI Fix add to your code are written in English.** A migration could come back with Chinese comments in it whatever language the interface was set to. Comments already in the file are still left exactly as they were.
+- **A complete migration is no longer rejected as truncated because the file ends with a `#pragma` or a comment.** A rewrite that closed with `#pragma warning restore` — or `#endif`, `#endregion`, a trailing comment — was refused every time it was generated. Genuinely cut-off output is still refused.
+- **Regenerating tells you which attempt you are on.** When a second attempt failed for the same reason as the first, the panel was identical before and after the click, so the button looked dead.
+- **Compile errors that are already in the Console are now reported per file.** Opening a project that was broken before PerfLint loaded gave you one "details pending" finding asking you to trigger a recompile — while the errors sat in the Console. They are now read from there instead, each file with AI Migrate on it.
+- **An AI change waiting for compile verification now survives closing the editor.** The pending list and its backups only lasted for the editor session, so quitting before the verifying compile left the change in place, unverified, with nothing to roll back to — and a project that doesn't compile can wait a long time for that verdict. Both now live under `Library/`, and the check resumes on the next start.
+- **AI Migrate is told what the replacement API actually contains.** Asked to migrate off `GetInstanceID()`, the model invented three `EntityId` members in a row on one file; each was caught and rolled back, but the round trips were wasted. The exact member list is now sent with the request.
+- **A restored report no longer shows the compile state it was saved with.** Compile findings are re-derived when the panel is restored and whenever you click back into it, so recompiling — or fixing the file — is reflected without a full rescan. Everything else in the restored report is unchanged.
 
 ## [1.6.0] — 2026-08-09
 
@@ -107,7 +130,7 @@ The "stuck Unity upgrade" release — turns a project that won't compile after a
 
 ## [1.0.0] — 2026-06-30
 
-First stable release — paid subscriptions are now live. What's included:
+First stable release — paid plans are now live. What's included:
 
 - **Local scan** across Performance, Assets, Migration, and Project Settings — one click, runs entirely on your machine.
 - **Project health score (0–100)** and a self-contained, shareable **HTML report**.

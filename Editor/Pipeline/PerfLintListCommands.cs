@@ -24,7 +24,7 @@ namespace PerfLint.Ci.Pipeline
         public static ListFindingsDto PerfLintListFindings(
             [CliArg("domain", "Filter by domain: performance / assets / migration / projectsettings / runtime. Empty = all.")] string domain = null,
             [CliArg("min_severity", "Only findings at or above this severity: info / warning / critical. Default info (= all).")] string minSeverity = "info",
-            [CliArg("rule_id", "Filter to a rule id — exact or prefix, e.g. 'PERF.TEX' or 'PERF.TEX002'. Empty = all.")] string ruleId = null,
+            [CliArg("rule_id", "Filter to a rule id — exact, prefix, or the short form without its domain prefix: 'PERF.TEX', 'PERF.TEX002' and 'TEX002' all work ('GC003' finds 'PERF.GC003'). If nothing matches, the response names the closest rule ids in the scan. Empty = all.")] string ruleId = null,
             [CliArg("limit", "Max individual items to return (paging). Default 50, capped at 200. The rule rollup is always complete.")] int limit = 50,
             [CliArg("offset", "Skip this many matching items before returning (paging). Default 0.")] int offset = 0)
         {
@@ -69,7 +69,8 @@ namespace PerfLint.Ci.Pipeline
             if (matched.Count == 0)
                 return Envelope("empty", 0, 0, scan.HealthScore(), scan.HealthGrade(), offset, limit,
                     Array.Empty<RuleRollupDto>(), Array.Empty<FindingItemDto>(),
-                    "No findings match this filter (the scan itself found " + (scan.Findings?.Count ?? 0) + ").");
+                    "No findings match this filter (the scan itself found " + (scan.Findings?.Count ?? 0) + ")."
+                    + UnknownRuleHint(scan.Findings, ruleId));
 
             var rules = FindingQuery.Rollup(matched).Select(RuleRollupDto.From).ToArray();
             var page = matched.Skip(offset).Take(limit).Select(FindingItemDto.From).ToArray();
@@ -83,6 +84,24 @@ namespace PerfLint.Ci.Pipeline
             var dto = Envelope("ok", matched.Count, rules.Length, scan.HealthScore(), scan.HealthGrade(),
                 offset, limit, rules, page, hint);
             return dto;
+        }
+
+        /// <summary>
+        /// Empty when there is no rule filter or it matches at least one finding in the scan (the empty result came
+        /// from the other filters); otherwise names the closest rule ids so a miss is never a silent empty list.
+        /// Shared with perflint_fix, which narrows by the same filter.
+        /// </summary>
+        internal static string UnknownRuleHint(IReadOnlyList<Finding> findings, string ruleId)
+        {
+            ruleId = ruleId?.Trim();
+            if (string.IsNullOrEmpty(ruleId)) return "";
+            if (findings != null)
+                foreach (var f in findings)
+                    if (f != null && FindingQuery.RuleMatches(f.RuleId, ruleId)) return "";
+            var closest = FindingQuery.SuggestRuleIds(findings, ruleId);
+            return closest.Count == 0 ? ""
+                : " Rule id '" + ruleId + "' does not appear in this scan — closest rule ids: "
+                  + string.Join(", ", closest) + ".";
         }
 
         static ListFindingsDto Envelope(string status, int total, int ruleCount, int score, string grade,

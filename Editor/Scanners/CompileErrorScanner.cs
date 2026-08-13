@@ -29,15 +29,58 @@ namespace PerfLint.Scanners
         private const int MaxErrorsQuoted = 5;     // per-file detail quotes the first few errors
 
         public IEnumerable<Finding> Scan(ScanContext context)
-            => BuildFindings(CompileErrorCollector.Snapshot(), EditorUtility.scriptCompilationFailed);
+            => BuildFindings(CompileErrorCollector.SnapshotOrHarvest(), EditorUtility.scriptCompilationFailed);
+
+        /// <summary>The rule ids this scanner owns — the set a refresh replaces wholesale.</summary>
+        internal static bool OwnsRule(string ruleId) =>
+            ruleId == "MIG.CompileError" || ruleId == "MIG.CompileErrorPackage" || ruleId == "MIG.CompileErrorPending";
+
+        /// <summary>
+        /// Re-derive these findings against the CURRENT compile state and splice them into a restored report.
+        /// Everything else in a restored report describes assets, which change slowly; compile state changes on
+        /// every compile, and the pending finding literally instructs the reader to recompile — so a report that
+        /// keeps showing the pre-recompile answer tells them their fix did nothing (2026-08-12: recompiled, then
+        /// restarted the editor, and the same "details pending" came back both times — it was serialized).
+        /// This is cheap by construction: it reads the collector, it does not scan assets.
+        /// <paramref name="changed"/> is false when the compile findings are identical, so callers can skip a
+        /// re-render (and keep the user's scroll position and expanded groups).
+        /// </summary>
+        public static ScanResult RefreshInto(ScanResult baseline, out bool changed)
+        {
+            changed = false;
+            if (baseline == null) return null;
+
+            var live = BuildFindings(CompileErrorCollector.SnapshotOrHarvest(), EditorUtility.scriptCompilationFailed).ToList();
+            var kept = new List<Finding>(baseline.Findings.Count);
+            var previous = new List<Finding>();
+            foreach (var f in baseline.Findings)
+                (f != null && OwnsRule(f.RuleId) ? previous : kept).Add(f);
+
+            if (SameFindings(previous, live)) return baseline;
+
+            kept.AddRange(live);
+            changed = true;
+            return new ScanResult(kept, baseline.Duration, baseline.ScannerRuleMap, baseline.CompletedAtUtc);
+        }
+
+        /// <summary>Identity for refresh purposes: same rules, same files, same error counts (the title carries the count).</summary>
+        private static bool SameFindings(List<Finding> a, List<Finding> b)
+        {
+            if (a.Count != b.Count) return false;
+            for (int i = 0; i < a.Count; i++)
+                if (a[i]?.RuleId != b[i]?.RuleId || a[i]?.Title != b[i]?.Title || a[i]?.TargetPath != b[i]?.TargetPath)
+                    return false;
+            return true;
+        }
 
         /// <summary>Pure logic (unit-testable): captured errors + the compilation-failed flag → findings.</summary>
         internal static IEnumerable<Finding> BuildFindings(IReadOnlyList<CollectedError> errors, bool compilationFailed)
         {
             errors = errors ?? Array.Empty<CollectedError>();
 
-            // Blind-spot degradation: the editor says compilation failed but nothing was captured (first-ever
-            // compile happened before any managed subscriber existed). Honest pointer instead of silence.
+            // Blind-spot degradation: the editor says compilation failed, no event reached the collector AND the
+            // Console harvest came back empty too (see CompileErrorCollector.SnapshotOrHarvest). Honest pointer
+            // instead of silence — but by now this should be rare, not the default first-open experience.
             if (errors.Count == 0)
             {
                 if (compilationFailed)
@@ -48,11 +91,13 @@ namespace PerfLint.Scanners
                         severity: Severity.Critical,
                         title: L.Tr("Project fails to compile (details pending)", "项目编译失败（详情待捕获）"),
                         detail: L.Tr(
-                            "Unity reports script compilation failed, but PerfLint hasn't captured the error details yet — " +
-                            "that happens when the very first compile finished before PerfLint loaded. Trigger a recompile " +
-                            "(save any script, or right-click a script → Reimport), then Scan again to get per-file findings.",
-                            "Unity 报告脚本编译失败，但 PerfLint 尚未捕获错误详情——这发生在首次编译早于 PerfLint 加载完成时。" +
-                            "触发一次重编译（保存任意脚本，或右键脚本 → Reimport），再重新扫描即可得到逐文件的诊断。"),
+                            "Unity reports script compilation failed, but PerfLint has no error details: the compile finished " +
+                            "before PerfLint loaded, and the Console no longer holds the messages either (cleared, or the failure " +
+                            "isn't a C# compiler error). Trigger a recompile (save any script, or right-click a script → Reimport), " +
+                            "then Scan again to get per-file findings.",
+                            "Unity 报告脚本编译失败，但 PerfLint 拿不到错误详情：编译早于 PerfLint 加载完成，而 Console 里也已经" +
+                            "没有这些消息（被清空，或该失败不是 C# 编译错误）。触发一次重编译（保存任意脚本，或右键脚本 → Reimport），" +
+                            "再重新扫描即可得到逐文件的诊断。"),
                         targetPath: null);
                 }
                 yield break;

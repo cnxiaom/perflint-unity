@@ -34,16 +34,44 @@ namespace PerfLint.Licensing
         /// <summary>License validation + hosted LLM proxy (Cloudflare Worker, custom domain api.perflint.dev). Can be overridden by the user in advanced settings.</summary>
         public const string DefaultEndpoint = "https://api.perflint.dev";
 
-        /// <summary>Purchase/upgrade landing page (landing page pricing section, then redirects to Creem checkout).</summary>
-        public const string BuyUrl = "https://perflint.dev/#pricing";
-
         /// <summary>
-        /// Asset Store listing for the one-time-purchase Pro package. <b>Empty until that package is
-        /// actually published</b> — the UI gates the "Buy on the Asset Store" button on this being
-        /// non-empty, so we never ship a button that leads nowhere (see CLAUDE.md: cross-references must
-        /// be gated on the thing existing, not written as a wish).
+        /// Asset Store listing for the one-time-purchase Pro package. <b>Empty, and expected to stay
+        /// empty</b> — as of 2026-08-12 the Asset Store carries the free package only, as a funnel, and
+        /// there is no Pro package listed there to link to. Kept as the higher-priority half of
+        /// <see cref="BuyUrl"/> so that reversing that route later is a one-line change.
         /// </summary>
         public const string AssetStoreProUrl = "";
+
+        /// <summary>
+        /// Where Pro is actually sold: a subscription on perflint.dev. This is the whole point of the free
+        /// package being on the Asset Store — it is a funnel, and a funnel with no outlet is just a free
+        /// tool. <b>Leaving this empty is not the safe choice</b>, it is the one that silently breaks the
+        /// business: the license panel goes blank and two Pipeline commands emit "Upgrade: " with nothing
+        /// after it.
+        ///
+        /// The site only serves this page while <c>STORE_MODE !== 'off'</c> (site/src/consts.ts) — under
+        /// 'off' the route is not emitted at all, so this would 404. That is acceptable rather than
+        /// gated-on-live-state, because the two facts move together by construction: 'off' means Pro
+        /// cannot be bought anywhere, which is a bigger problem than a stale link in the panel. If the
+        /// site ever goes back to 'off', empty this too and ship it.
+        /// </summary>
+        public const string SiteProUrl = "https://perflint.dev/pricing/";
+
+        /// <summary>
+        /// Where to send someone who wants Pro — <b>or empty when there is nowhere to send them</b>.
+        ///
+        /// Two channels, in priority order, because they can both be true at once and the store one wins
+        /// when it exists (a buyer already inside the Asset Store should not be sent out to a subscription
+        /// page). Today only the second is live: the store carries the free package as a funnel, Pro is a
+        /// subscription on perflint.dev.
+        ///
+        /// Still nullable by construction, and callers must still check <see cref="CanBuy"/> rather than
+        /// emit a dead link — both halves can be empty, and were between 2026-08-11 and 08-12.
+        /// </summary>
+        public static string BuyUrl => !string.IsNullOrEmpty(AssetStoreProUrl) ? AssetStoreProUrl : SiteProUrl;
+
+        /// <summary>Whether a purchase destination exists at all. Gate every buy button, link and upgrade URL on this.</summary>
+        public static bool CanBuy => !string.IsNullOrEmpty(BuyUrl);
 
         /// <summary>
         /// Whether the one-time Asset Store purchase exists as a product — i.e. whether an invoice number
@@ -56,9 +84,20 @@ namespace PerfLint.Licensing
         /// hand and nowhere to put it. Someone who has already paid needs to be told where to type it —
         /// not offered a button selling them what they just bought.
         ///
-        /// Flip to true in the build submitted as the Pro package; fill in the URL later, once the listing
-        /// is live. <c>static readonly</c> rather than <c>const</c> so flipping it never turns call sites
-        /// into "unreachable code" warnings.
+        /// <b>False, and expected to stay false</b> (route settled 2026-08-12): the Asset Store carries the
+        /// FREE package only, as a funnel, and Pro is a subscription sold on perflint.dev. No Pro package is
+        /// listed there, so nobody can be holding an Asset Store invoice for one, and offering to activate
+        /// with an invoice number would be asking for a credential that cannot exist. This supersedes the
+        /// 2026-08-11 plan of submitting a $59.99 buyout package alongside the free one.
+        ///
+        /// The invoice-verification path behind it is built and tested end to end (worker → Unity's
+        /// publisher/v1/invoice/verify.json, seats in KV) and is deliberately left in place rather than
+        /// deleted — it costs nothing dormant, and reversing the route later should not mean rebuilding it.
+        /// <c>tools/build-asset-store-package.sh --edition pro</c> flips this line and asserts the rewrite
+        /// landed; that switch has no current use, and <c>--edition free</c> is the only edition shipped.
+        ///
+        /// <c>static readonly</c> rather than <c>const</c> so flipping it never turns call sites into
+        /// "unreachable code" warnings.
         /// </summary>
         public static readonly bool AssetStoreBuyoutAvailable = false;
 

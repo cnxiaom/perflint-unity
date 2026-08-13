@@ -196,10 +196,13 @@ namespace PerfLint.Scanners
                     title: L.Tr("WebGL build compression is disabled", "WebGL 构建压缩未开启"),
                     detail: L.Tr("Publishing Settings > Compression Format is Disabled, so the .wasm and .data files ship uncompressed — downloads are commonly 2-4x larger " +
                             "than with Brotli, which directly lengthens first-load time (the metric web game platforms live by). Brotli also compresses ~20% smaller than Gzip; " +
-                            "browsers accept it over HTTPS, which itch.io / Poki / CrazyGames and similar platforms already serve. If you self-host on a server without " +
+                            // Naming specific storefronts here was a liability, not information: Asset Store Content
+                            // Transparency §1.7.2 bars marketplace references in in-package descriptions, and the
+                            // 2026-08-11 rejection raised that as its own item. The point stands without the names.
+                            "browsers accept it over HTTPS, which the major web game portals already serve. If you self-host on a server without " +
                             "Content-Encoding headers, additionally enable Decompression Fallback in Publishing Settings (or use Gzip, whose fallback decompresses faster).",
                             "Publishing Settings 的 Compression Format 为 Disabled，.wasm 与 .data 文件未经压缩直接分发——下载体积通常比 Brotli 压缩后大 2-4 倍，" +
-                            "直接拉长首次加载时长（web 游戏平台最看重的指标）。Brotli 还比 Gzip 小 ~20%；浏览器在 HTTPS 下即支持（itch.io / Poki / CrazyGames 等平台均为 HTTPS）。" +
+                            "直接拉长首次加载时长（web 游戏平台最看重的指标）。Brotli 还比 Gzip 小 ~20%；浏览器在 HTTPS 下即支持（主流 web 游戏平台均为 HTTPS）。" +
                             "若自托管在不发 Content-Encoding 响应头的服务器上，请同时开启 Publishing Settings 的 Decompression Fallback（或改用 Gzip，其回退解压更快）。"),
                     targetPath: null,
                     action: new FindingAction(

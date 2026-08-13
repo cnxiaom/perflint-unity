@@ -16,7 +16,7 @@ namespace PerfLint.Core
         {
             public readonly Severity MinSeverity;      // include findings at or above this severity
             public readonly Domain? Domain;            // null = any domain
-            public readonly string RuleIdPrefix;       // case-insensitive prefix (exact id is a full-length prefix); null = any
+            public readonly string RuleIdPrefix;       // lenient rule filter, see RuleMatches (prefix or segment); null = any
 
             public Filter(Severity minSeverity, Domain? domain, string ruleIdPrefix)
             {
@@ -72,6 +72,82 @@ namespace PerfLint.Core
         }
 
         /// <summary>
+        /// Lenient rule-id matching: case-insensitive prefix at the start of the id OR at any '.'-segment
+        /// boundary — so the short form an agent naturally passes ("GC003") finds the namespaced rule
+        /// ("PERF.GC003") instead of silently matching nothing. Deliberately NOT a substring match: "ERF"
+        /// must not match "PERF.GC003", or every filter would smear across unrelated rules.
+        /// </summary>
+        public static bool RuleMatches(string ruleId, string filter)
+        {
+            if (string.IsNullOrEmpty(filter)) return true;
+            if (string.IsNullOrEmpty(ruleId)) return false;
+            if (ruleId.StartsWith(filter, StringComparison.OrdinalIgnoreCase)) return true;
+            for (int i = ruleId.IndexOf('.'); i >= 0; i = ruleId.IndexOf('.', i + 1))
+            {
+                if (string.Compare(ruleId, i + 1, filter, 0, filter.Length, StringComparison.OrdinalIgnoreCase) == 0)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// The rule ids in <paramref name="findings"/> closest to a filter that matched nothing, so a caller can
+        /// answer "no such rule" with candidates instead of a silent empty list. Ranked by edit distance between
+        /// the filter and the full id / each '.'-segment (case-insensitive, separators ignored), capped at
+        /// <paramref name="max"/>. Never null; empty only when there are no findings.
+        /// </summary>
+        public static List<string> SuggestRuleIds(IReadOnlyList<Finding> findings, string filter, int max = 5)
+        {
+            var result = new List<string>();
+            if (findings == null || string.IsNullOrEmpty(filter)) return result;
+
+            string want = NormalizeRuleToken(filter);
+            var scored = new List<KeyValuePair<int, string>>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var f in findings)
+            {
+                if (f == null || string.IsNullOrEmpty(f.RuleId) || !seen.Add(f.RuleId)) continue;
+                int best = EditDistance(NormalizeRuleToken(f.RuleId), want);
+                foreach (var seg in f.RuleId.Split('.'))
+                    best = Math.Min(best, EditDistance(NormalizeRuleToken(seg), want));
+                scored.Add(new KeyValuePair<int, string>(best, f.RuleId));
+            }
+            scored.Sort((a, b) => a.Key != b.Key ? a.Key.CompareTo(b.Key) : string.CompareOrdinal(a.Value, b.Value));
+            for (int i = 0; i < scored.Count && i < max; i++) result.Add(scored[i].Value);
+            return result;
+        }
+
+        /// <summary>Uppercased with separators dropped, so "perf-gc003" and "PERF.GC003" compare as the same token.</summary>
+        static string NormalizeRuleToken(string s)
+        {
+            var sb = new System.Text.StringBuilder(s.Length);
+            foreach (char c in s)
+                if (char.IsLetterOrDigit(c)) sb.Append(char.ToUpperInvariant(c));
+            return sb.ToString();
+        }
+
+        /// <summary>Plain Levenshtein distance (two-row), small inputs only — rule ids are short.</summary>
+        static int EditDistance(string a, string b)
+        {
+            if (a.Length == 0) return b.Length;
+            if (b.Length == 0) return a.Length;
+            var prev = new int[b.Length + 1];
+            var cur = new int[b.Length + 1];
+            for (int j = 0; j <= b.Length; j++) prev[j] = j;
+            for (int i = 1; i <= a.Length; i++)
+            {
+                cur[0] = i;
+                for (int j = 1; j <= b.Length; j++)
+                {
+                    int sub = prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1);
+                    cur[j] = Math.Min(Math.Min(prev[j] + 1, cur[j - 1] + 1), sub);
+                }
+                var t = prev; prev = cur; cur = t;
+            }
+            return prev[b.Length];
+        }
+
+        /// <summary>
         /// Findings matching the filter, ordered most-useful-first: severity desc, then total (memory+build) savings
         /// desc, then a stable tiebreak (ruleId / path / line) so paging is deterministic across calls. Never null.
         /// </summary>
@@ -84,7 +160,7 @@ namespace PerfLint.Core
                 if (x == null) continue;
                 if ((int)x.Severity < (int)f.MinSeverity) continue;
                 if (f.Domain.HasValue && x.Domain != f.Domain.Value) continue;
-                if (f.RuleIdPrefix != null && !x.RuleId.StartsWith(f.RuleIdPrefix, StringComparison.OrdinalIgnoreCase)) continue;
+                if (f.RuleIdPrefix != null && !RuleMatches(x.RuleId, f.RuleIdPrefix)) continue;
                 result.Add(x);
             }
             result.Sort(CompareFindings);

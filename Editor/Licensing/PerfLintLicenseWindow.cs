@@ -107,28 +107,36 @@ namespace PerfLint.Licensing
             };
             state.Add(_tierNote);
 
-            // Shown only while it is the useful button — hidden outright on a machine that already has Pro, rather
-            // than left there to sell something already owned. Visibility is set in Refresh, so a tier flip while
-            // the window is open moves it without a rebuild (which would wipe a half-typed key).
+            // Shown only while it is the useful button — hidden on a machine that already has Pro, rather than left
+            // there to sell something already owned, AND hidden while nothing is actually on sale. Visibility is set
+            // in Refresh, so a tier flip while the window is open moves it without a rebuild (which would wipe a
+            // half-typed key).
+            //
+            // The label names no channel on purpose. LicenseSettings.BuyUrl picks between the Asset Store listing
+            // and perflint.dev, so wording it after either one would be wrong the moment the other wins — the same
+            // cross-reference trap CLAUDE.md calls out. Where the button leads is a fact the button should read
+            // from, not repeat. (And when both are empty there is genuinely nowhere to send anyone, hence CanBuy:
+            // the key field below still works, which is what somebody arriving with a credential actually needs.)
             _buyRow = new VisualElement { style = { flexDirection = FlexDirection.Row, marginTop = 10 } };
-            var buy = PerfLintStyle.Primary(L.Tr("Get Pro →", "获取 Pro →"),
-                () => Application.OpenURL(LicenseSettings.BuyUrl));
-            buy.style.alignSelf = Align.FlexStart;
-            _buyRow.Add(buy);
-
-            // The Asset Store one-time purchase sits BESIDE the subscription, not instead of it. Sending every
-            // buyer off-store while we also sell in the store is the one thing that reads badly from Unity's side
-            // — and plenty of people simply prefer to buy where their other tools live.
-            // Gated on the listing actually existing: an unpublished package would make this a button that leads
-            // nowhere, which is the failure mode CLAUDE.md calls out by name.
-            if (StoreListingLive)
+            if (LicenseSettings.CanBuy)
             {
-                var store = PerfLintStyle.Secondary(
-                    L.Tr("Buy once on the Asset Store →", "在 Asset Store 一次性购买 →"),
-                    () => Application.OpenURL(LicenseSettings.AssetStoreProUrl));
-                store.style.marginLeft = 6;
-                store.style.alignSelf = Align.FlexStart;
-                _buyRow.Add(store);
+                var buy = PerfLintStyle.Primary(L.Tr("Get Pro →", "获取 Pro →"),
+                    () => Application.OpenURL(LicenseSettings.BuyUrl));
+                buy.style.alignSelf = Align.FlexStart;
+                _buyRow.Add(buy);
+            }
+            else if (InvoiceActivationOffered)
+            {
+                // The Pro package exists but this build predates its listing URL — which is the normal state for
+                // the build submitted alongside it, since the URL only exists after approval. Saying where Pro
+                // comes from costs nothing and keeps the panel from dead-ending: without this, a Free user reads
+                // "Pro adds applying fixes at project scale" and is given no idea how to get it.
+                _buyRow.Add(new Label(L.Tr(
+                    "Pro is a separate package on the Unity Asset Store. Bought it already? Enter its invoice number below.",
+                    "Pro 是 Unity Asset Store 上的另一个包。已经买了的话，在下面填那笔购买的发票号。"))
+                {
+                    style = { fontSize = 11, color = PerfLintStyle.Dim, whiteSpace = WhiteSpace.Normal, flexShrink = 1 }
+                });
             }
             state.Add(_buyRow);
 
@@ -136,7 +144,7 @@ namespace PerfLint.Licensing
 
             // ── The key ──
             //
-            // One field takes every credential: a subscription license key, and — once the buyout exists — the
+            // One field takes every credential: an existing licence key, and — once the buyout exists — the
             // invoice number, order ID or product code from an Asset Store purchase (the store's own verify tool
             // accepts all three, so people will arrive holding any of them). That is not a shortcut: the proxy
             // already works out which channel a credential belongs to and remembers it, so a second field would
@@ -151,8 +159,8 @@ namespace PerfLint.Licensing
             body.Add(_keyField);
             if (InvoiceActivationOffered)
                 body.Add(Hint(L.Tr(
-                    "The license key from your perflint.dev subscription, or — if you bought on the Asset Store — the invoice number, order ID or product code from that purchase. This field takes any of them.",
-                    "可以是 perflint.dev 订阅的许可证密钥；如果你是在 Asset Store 买的，则填那笔购买的发票号、订单号或产品码 —— 同一个框都收。")));
+                    "The invoice number, order ID or product code from your Asset Store purchase — or an existing PerfLint license key. This field takes any of them.",
+                    "填 Asset Store 购买后的发票号、订单号或产品码；已有 PerfLint 许可证密钥的也填这里 —— 同一个框都收。")));
 
             var row = new VisualElement { style = { flexDirection = FlexDirection.Row, marginTop = 8 } };
             _activate = PerfLintStyle.Secondary(L.Tr("Activate", "激活"), OnActivate);
@@ -262,20 +270,26 @@ namespace PerfLint.Licensing
                                             : hasKey ? PerfLintStyle.Amber
                                             : PerfLintStyle.Dimmer;
 
-            // The Pro line differs by channel, because what the two actually grant differs: a subscription's AI
-            // allowance refills every month, a buyout's is a one-time pack. Saying "monthly allowance" to someone
-            // who bought once would promise a refill that never arrives.
+            // The Pro line differs by channel, because what the two actually grant differs: a buyout's AI credits
+            // are a one-time pack, a monthly plan's refill. Telling a buyout owner about a "monthly allowance"
+            // would promise a refill that never arrives — and telling anyone to go subscribe would advertise a
+            // channel that is no longer for sale. Describing the plan someone already holds is fine; steering
+            // people towards buying one elsewhere is not.
             if (_tierNote != null)
                 _tierNote.text = !pro
-                    ? L.Tr("The full scan, every finding, the health score and the shareable report are already yours, plus a daily allowance of AI Fix / Explain. Pro adds applying fixes at project scale.",
-                           "完整扫描、全部诊断、健康分、可分享报告已经归你，外加每日一定次数的 AI Fix / Explain。Pro 增加的是在整个工程规模上执行修复。")
+                    ? L.Tr("The full scan, every finding, the health score and the shareable report are already yours, plus a daily allowance of AI Fix / Explain — or unlimited with your own API key. Pro adds applying fixes at project scale.",
+                           "完整扫描、全部诊断、健康分、可分享报告已经归你，外加每日一定次数的 AI Fix / Explain —— 填入自己的 API key 则不限量。Pro 增加的是在整个工程规模上执行修复。")
                     : LicenseSettings.IsPerpetualBuyout
-                        ? L.Tr("Yours permanently: unlimited one-click and batch fixes, duplicate-asset de-duplication, the Migration Assistant, and bring-your-own API key. The included AI credits are a one-time pack — once it runs out, use your own API key, or subscribe for a monthly allowance.",
-                               "永久归你：无限一键与批量修复、重复资源去重、迁移助手，以及自带 API key。附带的 AI 额度是一次性包 —— 用完后可改用自己的 API key，或订阅换取每月额度。")
-                        : L.Tr("Unlimited one-click and batch fixes, duplicate-asset de-duplication, the Migration Assistant, the Pro monthly AI allowance, and bring-your-own API key.",
-                               "无限一键与批量修复、重复资源去重、迁移助手、Pro 每月 AI 额度，以及自带 API key。");
+                        ? L.Tr("Yours permanently: unlimited one-click and batch fixes, duplicate-asset de-duplication, and the Migration Assistant. The included AI credits are a one-time pack — once they run out, add your own API key under Advanced for unlimited, self-funded use.",
+                               "永久归你：无限一键与批量修复、重复资源去重、迁移助手。附带的 AI 额度是一次性包 —— 用完后在「高级」里填入自己的 API key，自费无限使用。")
+                        : L.Tr("Unlimited one-click and batch fixes, duplicate-asset de-duplication, the Migration Assistant, and your plan's AI allowance.",
+                               "无限一键与批量修复、重复资源去重、迁移助手，以及你所在套餐的 AI 额度。");
 
-            if (_buyRow != null) _buyRow.style.display = pro ? DisplayStyle.None : DisplayStyle.Flex;
+            // Hidden on a machine that already has Pro, and hidden when Rebuild found nothing worth putting in it
+            // (no purchase link AND no listing to point at). Keyed on childCount rather than re-deriving the
+            // conditions, so this can never disagree with what Rebuild actually built.
+            if (_buyRow != null)
+                _buyRow.style.display = (pro || _buyRow.childCount == 0) ? DisplayStyle.None : DisplayStyle.Flex;
 
             // Both of these need a key on file to do anything at all — Validate returns "Not activated yet." without
             // one, and Deactivate has nothing to remove. A button whose only possible outcome is a message saying it

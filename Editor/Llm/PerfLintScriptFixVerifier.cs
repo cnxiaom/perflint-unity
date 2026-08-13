@@ -25,7 +25,7 @@ namespace PerfLint.Llm
     ///   The reload wipes in-memory window results, so we set RescanFlag here to make the
     ///   window perform one full rescan after reload for reconciliation.
     ///
-    /// Pending entries are stored as a <b>list</b> (multiple entries survive reloads via SessionState):
+    /// Pending entries are stored as a <b>list</b> on disk under Library/ (they survive reloads AND editor restarts):
     /// fixes are applied without compiling, so the user can edit multiple files in a row,
     /// and each must be independently rollback-able from its own backup — a single slot would
     /// lose everything except the last entry.
@@ -42,9 +42,9 @@ namespace PerfLint.Llm
     [InitializeOnLoad]
     internal static class PerfLintScriptFixVerifier
     {
-        // Pending-verification list: each line is "assetPath\tbackupPath\twriteTicks".
-        // Internal (not private) so the batchmode integration driver (VerifierItestDriver) can assert on the
-        // raw pending state across compile passes.
+        // Legacy home of the pending list (each line "assetPath\tbackupPath\twriteTicks"). The list now lives on
+        // disk — see StateDir — and this key is read once, so entries in flight when PerfLint updates still get a
+        // verdict instead of being stranded. Nothing writes it any more.
         internal const string KPending = "PerfLint.Fix.Pending";
 
         // UTC ticks of the most recent compilation-pass start; persisted so OnScriptsReloaded (new domain)
@@ -62,13 +62,105 @@ namespace PerfLint.Llm
         /// </summary>
         public static event System.Action<string, string> FixRolledBack;
 
+        // ── Pollable outcome record ──────────────────────────────────────────────────────────────────
+        //
+        // The event above only reaches subscribers alive in this domain, which is exactly what an
+        // out-of-process caller is not: a successful compile reloads the domain and cuts the CLI/MCP
+        // connection mid-verification (this is why perflint_ai_migrate refuses .cs files outright). So the
+        // verdict is also written to SessionState, which survives the reload, and the caller polls for it
+        // afterwards instead of holding a connection across it.
+        //
+        // Kept deliberately small: newest-first, capped, and cleared with the editor session. It is a
+        // hand-off channel, not a history — the authoritative state is the file on disk.
+        private const string KOutcome = "PerfLint.Fix.Outcome";
+        private const int MaxOutcomes = 32;
+
+        /// <summary>The verdict recorded for a verified write.</summary>
+        public const string OutcomePassed = "passed";
+        /// <summary>The verdict recorded when compile errors caused the file to be restored.</summary>
+        public const string OutcomeRolledBack = "rolled_back";
+
         private static long _passStartTicks;
+
+        /// <summary>
+        /// Records a verdict for <paramref name="assetPath"/>, replacing any earlier one for the same file.
+        /// Called from both judgement sites so a caller that was disconnected by the domain reload can still
+        /// learn what happened.
+        ///
+        /// Internal rather than private because the shader half of perflint_apply_verified reaches its verdict
+        /// synchronously (shader compilation reloads no domain) and records it here too — so a caller that polls
+        /// perflint_verify_status out of habit gets the same answer for both file kinds instead of "unknown".
+        /// </summary>
+        internal static void RecordOutcome(string assetPath, string verdict, string errors)
+        {
+            var kept = new List<string> { Encode(assetPath, verdict, errors) };
+            foreach (var line in SessionState.GetString(KOutcome, "").Split('\n'))
+            {
+                if (string.IsNullOrEmpty(line)) continue;
+                if (DecodePath(line) == assetPath) continue;      // superseded by the entry just added
+                if (kept.Count >= MaxOutcomes) break;
+                kept.Add(line);
+            }
+            SessionState.SetString(KOutcome, string.Join("\n", kept));
+        }
+
+        /// <summary>
+        /// The last verdict recorded for <paramref name="assetPath"/>, or a null verdict when the file has no
+        /// record in this editor session — which, for a file still in the pending list, means "not judged yet".
+        /// </summary>
+        public static void ReadOutcome(string assetPath, out string verdict, out string errors)
+        {
+            verdict = null; errors = null;
+            foreach (var line in SessionState.GetString(KOutcome, "").Split('\n'))
+            {
+                if (string.IsNullOrEmpty(line) || DecodePath(line) != assetPath) continue;
+                var parts = line.Split('\t');
+                verdict = parts.Length > 1 ? parts[1] : null;
+                errors = parts.Length > 2 ? Unescape(parts[2]) : null;
+                return;
+            }
+        }
+
+        /// <summary>Whether <paramref name="assetPath"/> is still awaiting a compile verdict.</summary>
+        public static bool IsPending(string assetPath)
+        {
+            foreach (var (asset, _, _) in Load())
+                if (asset == assetPath) return true;
+            return false;
+        }
+
+        private static string Encode(string path, string verdict, string errors)
+            => path + "\t" + verdict + "\t" + Escape(errors ?? "");
+        private static string DecodePath(string line)
+        {
+            int t = line.IndexOf('\t');
+            return t < 0 ? line : line.Substring(0, t);
+        }
+        // Tabs and newlines are the record separators, so they cannot survive raw inside a payload.
+        private static string Escape(string s) => s.Replace("\\", "\\\\").Replace("\t", "\\t").Replace("\n", "\\n").Replace("\r", "");
+        private static string Unescape(string s)
+        {
+            var sb = new System.Text.StringBuilder(s.Length);
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (s[i] != '\\' || i + 1 >= s.Length) { sb.Append(s[i]); continue; }
+                char c = s[++i];
+                sb.Append(c == 'n' ? '\n' : c == 't' ? '\t' : c);
+            }
+            return sb.ToString();
+        }
 
         static PerfLintScriptFixVerifier()
         {
             CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompilationFinished;
             CompilationPipeline.compilationStarted += OnCompilationStarted;
             long.TryParse(SessionState.GetString(KPassStart, "0"), out _passStartTicks);
+
+            // An entry surviving into a NEW editor session was written and never judged — the session it belonged
+            // to ended before its verifying compile (see StateDir for why that used to lose the entry entirely).
+            // Give it a verdict now, instead of the AI's write silently becoming permanent.
+            // Deferred: a static constructor is no place to touch the asset pipeline.
+            EditorApplication.delayCall += ReconcileInheritedEntries;
         }
 
         private static void OnCompilationStarted(object context)
@@ -131,25 +223,8 @@ namespace PerfLint.Llm
                 }
 
                 // Compile failure: restore the backup. No domain reload occurs at this point, so the handler is still alive.
-                try
-                {
-                    if (File.Exists(backup))
-                    {
-                        File.WriteAllText(Path.GetFullPath(asset), File.ReadAllText(backup));
-                        File.Delete(backup);
-                    }
-                }
-                catch { /* rollback is best-effort */ }
+                RollBack(asset, backup, SummarizeErrors(messages, asset));
                 rolledBack = true;
-                // Include the actual compiler errors: without them the user (and we) can't tell WHAT the AI got
-                // wrong — the difference between "regenerate", "fix one line by hand" and "give up".
-                string summary = SummarizeErrors(messages, asset);
-                Debug.LogWarning("[PerfLint] " + L.Tr(
-                    $"The AI change caused compile errors and was auto-rolled back: {asset}\n{summary}",
-                    $"AI 修改导致编译错误，已自动回滚：{asset}\n{summary}"));
-                AssetDatabase.ImportAsset(asset);
-                try { FixRolledBack?.Invoke(asset, summary); }
-                catch { /* a subscriber error must never break verification */ }
             }
 
             Save(remaining);
@@ -161,11 +236,108 @@ namespace PerfLint.Llm
             }
         }
 
+        /// <summary>
+        /// Restore one pending write from its backup and announce the verdict. Shared by the compile-callback path
+        /// and the startup reconciliation — the same act, reached two ways; duplicating it once meant one of them
+        /// would drift.
+        /// </summary>
+        private static void RollBack(string asset, string backup, string summary)
+        {
+            try
+            {
+                if (File.Exists(backup))
+                {
+                    File.WriteAllText(Path.GetFullPath(asset), File.ReadAllText(backup));
+                    File.Delete(backup);
+                }
+            }
+            catch { /* rollback is best-effort */ }
+
+            // Include the actual compiler errors: without them the user (and we) can't tell WHAT the AI got
+            // wrong — the difference between "regenerate", "fix one line by hand" and "give up".
+            Debug.LogWarning("[PerfLint] " + L.Tr(
+                $"The AI change caused compile errors and was auto-rolled back: {asset}\n{summary}",
+                $"AI 修改导致编译错误，已自动回滚：{asset}\n{summary}"));
+            AssetDatabase.ImportAsset(asset);
+            RecordOutcome(asset, OutcomeRolledBack, summary);
+            try { FixRolledBack?.Invoke(asset, summary); }
+            catch { /* a subscriber error must never break verification */ }
+        }
+
+        /// <summary>
+        /// Judge entries inherited from a previous editor session, using errors that are ALREADY known.
+        ///
+        /// The startup compile happens before this class exists, so its assemblyCompilationFinished never reaches
+        /// us — and asking for another one does nothing, because nothing on disk changed since that compile
+        /// (AssetDatabase.Refresh is a no-op, so no pass ever runs and the entry stays pending forever; measured
+        /// exactly that way on 2026-08-12 with a deliberately broken probe file surviving a restart untouched).
+        /// So the verdict is taken from the error set instead of from a pass: the collector's, or — since the
+        /// collector missed that compile for the very same reason — the Console's, via the same harvest that
+        /// recovers per-file compile findings.
+        /// </summary>
+        private static void ReconcileInheritedEntries()
+        {
+            var list = Load();
+            if (list.Count == 0) return;
+
+            // Clean startup compile: it DID see these writes (they were on disk before the editor opened), and it
+            // succeeded. That is a verdict — the strongest one available. Entries written mid-pass are not covered
+            // by it (same stale rule as everywhere else), though at editor start there is no such entry.
+            if (!EditorUtility.scriptCompilationFailed)
+            {
+                var stillPending = new List<(string asset, string backup, long writeTicks)>();
+                var passed = new List<string>();
+                foreach (var e in list)
+                {
+                    if (IsStaleForPass(e.writeTicks, _passStartTicks)) { stillPending.Add(e); continue; }
+                    try { if (File.Exists(e.backup)) File.Delete(e.backup); } catch { }
+                    RecordOutcome(e.asset, OutcomePassed, null);
+                    passed.Add(e.asset);
+                }
+                if (passed.Count > 0) PerfLintPendingRescan.Record(passed);
+                Save(stillPending);
+                return;
+            }
+
+            var errors = Scanners.CompileErrorCollector.SnapshotOrHarvest();
+            var errored = new HashSet<string>();
+            foreach (var e in errors)
+                if (e != null && !string.IsNullOrEmpty(e.file)) errored.Add(NormFull(e.file));
+
+            bool rolledBack = false;
+            var remaining = new List<(string asset, string backup, long writeTicks)>();
+            foreach (var (asset, backup, writeTicks) in list)
+            {
+                if (!errored.Contains(NormFull(asset)))
+                {
+                    // No error names this file — but "not named" is not "clean": the file's assembly may have been
+                    // skipped because another one failed first. Keep it pending for a real pass to judge.
+                    remaining.Add((asset, backup, writeTicks));
+                    continue;
+                }
+                RollBack(asset, backup, SummarizeCollectedErrors(errors, asset));
+                rolledBack = true;
+            }
+
+            Save(remaining);
+            if (rolledBack)
+            {
+                SessionState.SetBool(RescanFlag, true);
+                CompilationPipeline.RequestScriptCompilation();   // compile the restored content
+            }
+        }
+
         [DidReloadScripts]
         private static void OnScriptsReloaded()
         {
             var list = Load();
             if (list.Count == 0) return;
+
+            // A domain load is not by itself proof of a clean compile: the editor loads one at STARTUP too, with
+            // whatever assemblies exist, even when the project is broken. Confirming here would delete the backups
+            // of entries from the previous session on the strength of a compile that never ran — the exact files
+            // most in need of a verdict. The scheduler pass driven from the static constructor judges them properly.
+            if (EditorUtility.scriptCompilationFailed) { PerfLintFixCompileScheduler.RequestSoon(); return; }
 
             // A successful reload means the pass compiled cleanly — but it only vouches for entries written
             // BEFORE that pass started. A fix written mid-pass was never compiled; confirming it here would
@@ -175,10 +347,11 @@ namespace PerfLint.Llm
             foreach (var e in list)
                 (IsStaleForPass(e.writeTicks, _passStartTicks) ? keep : confirmed).Add(e);
 
-            foreach (var (_, backup, _) in confirmed)
+            foreach (var (asset, backup, _) in confirmed)
             {
                 try { if (File.Exists(backup)) File.Delete(backup); }
                 catch { /* ignore */ }
+                RecordOutcome(asset, OutcomePassed, null);
             }
 
             // Record the files that were modified and passed verification, so that after reload
@@ -196,12 +369,46 @@ namespace PerfLint.Llm
                 Debug.Log("[PerfLint] " + L.Tr("AI fixes passed compile verification.", "AI 修复已通过编译校验。"));
         }
 
-        // ── SessionState read/write for the pending-verification list ──
+        // ── Pending-verification list: on disk, deliberately outside the editor session ──
+        //
+        // This used to live in SessionState with the backups in Temp/ — both wiped when the editor closes. So an
+        // AI write whose verifying compile hadn't happened yet became permanent and unjudged the moment the user
+        // quit, with its backup gone: the rollback contract silently did not apply across a restart. Not a corner
+        // case — PerfLint's own stale-domain notice TELLS the user to restart, and a compile-broken project (the
+        // one place whole-file migration is used most) can sit for a long time before any pass judges anything.
+        // Library/ is the right home: per-machine, not committed, and not cleared behind our back.
+        private const string StateDir = "Library/PerfLint";
+        private static string PendingFile => StateDir + "/pending-verify.tsv";
+
+        /// <summary>A fresh backup path for a write about to be verified. Lives beside the pending list, and for
+        /// the same reason: a backup the editor deletes on exit cannot roll anything back the next morning.</summary>
+        internal static string NewBackupPath()
+        {
+            Directory.CreateDirectory(Path.GetFullPath(StateDir + "/Backups"));
+            return StateDir + "/Backups/PerfLint_backup_" + System.Guid.NewGuid().ToString("N") + ".txt";
+        }
+
+        /// <summary>The raw pending-list text — the itest driver asserts on it across compile passes.</summary>
+        internal static string PendingRaw()
+        {
+            try
+            {
+                string full = Path.GetFullPath(PendingFile);
+                return File.Exists(full) ? File.ReadAllText(full) : "";
+            }
+            catch { return ""; }
+        }
+
         private static List<(string asset, string backup, long writeTicks)> Load()
         {
             var list = new List<(string, string, long)>();
-            string raw = SessionState.GetString(KPending, "");
+            string raw = PendingRaw();
+
+            // One-time adoption: entries written by a pre-upgrade build of PerfLint are still in SessionState and
+            // still deserve a verdict. Read them once; the next Save writes them to disk in the new form.
+            if (string.IsNullOrEmpty(raw)) raw = SessionState.GetString(KPending, "");
             if (string.IsNullOrEmpty(raw)) return list;
+
             foreach (var line in raw.Split('\n'))
             {
                 if (line.Length == 0) continue;
@@ -216,11 +423,22 @@ namespace PerfLint.Llm
 
         private static void Save(List<(string asset, string backup, long writeTicks)> list)
         {
-            if (list.Count == 0) { SessionState.EraseString(KPending); return; }
-            var sb = new System.Text.StringBuilder();
-            foreach (var (asset, backup, writeTicks) in list)
-                sb.Append(asset).Append('\t').Append(backup).Append('\t').Append(writeTicks).Append('\n');
-            SessionState.SetString(KPending, sb.ToString());
+            SessionState.EraseString(KPending);   // the file is the only source of truth from here on
+            try
+            {
+                string full = Path.GetFullPath(PendingFile);
+                if (list.Count == 0)
+                {
+                    if (File.Exists(full)) File.Delete(full);
+                    return;
+                }
+                Directory.CreateDirectory(Path.GetFullPath(StateDir));
+                var sb = new System.Text.StringBuilder();
+                foreach (var (asset, backup, writeTicks) in list)
+                    sb.Append(asset).Append('\t').Append(backup).Append('\t').Append(writeTicks).Append('\n');
+                File.WriteAllText(full, sb.ToString());
+            }
+            catch { /* a write failure must not break the compile callback; the entry stays judged in memory */ }
         }
 
         /// <summary>
@@ -243,6 +461,30 @@ namespace PerfLint.Llm
                 if (shown >= max) continue;
                 if (shown > 0) sb.Append('\n');
                 sb.Append("  (").Append(m.line).Append(") ").Append(m.message);
+                shown++;
+            }
+            if (total > shown) sb.Append('\n').Append("  … +").Append(total - shown).Append(" more");
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Same summary, from already-captured errors rather than a live compilation pass — the form the startup
+        /// reconciliation has (its pass ran before this class existed). Identical shape on purpose: the user should
+        /// not be able to tell which path rolled their file back.
+        /// </summary>
+        internal static string SummarizeCollectedErrors(IReadOnlyList<Scanners.CollectedError> errors, string assetPath, int max = 8)
+        {
+            if (errors == null) return "";
+            string target = NormFull(assetPath);
+            var sb = new System.Text.StringBuilder();
+            int total = 0, shown = 0;
+            foreach (var e in errors)
+            {
+                if (e == null || NormFull(e.file) != target) continue;
+                total++;
+                if (shown >= max) continue;
+                if (shown > 0) sb.Append('\n');
+                sb.Append("  (").Append(e.line).Append(") ").Append(e.message);
                 shown++;
             }
             if (total > shown) sb.Append('\n').Append("  … +").Append(total - shown).Append(" more");

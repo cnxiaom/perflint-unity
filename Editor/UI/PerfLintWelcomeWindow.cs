@@ -58,11 +58,16 @@ namespace PerfLint.UI
                 L.Tr("Where you are, what to fix this round, and whether it actually worked. Start here — it decides what to do next so you don't have to read a list to find out.",
                      "你现在在哪、这一轮修什么、做完到底有没有用。从这里开始——它替你定下一步，不用先读完一整张清单。")));
             scroll.Add(MenuRow(
-                "Tools ▸ PerfLint ▸ Scan Project", "Ctrl/Cmd + Shift + L",
-                L.Tr("The full panel — health score, every finding, and all the evidence behind the Autopilot's ranking.",
-                     "完整面板——健康分、全部问题清单，以及 Autopilot 排序背后的全部证据。")));
+                // No "health score" in this description: the panel stopped showing one. The number is real and still
+                // computed, but its only outlets are the exported HTML report, CLI stdout and the Pipeline JSON —
+                // grep _ring/scoreLabel/HealthScore in PerfLintWindow returns nothing. Sending a first-time user to
+                // a panel to look at something that is not on it is the cross-reference trap in CLAUDE.md, and this
+                // is the first screen they ever see.
+                "Tools ▸ PerfLint ▸ Scan Project", "Ctrl/Cmd + Alt + L",
+                L.Tr("The full panel — every finding, how many of them apply in one click, and all the evidence behind the Autopilot's ranking.",
+                     "完整面板——全部问题清单、其中有多少能一键修，以及 Autopilot 排序背后的全部证据。")));
             scroll.Add(MenuRow(
-                "Tools ▸ PerfLint ▸ Runtime Profiler", "Ctrl/Cmd + Shift + K",
+                "Tools ▸ PerfLint ▸ Runtime Profiler", "Ctrl/Cmd + Alt + M",
                 L.Tr("Play Mode profiling: stutter, per-frame GC, and CPU hotspots, down to the script.",
                      "Play Mode 运行时分析：卡顿、每帧 GC、CPU 热点，定位到具体脚本。")));
             scroll.Add(MenuRow(
@@ -76,8 +81,8 @@ namespace PerfLint.UI
             // ── 2. What a scan gives you ─────────────────────────
             scroll.Add(Header(L.Tr("What a scan gives you", "扫描会得到什么")));
             scroll.Add(Body(L.Tr(
-                "Click Scan Project and, in seconds, you get a project health score (0–100) and findings grouped by domain. Every finding carries a severity, a Locate button that jumps to the exact asset or line, what it costs you, and how to fix it — the safe ones in one click.",
-                "点击 Scan Project，几秒后得到工程健康分（0–100）和按域分组的问题清单。每条问题都带严重级别、可跳到具体资源或代码行的 Locate 按钮、它的实际代价，以及修复方法——安全的那些可一键修复。")));
+                "Click Scan Project and, in seconds, you get findings grouped by domain, with the count of what applies in one click up top. Every finding carries a severity, a Locate button that jumps to the exact asset or line, what it costs you, and how to fix it — the safe ones in one click. The 0–100 health score and A–F grade live in the HTML report you can export.",
+                "点击 Scan Project，几秒后得到按域分组的问题清单，顶上标着其中有多少能一键修。每条问题都带严重级别、可跳到具体资源或代码行的 Locate 按钮、它的实际代价，以及修复方法——安全的那些可一键修复。0–100 的健康分与 A–F 等级在可导出的 HTML 报告里。")));
             scroll.Add(Bullet(DotPerformance, L.Tr("Performance", "性能"), L.Tr(
                 "Uncompressed or oversized textures, needless Read/Write, per-frame GC in Update (GetComponent / Camera.main / LINQ / string concat), Debug.Log shipping in builds, batching breakers, mesh and audio import settings.",
                 "未压缩/超大纹理、多余的 Read/Write、Update 里的每帧 GC（GetComponent / Camera.main / LINQ / 字符串拼接）、进 build 的 Debug.Log、破坏合批的用法、网格与音频导入设置。")));
@@ -152,11 +157,11 @@ namespace PerfLint.UI
             // ── 6. Free vs Pro (no prices in-plugin: the landing page is the single source of truth) ──
             scroll.Add(Header(L.Tr("Free and Pro", "Free 与 Pro")));
             scroll.Add(Bullet(DotFree, L.Tr("Free, forever", "免费，永久"), L.Tr(
-                "The full scan, every finding, the health score, the shareable HTML report, written fix guidance, and a daily allowance of AI Fix / Explain.",
-                "完整扫描、全部问题、健康分、可分享 HTML 报告、文字修复指引，以及每日一定次数的 AI Fix / Explain。")));
+                "The full scan, every finding, the shareable HTML report with its 0–100 health score, written fix guidance, and a daily allowance of AI Fix / Explain — or unlimited with your own API key.",
+                "完整扫描、全部问题、带 0–100 健康分的可分享 HTML 报告、文字修复指引，以及每日一定次数的 AI Fix / Explain —— 填入自己的 API key 则不限量。")));
             scroll.Add(Bullet(DotPro, "Pro", L.Tr(
-                "Applying fixes at project scale: one-click and batch fixes, optimize-by-goal, duplicate-asset de-duplication, the whole-file Migration Assistant, a much larger AI allowance, and bring-your-own API key.",
-                "在整个工程规模上执行修复：一键与批量修复、按目标优化、重复资源去重、整文件迁移助手、大得多的 AI 额度，以及自带 API key。")));
+                "Applying fixes at project scale: one-click and batch fixes, optimize-by-goal, duplicate-asset de-duplication, the whole-file Migration Assistant, and a much larger AI allowance.",
+                "在整个工程规模上执行修复：一键与批量修复、按目标优化、重复资源去重、整文件迁移助手，以及大得多的 AI 额度。")));
 
             // ── Footer: fixed, always reachable ──────────────────
             var footer = new VisualElement

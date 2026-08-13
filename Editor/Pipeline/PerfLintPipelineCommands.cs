@@ -47,7 +47,7 @@ namespace PerfLint.Ci.Pipeline
         [CliCommand("perflint_fix", "Auto-apply the safe deterministic fixes (import/project settings — the 'Fix All' set, undoable), re-scan, and report the delta. Narrow the run with rule_id / domain / min_severity to fix one category at a time. Trade-offs and AI fixes are left for review. Pro. Modifies the open project.")]
         public static FixResultDto PerfLintFix(
             [CliArg("dry_run", "Report what would be fixed and what needs review, without changing anything.")] bool dryRun = false,
-            [CliArg("rule_id", "Only fix this rule — exact or prefix, e.g. 'PERF.TEX' or 'PERF.TEX002'. Empty = every rule.")] string ruleId = null,
+            [CliArg("rule_id", "Only fix this rule — exact, prefix, or the short form without its domain prefix: 'PERF.TEX', 'PERF.TEX002' and 'TEX002' all work ('GC003' finds 'PERF.GC003'). Empty = every rule.")] string ruleId = null,
             [CliArg("domain", "Only fix this domain: performance / assets / migration / projectsettings / runtime. Empty = all.")] string domain = null,
             [CliArg("min_severity", "Only fix findings at or above this severity: info / warning / critical. Default info (= all).")] string minSeverity = "info")
         {
@@ -65,7 +65,12 @@ namespace PerfLint.Ci.Pipeline
             if (dryRun)
                 return FixResultDto.DryRun(before, plan, scope);
             if (plan.AutoFixable.Count == 0)
-                return FixResultDto.Nothing(before, plan, scope);
+            {
+                var nothing = FixResultDto.Nothing(before, plan, scope);
+                // A rule filter that names no rule in the scan must not read as "already clean".
+                nothing.message += ListFindingsDto.UnknownRuleHint(before.Findings, ruleId);
+                return nothing;
+            }
             if (!LicenseService.IsPro)
                 return FixResultDto.ProRequired(before, plan, scope);
 

@@ -1466,7 +1466,11 @@ namespace PerfLint.UI
         // Max instance rows rendered per rule, to avoid stuffing tens of thousands of VisualElements at once in a huge project.
         private const int MaxRowsPerRule = 100;
 
-        [MenuItem("Tools/PerfLint/Scan Project %#l")] // Ctrl/Cmd + Shift + L
+        // Ctrl/Cmd + Alt + L. NOT Ctrl+Shift+L, which is Unity's own Edit ▸ Lighting ▸ Generate Lighting — pressing
+        // it with PerfLint installed opened a "binding conflicts with multiple commands" dialog instead of either
+        // command, which is a poor first thing for a new user to meet. Asked the live Shortcut Manager rather than
+        // guessing a replacement: Ctrl+Shift is carrying 30 bindings, Ctrl+Alt only 21 with most letters free.
+        [MenuItem("Tools/PerfLint/Scan Project %&l")]
         public static void Open() => OpenWindow();
 
         /// <summary>
@@ -1955,7 +1959,13 @@ namespace PerfLint.UI
             // to make their findings live (replacing a full rescan). Both sources are registered in PerfLintPendingRescan,
             // written by the change tracker / verifier before domain reload, and consumed here via the shared apply step.
             _lastResult = PerfLintIncrementalRescan.Apply(_lastResult, out bool refreshedAny);
-            if (refreshedAny) ScanResultStore.Save(_lastResult);
+
+            // Compile state is the one part of a restored report that is never worth trusting: it changes with every
+            // compile, and the "details pending" finding tells the reader to go recompile — which they then do, only
+            // to be shown the serialized answer again. Re-derived from the collector here; costs nothing (no assets).
+            _lastResult = Scanners.CompileErrorScanner.RefreshInto(_lastResult, out bool compileChanged);
+
+            if (refreshedAny || compileChanged) ScanResultStore.Save(_lastResult);
 
             SessionState.EraseBool(PerfLintScriptFixVerifier.RescanFlag);
 
@@ -2132,7 +2142,18 @@ namespace PerfLint.UI
             // session would leave a "measure again and compare" button pointing at a scene it cannot compare.
             bool runtimeChanged = ReloadRuntimeSession();
             bool benchmarkChanged = ReloadBenchmarkState();
-            if ((runtimeChanged || benchmarkChanged) && _lastResult != null)
+
+            // A FAILED compile never reloads the domain, so this window survives it and would otherwise keep showing
+            // the compile findings from before — exactly when the user has just gone off to fix them. Same "only on a
+            // genuine change" discipline as above; RefreshInto returns the baseline untouched when nothing moved.
+            bool compileChanged = false;
+            if (_lastResult != null)
+            {
+                _lastResult = Scanners.CompileErrorScanner.RefreshInto(_lastResult, out compileChanged);
+                if (compileChanged) ScanResultStore.Save(_lastResult);
+            }
+
+            if ((runtimeChanged || benchmarkChanged || compileChanged) && _lastResult != null)
             {
                 RenderHeader(ListResult());
                 RenderResults();
@@ -2262,9 +2283,13 @@ namespace PerfLint.UI
         {
             if (!RoslynSetup.CanOneClickInstall)
             {
-                // No bundled DLLs: open the manual-steps doc.
+                // No bundled DLLs: open the manual-steps doc. Resolve where we are installed rather than writing the
+                // UPM path down — under Asset Store form the package is beneath Assets/, and the literal finds nothing
+                // (same defect that silently killed the stylesheet; see PerfLintStyle.SheetPath).
+                string selfRoot = PerfLint.Scanners.ScannerUtil.SelfRoot();
                 var doc = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(
-                    "Packages/com.perflint.unity/Editor/Scripting/SETUP-ROSLYN.md");
+                    (string.IsNullOrEmpty(selfRoot) ? "Packages/com.perflint.unity" : selfRoot)
+                    + "/Editor/Scripting/SETUP-ROSLYN.md");
                 if (doc != null) AssetDatabase.OpenAsset(doc);
                 else EditorUtility.DisplayDialog(L.Tr("Enable script analysis", "启用脚本分析"),
                     L.Tr("Follow Editor/Scripting/SETUP-ROSLYN.md in the package: install Microsoft.CodeAnalysis.CSharp via NuGetForUnity and add the Scripting Define `PERFLINT_ROSLYN`.",
@@ -3184,17 +3209,22 @@ namespace PerfLint.UI
 
             var gen = PerfLintStyle.AsSecondary(new Button { text = L.Tr($"Generate migration (send whole file, {n} lines, to {provider})", $"生成迁移（发送整个文件 {n} 行给 {provider}）") });
             gen.style.marginTop = 4;
+            // Attempt counter: a regenerate that fails the same way as the last one writes the SAME status text, so
+            // the panel is pixel-identical before and after the click — indistinguishable from a dead button, and
+            // reported as exactly that. The number is the only thing proving the click was heard.
+            int attempt = 0;
             gen.clicked += () =>
             {
                 if (!Entitlements.RequirePro(L.Tr("Migration Assistant", "迁移助手"))) return;
                 if (!Entitlements.RequireAiCredit(L.Tr("AI Migrate", "AI 迁移"))) return;
+                attempt++;
                 gen.SetEnabled(false);
-                status.text = L.Tr("Generating (whole-file rewrites take longer than snippet fixes)…", "生成中（整文件重写比片段修复耗时更久）…");
+                status.text = L.Tr($"Generating, attempt {attempt} (whole-file rewrites take longer than snippet fixes)…", $"第 {attempt} 次生成中（整文件重写比片段修复耗时更久）…");
                 diffArea.Clear();
                 MigrateService.Propose(recipe, target, p =>
                 {
                     gen.SetEnabled(true);
-                    if (!p.Ok) { status.text = L.Tr("Failed: ", "失败：") + p.Error; return; }
+                    if (!p.Ok) { status.text = L.Tr($"Attempt {attempt} failed: ", $"第 {attempt} 次尝试失败：") + p.Error; return; }
                     if (p.NoChange)
                     {
                         status.text = L.Tr("AI judged this file needs no migration — possibly already migrated.", "AI 判断此文件无需迁移——可能已完成迁移。");

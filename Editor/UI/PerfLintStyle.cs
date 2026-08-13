@@ -1,5 +1,6 @@
 using System;
 using PerfLint.Core;
+using PerfLint.Scanners;   // ScannerUtil.SelfRoot — resolves our install root; see SheetPath
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.UIElements;
@@ -31,7 +32,34 @@ namespace PerfLint.UI
     /// </summary>
     public static class PerfLintStyle
     {
-        public const string SheetPath = "Packages/com.perflint.unity/Editor/UI/uss/PerfLint.uss";
+        /// <summary>
+        /// Where the stylesheet lives in a UPM install — <b>and only there</b>. Kept as the fallback for when the
+        /// install root cannot be resolved; it is not the address to load from. See <see cref="SheetPath"/>.
+        /// </summary>
+        public const string SheetPathUpm = "Packages/com.perflint.unity/Editor/UI/uss/PerfLint.uss";
+
+        /// <summary>
+        /// The stylesheet path for <i>this</i> install, resolved from where PerfLint actually sits.
+        ///
+        /// This was the UPM literal until 2026-08-12, which meant that in Asset Store form — package under
+        /// <c>Assets/PerfLint/</c> — <see cref="AssetDatabase.LoadAssetAtPath{T}"/> returned null and the whole
+        /// stylesheet was skipped. Nothing threw and nothing logged; the window just rendered with every surface,
+        /// card and accent button falling back to the editor's defaults. Both install forms compile, both scan, and
+        /// only one of them looks like the product. It surfaced from a side-by-side screenshot.
+        ///
+        /// The lesson generalises past this file: <b>a path to one of our own assets must be resolved, never written
+        /// down</b> — <c>ScannerUtil.SelfRoot()</c> derives it from the main asmdef's location and is right in both
+        /// forms. <c>RoslynSetup</c> already worked this way (it was fixed for exactly this reason in 1c8fe1f); this
+        /// one was missed because a missing stylesheet degrades instead of failing.
+        /// </summary>
+        public static string SheetPath
+        {
+            get
+            {
+                string root = ScannerUtil.SelfRoot();
+                return string.IsNullOrEmpty(root) ? SheetPathUpm : root + "/Editor/UI/uss/PerfLint.uss";
+            }
+        }
 
         // ── palette ───────────────────────────────────────────
         //

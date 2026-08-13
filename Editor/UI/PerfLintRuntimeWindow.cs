@@ -38,7 +38,10 @@ namespace PerfLint.UI
         private HashSet<string> _gcRelevantFiles;
         private IVisualElementScheduledItem _poll;
 
-        [MenuItem("Tools/PerfLint/Runtime Profiler %#k")] // Ctrl/Cmd + Shift + K
+        // Ctrl/Cmd + Alt + M. NOT Ctrl+Shift+K, which ProBuilder — a Unity-published package — binds to
+        // Editors/New Shape Toggle. Same collision as Scan Project's, and nobody had pressed it yet; both moved to
+        // Ctrl+Alt together, off the list the live Shortcut Manager returned.
+        [MenuItem("Tools/PerfLint/Runtime Profiler %&m")]
         public static void Open()
         {
             var win = GetWindow<PerfLintRuntimeWindow>();

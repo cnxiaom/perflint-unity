@@ -27,7 +27,7 @@ namespace PerfLint.Licensing
         private const int ProMonthlyLimit = 5000;
         // Asset Store buyout: a ONE-TIME lifetime pack, not a monthly allowance. Mirrors
         // QUOTA.assetStoreLifetime in worker.js — keep the two in step.
-        private const int BuyoutLifetimeLimit = 2000;
+        private const int BuyoutLifetimeLimit = 10000;
 
         /// <summary>Fired whenever the remaining balance changes, so the UI can refresh its display.</summary>
         public static event Action Changed;
@@ -123,7 +123,7 @@ namespace PerfLint.Licensing
         /// Called by <see cref="LicenseService"/> on any license change. If the server-side pool just changed
         /// (Free ↔ subscription ↔ Asset Store buyout — activation / expiry / deactivation / switching channels),
         /// the cached balance belongs to the wrong pool, so drop it — <see cref="RemainingText"/> then shows the
-        /// new tier's standby allowance ("5000/month · ready" / "2000 one-time · ready" / "10/day free · ready")
+        /// new tier's standby allowance ("5000/month · ready" / "10000 one-time · ready" / "10/day free · ready")
         /// until the next /llm call returns the real balance. Built on
         /// <see cref="LicenseService.HasActivePaidLicense"/> (grace-window–independent), NOT IsPro, so an offline
         /// grace-period flap on the SAME license does not wipe a valid balance. No-op when unchanged, so

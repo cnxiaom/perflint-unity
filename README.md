@@ -53,16 +53,16 @@ Not mockups — screenshots from a real Unity project after applying the fixes P
 Detection runs on a rule engine — reproducible, offline, zero tokens. The LLM is only used to explain a finding in plain language, answer follow-ups, and generate fix snippets. Stable results, controllable cost.
 
 - **🎯 Deterministic engine** — Roslyn script analysis + asset / import / project-settings scanners. Same project, same findings, every time. No cloud round-trip to get a report.
-- **🛠️ Safe one-click fixes** — import-setting fixes apply in a batch with a preview and full Undo. You stay in control; nothing changes your project silently.
+- **🛠️ Safe one-click fixes** — import-setting fixes apply in a batch, with a preview of exactly what each one will change. They are not `Edit ▸ Undo` territory, so PerfLint says so at the point of action and asks you to commit to version control first. You stay in control; nothing changes your project silently.
 - **🤖 AI Fix with a safety net** — script-level fixes are compile-verified after writing; if the build breaks, the change is rolled back automatically. Only the snippet you choose is ever sent.
 
-**Free — find and understand every issue.** Full scan, every finding, the shareable health report, written fix guidance, and a daily allowance of AI Fix / Explain credits.
+**Free — find and understand every issue.** Full scan, every finding, the shareable health report, written fix guidance, and a daily allowance of AI Fix / Explain credits. Bringing your own API key works here too — self-funded, unlimited, and it never passes through our servers.
 
-**Pro — apply fixes at project scale.** One-click, batch, and optimize-by-goal fixes, the whole-file Migration Assistant, more AI credits, and bring-your-own key. → [See plans on perflint.dev](https://perflint.dev/#pricing)
+**Pro — apply fixes at project scale.** One-click, batch, and optimize-by-goal fixes, the whole-file Migration Assistant, and a larger monthly AI allowance. Pro is a paid subscription billed on [perflint.dev](https://perflint.dev/pricing/), where the current plans and prices are listed; no account is needed to install this package or to use anything in the free tier.
 
 ## Your AI agent can run it
 
-PerfLint registers its diagnosis as Unity Pipeline commands, so they show up as tools in Unity's own MCP server — **there is no separate MCP server to install**. Point your agent at it and ask in plain English; it reads measurements instead of guessing from your files.
+PerfLint registers its diagnosis as Unity Pipeline commands, so they show up as tools in Unity's own MCP server — **there is no separate MCP server to install**. Point your agent at it and ask in your own words — any language your agent speaks. It reads measurements instead of guessing from your files.
 
 ```
 unity mcp configure claude-code
@@ -79,7 +79,7 @@ A real session on Unity's Viking Village sample, unedited:
 >
 > `perflint_fix` → **204 applied · 0 failed · grade D → C (score 42 → 63)**
 >
-> Three findings handed back as judgment calls — a duplicate normal map whose merge rewires references, a material with a missing shader, one deprecated call. All undoable via `Edit ▸ Undo`.
+> Three findings handed back as judgment calls — a duplicate normal map whose merge rewires references, a material with a missing shader, one deprecated call. PerfLint left all three alone.
 
 Total: **1 minute 41 seconds.**
 
@@ -160,7 +160,7 @@ Pin a version by appending a tag, e.g. `…perflint-unity.git#v1.0.0`. Requires 
 ## From install to fixed in minutes
 
 1. **Install via UPM.** Add the package by Git URL — no account, no login.
-2. **Click Scan.** Open **Tools ▸ PerfLint ▸ Scan Project** (`Ctrl/Cmd + Shift + L`) and click **Scan Project**. In seconds you get a **project health score (0–100)** and findings grouped by **Performance / Assets / Migration / Project Settings** — each with a severity, an exact **Locate**, the impact in plain language, and a fix.
+2. **Click Scan.** Open **Tools ▸ PerfLint ▸ Scan Project** (`Ctrl/Cmd + Alt + L`) and click **Scan Project**. In seconds you get findings grouped by **Performance / Assets / Migration / Project Settings** — each with a severity, an exact **Locate**, the impact in plain language, and a fix — with the count of what applies in one click up top. The **0–100 project health score and A–F grade** are in the exported HTML report.
 3. **Fix &amp; ship.** Follow the free guidance or use your daily AI Fix allowance, and export a self-contained, shareable **HTML report** to send your team. Upgrade to Pro for one-click, batch, and whole-file migration fixes.
 
 Prefer the terminal? See **[Run it anywhere](#run-it-anywhere--editor-cli-or-ci)** above.
@@ -177,7 +177,7 @@ single code snippet you chose. That's it. **Zero telemetry.**
 No. All scanning and analysis happen locally in your editor. The only thing ever sent is, when you explicitly use Explain or AI Fix, the finding's metadata or the single code snippet you chose — through a zero-log proxy, or direct to your own provider if you add a key.
 
 **Do I need an API key?**
-No. AI Fix and Explain work out of the box using your plan's AI credits. Pro users can instead add their own Claude or DeepSeek key; those calls go direct to the provider and are unlimited. The deterministic scan, findings, and health report need no key and no network at all.
+No. AI Fix and Explain work out of the box using your plan's AI credits. You can instead add your own Claude or DeepSeek key — on either tier, free included; those calls go direct to the provider, are unlimited, and never pass through our servers. The deterministic scan, findings, and health report need no key and no network at all.
 
 **Which Unity versions are supported?**
 Unity 2021.3 and newer, including Unity 6. Migration rules are version-aware — you won't get noise about APIs that aren't actually deprecated in your version.

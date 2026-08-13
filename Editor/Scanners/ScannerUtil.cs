@@ -546,8 +546,14 @@ namespace PerfLint.Scanners
         /// PerfLint's own install root ("Assets/&lt;PerfLint&gt;" in Asset Store form, "Packages/com.perflint.unity" in UPM form),
         /// resolved from the main PerfLint.Editor.asmdef (which sits at &lt;root&gt;/Editor/). Cached; null when it can't be
         /// resolved (then nothing is excluded — same behaviour as before this guard existed).
+        ///
+        /// <b>Internal rather than private since 2026-08-12</b>: anything that loads one of PerfLint's own files by path
+        /// must ask this rather than write "Packages/com.perflint.unity/..." — that literal is a UPM-only address, and
+        /// under Asset Store form it resolves to nothing at all. <c>PerfLintStyle</c> had it hard-coded, so the entire
+        /// stylesheet silently failed to load there: no exception, no log, just every surface and button falling back
+        /// to editor defaults. Caught by comparing screenshots of the two install forms, not by any test.
         /// </summary>
-        private static string SelfRoot()
+        internal static string SelfRoot()
         {
             if (_selfRootResolved) return _selfRoot;
             _selfRootResolved = true;

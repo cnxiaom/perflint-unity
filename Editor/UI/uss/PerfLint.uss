@@ -44,8 +44,32 @@
     background-color: rgba(20, 40, 69, 0.2);
 }
 
+/* A card, and it has to be VISIBLE as one.
+ *
+ * It used to be `var(--unity-colors-helpbox-background)` — the theme's own surface, which is the right instinct and
+ * measured wrong: on the dark skin that resolves to #404040 against a #383838 window, which is 1.13:1. Sampled off
+ * a real capture rather than argued, and 1.13 is nothing — the block does not read as a block, so a screen that
+ * puts half its text in cards and half loose looks like one flat grey either way. Tim, on the shader panel: "这个字
+ * 的底图是否要换个颜色".
+ *
+ * Two changes, and the second is what the first alone could not do:
+ *
+ *  · The FILL lifts to ~#4A4A4A on the dark skin (1.32:1) — enough to see, deliberately short of the ~1.5 that
+ *    starts to read as RAISED, i.e. as something you could click. That distinction is the whole reason .pl-panel
+ *    goes darker rather than lighter.
+ *
+ *  · A HAIRLINE, which is the part that draws the edge. It contradicts what this file used to say — "a neutral one
+ *    does not need it, and outlining every block is what made these panels read as a stack of boxes" — and that
+ *    sentence was written when the fill was assumed to be doing the work. At 1.13:1 it was not doing any.
+ *
+ * NEUTRAL GREY rather than a fixed colour or a white overlay, for the same reason .pl-secondary is (see its note):
+ * white only ever lightens, so a value picked on the dark skin lightens an already-light page on the other one.
+ * 127-grey lifts a dark surface and darkens a light one — over #383838 it lands on 74 (#4A4A4A), and over the light
+ * skin's ~#C8C8C8 it lands on ~#B6B6B6, a card that is visible there too. One value, correct on both. */
 .pl-card {
-    background-color: var(--unity-colors-helpbox-background);
+    background-color: rgba(127, 127, 127, 0.25);
+    border-width: 1px;
+    border-color: rgba(127, 127, 127, 0.35);
     transition-duration: 150ms;
 }
 

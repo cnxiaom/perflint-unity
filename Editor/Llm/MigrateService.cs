@@ -85,6 +85,19 @@ namespace PerfLint.Llm
     /// <summary>Registry of whole-file migration recipes, keyed by the rule that detects the need for them.</summary>
     public static class MigrateRecipes
     {
+        /// <summary>
+        /// Every prompt that WRITES INTO THE USER'S SOURCE FILE must carry this line. The playbooks themselves are in
+        /// Chinese (they are ours to maintain), and a model mirrors the language it is prompted in — which is exactly
+        /// how Chinese comments ended up inside an English user's migrated file. The product ships to English-speaking
+        /// developers and the output lands in their version control, so the artifact language is stated explicitly and
+        /// is deliberately NOT tied to the UI language: `L.Tr` would still hand Chinese comments to a Chinese-UI user
+        /// whose repo (and teammates) are English. Existing comments are left alone — translating them would be an
+        /// unrelated diff.
+        /// </summary>
+        public const string EnglishOutputRule =
+            "- 【写进用户源码的文字一律用英文】：你新增或改写的注释（含 // TODO(PerfLint AI Migrate): 后面的说明）只能是英文。" +
+            "本提示是中文，但产物是要提交进用户版本库的代码，里面绝不能出现中文。原有注释保持原样，不要翻译。\n";
+
         public static MigrateRecipe ForRule(string ruleId)
         {
             if (ruleId == RtHandleRecipe.RuleId) return RtHandleRecipe;
@@ -192,6 +205,7 @@ namespace PerfLint.Llm
                 "【硬性要求】\n" +
                 "- 输出必须是完整、可直接编译的整个源文件：从第一行到最后一行逐行给出，不得省略、不得用「// ... 其余不变」占位、不得截断。\n" +
                 "- 迁移后文件中不得再出现 RenderTargetHandle。\n" +
+                EnglishOutputRule +
                 "- 绝不 override 实测 API 里标记为「已不存在」的方法——那会直接产生 CS0115 编译错误。\n" +
                 "- 只做与本迁移相关的改动：类名、命名空间、公共 API、无关方法、注释与空行布局保持原样。\n" +
                 "- 不虚构不存在的 API；不确定的边缘写法选择最保守的等价实现。\n" +
@@ -231,6 +245,7 @@ namespace PerfLint.Llm
                 "【反幻觉纪律】绝不调用你不能确定存在于该 Unity 版本的 API；不引入新包依赖；不改与本迁移无关的代码。\n" +
                 "【硬性要求】\n" +
                 "- 输出必须是完整、可直接编译的整个源文件：从第一行到最后一行逐行给出，不得省略、不得用「// ... 其余不变」占位、不得截断。\n" +
+                EnglishOutputRule +
                 "- 原文件声明的每个类型（class/struct/interface/enum）必须原名保留；公共 API（public 方法签名/属性）尽量不动，" +
                 "确须改动时留 // TODO(PerfLint AI Migrate): 注明调用方需跟进。\n" +
                 "- 只做与本迁移相关的改动：类名、命名空间、无关方法、注释与空行布局保持原样。\n" +
@@ -247,6 +262,7 @@ namespace PerfLint.Llm
         {
             bool hasGetEntityId = false;
             int implicitState = 0; // 0 = EntityId type missing, 1 = usable, 2 = warning-obsolete, 3 = error-obsolete
+            string surface = null;
             try
             {
                 foreach (var m in typeof(UnityEngine.Object).GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
@@ -263,14 +279,55 @@ namespace PerfLint.Llm
                         if (attr != null) implicitState = attr.IsError ? 3 : 2;
                         break;
                     }
+                    surface = DescribeTypeSurface(et);
                 }
             }
             catch { /* partial facts are still facts */ }
-            return FormatGetInstanceIdFacts(hasGetEntityId, implicitState);
+            return FormatGetInstanceIdFacts(hasGetEntityId, implicitState, surface);
+        }
+
+        /// <summary>
+        /// Every public member of a type, one per line, obsolete ones marked. Feeding this to the model is the only
+        /// thing that reliably stops it inventing members: told merely that "GetEntityId() exists", one run invented
+        /// EntityId.FromInt32, then .ToInt64(), then .Id — three rounds, three rollbacks, one project left broken
+        /// (Convai SDK on 6000.5, 2026-08-12). The type is small and the list is cheap; the guessing is not.
+        /// Null when the type is absent (then the facts block says so and the surface is meaningless).
+        /// </summary>
+        internal static string DescribeTypeSurface(Type t)
+        {
+            if (t == null) return null;
+            const System.Reflection.BindingFlags F = System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static |
+                System.Reflection.BindingFlags.DeclaredOnly;
+
+            var lines = new List<string>();
+            foreach (var p in t.GetProperties(F))
+                lines.Add("  " + Nice(p.PropertyType) + " " + p.Name + Obsolete(p));
+            foreach (var f in t.GetFields(F))
+                lines.Add("  " + Nice(f.FieldType) + " " + f.Name + Obsolete(f));
+            foreach (var m in t.GetMethods(F))
+            {
+                if (m.IsSpecialName && (m.Name.StartsWith("get_") || m.Name.StartsWith("set_"))) continue;
+                var ps = m.GetParameters();
+                var args = new string[ps.Length];
+                for (int i = 0; i < ps.Length; i++) args[i] = Nice(ps[i].ParameterType);
+                lines.Add("  " + (m.IsStatic ? "static " : "") + Nice(m.ReturnType) + " " + m.Name +
+                          "(" + string.Join(", ", args) + ")" + Obsolete(m));
+            }
+            lines.Sort(StringComparer.Ordinal);
+            return string.Join("\n", lines.ToArray());
+        }
+
+        private static string Nice(Type t) => t == null ? "?" : (t == typeof(void) ? "void" : t.Name);
+
+        private static string Obsolete(System.Reflection.MemberInfo m)
+        {
+            var a = (ObsoleteAttribute)Attribute.GetCustomAttribute(m, typeof(ObsoleteAttribute));
+            return a == null ? "" : (a.IsError ? "   ← 已废弃（error 级，用了就是编译错误）" : "   ← 已废弃（别用）");
         }
 
         /// <summary>Pure formatting of the GetInstanceID probe result (unit-testable on engines without EntityId).</summary>
-        internal static string FormatGetInstanceIdFacts(bool hasGetEntityId, int implicitToIntState)
+        internal static string FormatGetInstanceIdFacts(bool hasGetEntityId, int implicitToIntState, string entityIdSurface = null)
         {
             var sb = new StringBuilder();
             sb.Append("【当前引擎实测 API（反射自本机引擎，权威，优先于你的记忆）】\n");
@@ -281,6 +338,12 @@ namespace PerfLint.Llm
                 case 2: sb.Append("EntityId→int 隐式转换：warning 级废弃（能编译，但绝不要依赖）"); break;
                 case 1: sb.Append("EntityId→int 隐式转换：可用（仍应保持类型一致，不要依赖它）"); break;
                 default: sb.Append("EntityId 类型：不存在——所有调用点按方案 a 处理"); break;
+            }
+            if (!string.IsNullOrEmpty(entityIdSurface))
+            {
+                sb.Append("\n【EntityId 的全部公开成员（反射所得，是完整清单）——不在这张表里的成员一律不存在，" +
+                          "写了就是 CS1061/CS0117。需要数值时只能走这里列出的转换，绝不要自创 .Id / .ToInt64() / FromInt32() 之类】\n");
+                sb.Append(entityIdSurface);
             }
             return sb.ToString();
         }
@@ -340,6 +403,7 @@ namespace PerfLint.Llm
                 "【反幻觉纪律】绝不调用你不能确定存在于该 Unity 版本的 API；不引入新包依赖；不改与错误无关的代码。\n" +
                 "【硬性要求】\n" +
                 "- 输出必须是完整、可直接编译的整个源文件：从第一行到最后一行逐行给出，不得省略、不得用「// ... 其余不变」占位、不得截断。\n" +
+                EnglishOutputRule +
                 "- 原文件声明的每个类型（class/struct/interface/enum）必须原名保留——改名或删除会破坏其他文件对它的引用。\n" +
                 "- 公共 API（public 方法签名/属性）尽量不动；确须改动时留 TODO 注明调用方需跟进。\n" +
                 "- 缺少的 using 请补上；只做与消除所列编译错误相关的最小改动，注释与空行布局保持原样。\n" +
@@ -630,8 +694,9 @@ namespace PerfLint.Llm
             if (string.IsNullOrWhiteSpace(migrated))
                 return L.Tr("empty output", "输出为空");
 
-            // Truncation, cheapest signal first: a complete C# file ends with '}'.
-            if (!migrated.TrimEnd().EndsWith("}", StringComparison.Ordinal))
+            // Truncation, cheapest signal first: a complete C# file ends with '}' — but only once the things that
+            // legitimately follow the last brace are set aside. See LastCodeLine.
+            if (!LastCodeLine(migrated).EndsWith("}", StringComparison.Ordinal))
                 return L.Tr("output does not end with '}' — likely truncated", "输出末尾不是 '}'，疑似被截断");
 
             // Truncation / silent elision: the migrated file lost a large share of the original's lines.
@@ -663,6 +728,29 @@ namespace PerfLint.Llm
                     return L.Tr($"type '{t}' disappeared from the migrated file", $"类型 {t} 在迁移结果中消失");
 
             return null;
+        }
+
+        /// <summary>
+        /// The last line of a file that still carries code, for the "a complete C# file ends with '}'" check.
+        /// Trailing comments and preprocessor directives are NOT truncation: a file may legitimately end with
+        /// `#pragma warning restore CS0618`, `#endif`, `#endregion` or a comment, and the closing brace sits above.
+        /// Real case (2026-08-12, Convai SDK): the model wrapped the deprecated call in #pragma warning
+        /// disable/restore — a correct, complete migration — and every attempt was rejected as "likely truncated".
+        /// Comments are masked first so a trailing `// }` cannot be mistaken for the brace, or vice versa.
+        /// Returns "" for empty input (caller has already handled that case).
+        /// </summary>
+        internal static string LastCodeLine(string migrated)
+        {
+            var lines = ScriptFixService.MaskNonCode(migrated ?? "").Split('\n');
+            for (int i = lines.Length - 1; i >= 0; i--)
+            {
+                string line = lines[i].TrimEnd();
+                string lead = line.TrimStart();
+                if (lead.Length == 0) continue;      // blank, or a line that was entirely comment
+                if (lead[0] == '#') continue;        // preprocessor directive — not code, not truncation
+                return line;
+            }
+            return "";
         }
 
         /// <summary>
@@ -761,8 +849,7 @@ namespace PerfLint.Llm
                     return false;
                 }
 
-                string backup = "Temp/PerfLint_backup_" + Guid.NewGuid().ToString("N") + ".txt";
-                Directory.CreateDirectory("Temp");
+                string backup = PerfLintScriptFixVerifier.NewBackupPath();
                 File.WriteAllText(Path.GetFullPath(backup), raw);
                 PerfLintScriptFixVerifier.BeginVerify(p.FilePath, backup);
 
@@ -894,7 +981,8 @@ namespace PerfLint.Llm
         /// <summary>Retry-round user message: the rejected output plus the compiler errors it produced (and the probe facts, re-stated).</summary>
         internal static string BuildRetryUser(string failedMigrated, string errorSummary, string facts = null) =>
             "你上一轮输出的迁移文件应用后产生了编译错误，已被回滚。请修复这些错误后重新输出完整文件——" +
-            "仍然遵守 system 提示中的全部对照表、硬性要求与输出格式（<<<FILE>>>…<<<END>>>）。\n\n" +
+            "仍然遵守 system 提示中的全部对照表、硬性要求与输出格式（<<<FILE>>>…<<<END>>>），" +
+            "包括新增/改写的注释只能是英文。\n\n" +
             (string.IsNullOrEmpty(facts) ? "" : facts + "\n\n") +
             "【你上一轮的输出（含错误）】\n" + failedMigrated + "\n\n" +
             "【它产生的编译错误】\n" + errorSummary;

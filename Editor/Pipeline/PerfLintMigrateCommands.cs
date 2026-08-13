@@ -230,12 +230,9 @@ namespace PerfLint.Ci.Pipeline
         /// </summary>
         private static string CreditBlockReason()
         {
-            if (LlmSettings.Mode == LlmMode.ByoKey)
-                return LicenseService.IsPro ? null
-                    : "Using your own API key is a Pro feature. On Free, switch the LLM mode back to the built-in AI service "
-                      + "in Tools > PerfLint > LLM to use the daily allowance.";
+            if (LlmSettings.Mode == LlmMode.ByoKey) return null;   // self-funded, unlimited, both tiers
             return CreditService.HostedExhausted
-                ? "Out of AI credits for this period. Upgrade to Pro for a much larger monthly allowance, or add your own "
+                ? "Out of AI credits for this period. Pro comes with a much larger allowance, or add your own "
                   + "API key under Advanced (self-funded, never counted against credits)."
                 : null;
         }

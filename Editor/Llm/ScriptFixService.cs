@@ -94,7 +94,9 @@ namespace PerfLint.Llm
             return p;
         }
 
-        private const string SystemPrompt =
+        // internal, not private: the artifact-language guard (LlmPromptLanguageTests) asserts every code-writing
+        // prompt carries MigrateRecipes.EnglishOutputRule.
+        internal const string SystemPrompt =
             "你是资深 Unity 工程师。用户给你一段 C# 代码窗口、被标记的行与【规则说明】。请严格按规则说明，" +
             "对被标记处做最小改动的修复（可能是性能优化，也可能是 API 迁移/改名，如 FindObjectOfType→FindAnyObjectByType），" +
             "不改变原有行为、不重构无关代码。\n" +
@@ -132,6 +134,7 @@ namespace PerfLint.Llm
             "若 FIXED 用到的类型需要给定代码窗口里尚未出现的命名空间（如 SceneManager 需 UnityEngine.SceneManagement），" +
             "在 <<<FIXED>>> 之后、<<<END>>> 之前补一段 <<<USINGS>>>，每行一个命名空间（只写命名空间本身，不带 using 关键字与分号）；" +
             "工具会去重后插到文件顶部。不需要新命名空间则整段省略。\n" +
+            MigrateRecipes.EnglishOutputRule +
             "严格按如下格式回复你的修复，不要有任何其他文字或解释：\n" +
             "<<<ORIGINAL>>>\n（从给定代码中逐字复制、需要被替换的原始片段，含原有缩进）\n" +
             "<<<FIXED>>>\n（修正后的片段）\n" +
@@ -365,8 +368,7 @@ namespace PerfLint.Llm
                 // result refresh. Verification (compile + failure rollback) is delegated to Unity's next
                 // natural compile, handled by PerfLintScriptFixVerifier via
                 // assemblyCompilationFinished / DidReloadScripts.
-                string backup = "Temp/PerfLint_backup_" + Guid.NewGuid().ToString("N") + ".txt";
-                Directory.CreateDirectory("Temp");
+                string backup = PerfLintScriptFixVerifier.NewBackupPath();
                 File.WriteAllText(Path.GetFullPath(backup), full);
                 PerfLintScriptFixVerifier.BeginVerify(p.FilePath, backup);
 
@@ -903,13 +905,35 @@ namespace PerfLint.Llm
         // When anchorLine ≤ 0, keep the old behavior (take the first match).
         internal static (int at, int len) LocateRegion(string full, string originalLf, int anchorLine = 0)
         {
+            int bestStart = -1, bestLen = 0, bestDist = int.MaxValue;
+            foreach (var (line, start, len) in MatchRegions(full, originalLf))
+            {
+                if (anchorLine <= 0) return (start, len); // No anchor: take the first match (old behavior)
+
+                int dist = Math.Abs(line - anchorLine);
+                if (dist < bestDist) { bestDist = dist; bestStart = start; bestLen = len; }
+            }
+            return bestStart < 0 ? (0, 0) : (bestStart, bestLen);
+        }
+
+        /// <summary>How many places in the file the snippet matches (same tolerance as LocateRegion) — lets a
+        /// caller with no line anchor refuse an ambiguous edit instead of silently taking the first occurrence.</summary>
+        internal static int CountRegionMatches(string full, string originalLf)
+        {
+            int n = 0;
+            foreach (var _ in MatchRegions(full, originalLf)) n++;
+            return n;
+        }
+
+        /// <summary>Every match of the snippet in the file: (1-based start line, char offset, region length).</summary>
+        private static IEnumerable<(int line, int start, int len)> MatchRegions(string full, string originalLf)
+        {
             var orig = originalLf.Split('\n');
             int on = orig.Length;
             while (on > 0 && orig[on - 1].Trim().Length == 0) on--;
-            if (on == 0) return (0, 0);
+            if (on == 0) yield break;
 
             var fileLines = SplitWithIndex(full);
-            int bestStart = -1, bestLen = 0, bestDist = int.MaxValue;
             for (int i = 0; i + on <= fileLines.Count; i++)
             {
                 bool ok = true;
@@ -921,14 +945,8 @@ namespace PerfLint.Llm
 
                 int startIdx = fileLines[i].start;
                 int endIdx = fileLines[i + on - 1].contentEnd;
-                int matchLen = endIdx - startIdx;
-
-                if (anchorLine <= 0) return (startIdx, matchLen); // No anchor: take the first match (old behavior)
-
-                int dist = Math.Abs((i + 1) - anchorLine); // i is the 0-based line index → line number i+1
-                if (dist < bestDist) { bestDist = dist; bestStart = startIdx; bestLen = matchLen; }
+                yield return (i + 1, startIdx, endIdx - startIdx); // i is the 0-based line index → line number i+1
             }
-            return bestStart < 0 ? (0, 0) : (bestStart, bestLen);
         }
 
         private struct LineInfo { public string text; public int start; public int contentEnd; }
@@ -950,7 +968,7 @@ namespace PerfLint.Llm
             return res;
         }
 
-        private static string AdaptLineEndings(string snippetLf, string full)
+        internal static string AdaptLineEndings(string snippetLf, string full)
         {
             string s = snippetLf.Replace("\r\n", "\n").Replace("\r", "\n");
             return full.Contains("\r\n") ? s.Replace("\n", "\r\n") : s;

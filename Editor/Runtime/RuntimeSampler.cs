@@ -126,7 +126,21 @@ namespace PerfLint.Runtime
         // remember the frame hint + magnitude and retry the snapshot on later ticks until it becomes valid (or scrolls out of the retained window).
         // Detected spikes awaiting capture. A level-gen freeze produces SEVERAL spiking frames (different phases) in quick succession, so we track a small
         // queue — not one — and retry each until its Hierarchy becomes replayable (or it scrolls out), so no distinct culprit is dropped.
-        private struct PendingSpike { public int Frame; public double Ms; public int Attempts; }
+        private struct PendingSpike { public int Frame; public double Ms; public int Attempts; public int NextCandidate; }
+
+        /// <summary>
+        /// Order the +/-2 window around a detected spike is searched in: the hinted frame FIRST, then its immediate
+        /// neighbours, widening outwards.
+        ///
+        /// Ascending order (-2 first) was free while every candidate was rebuilt on the same tick. Under a per-tick
+        /// budget it is not: a Deep-Profile frame tree measures ~250 ms on a real project, so the budget is gone after
+        /// ONE rebuild and that one was a neighbour — an ordinary frame whose self-total cannot clear the
+        /// `bestSelf >= p.Ms * 0.5` confirmation. Measured on museum: both runs burned all 12 retries and reported
+        /// "gave up", while the spike itself sat one or two frames away, never once rebuilt.
+        ///
+        /// Centre-first makes the single rebuild a budget affords the one most likely to BE the spike.
+        /// </summary>
+        private static readonly int[] SpikeCandidateOffsets = { 0, -1, 1, -2, 2 };
         private readonly List<PendingSpike> _pendingSpikes = new List<PendingSpike>(16);
         private const int MaxPendingSpikes = 12;  // cap concurrent pending spikes (drop the smallest to make room) to bound per-tick frame-tree builds
         private List<ProfilerRecorderSample> _spikeScanBuf; // reused buffer for scanning recent Main Thread samples (freeze-recovery may add several frames per tick)
@@ -243,6 +257,9 @@ namespace PerfLint.Runtime
             FrameTimingManager.CaptureFrameTimings();
 
             _lastSpikeFrameSeen = ProfilerDriver.lastFrameIndex; // only evaluate frames produced after Start (skip pre-sampling scene-load spikes)
+            // Read once here as well as at Stop(): the live spike gate consults it on every editor tick, and it cannot
+            // change while a session runs (the toggle needs a domain reload, which ends Play Mode).
+            _wasDeepProfile = ProfilerDriver.deepProfiling;
             _spikeBaselineMs = 0;
             _liveSpikesByCulprit.Clear();
             _pendingSpikes.Clear();
@@ -303,8 +320,44 @@ namespace PerfLint.Runtime
 
         // Absolute freeze floor (ms): any frame at/above this is a candidate spike regardless of baseline (matches FPS003's 100 ms perceptible-freeze floor).
         private const double SpikeFloorMs = 100.0;
+        // Below this a frame is never a spike however far above the baseline it sits — a 4 ms frame that triples is not a stutter.
+        private const double SpikeMinMs = 33.0;
         // Relative trigger: a frame must also be this many times the running baseline to count as a spike (separates an outlier from "generally slow").
         private const double SpikeBaselineMult = 3.0;
+
+        /// <summary>
+        /// Whether a frame counts as a stutter spike.
+        ///
+        /// A pure function because the absolute thresholds in it are what reduced Deep Profile sampling to a few
+        /// frames per second, and nothing about that was testable while they were inline.
+        ///
+        /// Both absolute figures — the 100 ms freeze floor and the 33 ms minimum — are claims about what a PLAYER
+        /// would feel, and under Deep Profile the milliseconds are not the game's. Measured on the same scene minutes
+        /// apart, frames are 2.9x longer there (see BenchmarkMetricKeys.SurvivesDeepProfile, which drops every timing
+        /// for exactly this reason). So every frame cleared the freeze floor, every frame was pursued as a spike, and
+        /// each one cost up to five frame-tree rebuilds at ~100 ms apiece on the editor's own update loop. That is a
+        /// feedback loop rather than a fixed overhead: the rebuilds lengthen the next frame, which then qualifies too.
+        ///
+        /// Under Deep Profile only the RELATIVE test survives, and it is the one that still means something when the
+        /// whole scale is inflated — a frame three times this run's own baseline is an outlier whatever the units are.
+        /// </summary>
+        internal static bool IsSpike(double frameMs, double baselineMs, bool deepProfile)
+        {
+            if (frameMs <= 0) return false;
+            bool relative = baselineMs > 0 && frameMs >= baselineMs * SpikeBaselineMult;
+            if (deepProfile) return relative;
+            return frameMs >= SpikeFloorMs || (frameMs >= SpikeMinMs && relative);
+        }
+
+        /// <summary>
+        /// Per-tick ceiling (ms) on live spike capture.
+        ///
+        /// A single frame-tree rebuild cannot be interrupted, so this does not cap one — it stops the SECOND. Without
+        /// it every pending spike was retried in full on every tick: up to 12 spikes x 5 candidate frames each, and a
+        /// Deep-Profile frame tree measures ~100 ms (the same figure that sets ExtraUniformBudgetMs). Six seconds of
+        /// editor-update work per tick, spent inside the Play Mode session being measured.
+        /// </summary>
+        private const double SpikeCaptureBudgetMs = 8.0;
 
         /// <summary>
         /// While sampling, detect a spiked frame and snapshot its Hierarchy immediately (the newest frame is still retained by the Profiler backend).
@@ -341,8 +394,9 @@ namespace PerfLint.Runtime
                 else _spikeBaselineMs = _spikeBaselineMs * 0.95 + latest * 0.05;
             }
 
-            bool isSpike = spikeMs >= SpikeFloorMs || (spikeMs >= 33.0 && _spikeBaselineMs > 0 && spikeMs >= _spikeBaselineMs * SpikeBaselineMult);
-            if (!isSpike) return;
+            // _wasDeepProfile rather than reading ProfilerDriver here: the flag cannot change mid-session (toggling it
+            // needs a domain reload, which ends Play Mode), and this runs on every editor tick.
+            if (!IsSpike(spikeMs, _spikeBaselineMs, _wasDeepProfile)) return;
 
             // Pursue EVERY genuine spike (no relative-to-max gate — that would drop smaller-but-real culprits, e.g. a 358ms phase, once a big spike is seen).
             // Per-culprit aggregation keeps only the worst frame per cause, so tracking many spikes doesn't bloat the result.
@@ -399,6 +453,10 @@ namespace PerfLint.Runtime
             int first = ProfilerDriver.firstFrameIndex;
             int last  = ProfilerDriver.lastFrameIndex;
 
+            // Newest first, and bounded by SpikeCaptureBudgetMs: whatever this tick cannot afford stays pending and is
+            // retried on the next one, rather than every pending spike being rebuilt in full on every tick.
+            var budget = System.Diagnostics.Stopwatch.StartNew();
+
             for (int idx = _pendingSpikes.Count - 1; idx >= 0; idx--)
             {
                 var p = _pendingSpikes[idx];
@@ -408,13 +466,26 @@ namespace PerfLint.Runtime
                     _pendingSpikes.RemoveAt(idx);
                     continue;
                 }
+                // Checked AFTER the eviction sweep (which is free) and BEFORE the attempt is spent, so a spike skipped
+                // for lack of budget keeps its full retry count.
+                if (budget.Elapsed.TotalMilliseconds >= SpikeCaptureBudgetMs) break;
+
                 p.Attempts--;
                 _pendingSpikes[idx] = p; // persist the decremented attempt count
 
                 double bestSelf = 0; WorstFrameInfo bestSnap = null; string bestRawTop = "";
-                for (int fi = p.Frame - 2; fi <= p.Frame + 2; fi++)
+                // Resume where the last tick stopped instead of restarting the window. Restarting made every retry
+                // rebuild the SAME candidate — twelve attempts spent on one frame, which is how a spike that was
+                // sitting right there got reported as "never became replayable".
+                int ci = p.NextCandidate;
+                for (; ci < SpikeCandidateOffsets.Length; ci++)
                 {
+                    int fi = p.Frame + SpikeCandidateOffsets[ci];
                     if (fi < first || fi > last) continue;
+                    // Stop widening the +/-2 search once the budget is gone, but only with a candidate already in hand —
+                    // otherwise a tick could spend a rebuild and keep nothing. The rest of the window is covered by the
+                    // retry on a later tick, which now picks up from here.
+                    if (bestSnap != null && budget.Elapsed.TotalMilliseconds >= SpikeCaptureBudgetMs) break;
                     var frame = ProfilerDriver.GetHierarchyFrameDataView(
                         fi, 0, HierarchyFrameDataView.ViewModes.MergeSamplesWithTheSameName,
                         HierarchyFrameDataView.columnSelfTime, false);
@@ -431,6 +502,11 @@ namespace PerfLint.Runtime
                     }
                     finally { frame?.Dispose(); }
                 }
+                // Where the next tick resumes. Wrapping back to 0 after a full pass is deliberate: a frame that was not
+                // replayable on the first sweep often is a tick or two later, so the window is worth re-walking for as
+                // long as the attempt count allows.
+                p.NextCandidate = ci >= SpikeCandidateOffsets.Length ? 0 : ci;
+                _pendingSpikes[idx] = p;
 
                 // Confirm we found the actual spike frame (self-total within range of the detected magnitude), not just a normal neighbour that's ready first.
                 if (bestSnap != null && bestSelf >= p.Ms * 0.5)
@@ -1118,6 +1194,20 @@ namespace PerfLint.Runtime
         private static readonly Dictionary<string, string> _scriptPathCache = new Dictionary<string, string>(256);
 
         /// <summary>
+        /// Ceiling on first-time script resolutions per drill-down.
+        ///
+        /// The cache above only helps on a REPEAT name, and under Deep Profile every node on the trunk is a distinct
+        /// method — so a deep path meant hundreds of first-time misses, each one an AssetDatabase.FindAssets over the
+        /// whole project. BuildHotspots already avoids exactly this by mapping only its top 12 ("mapping every unique
+        /// marker, thousands under Deep Profile, would take tens of seconds"); this path, which runs DURING Play Mode
+        /// rather than during the merge, had no such limit.
+        ///
+        /// 24 is well past what a finding can show: the call path a spike is reported with is a handful of frames long,
+        /// and resolutions past that are paid for and thrown away.
+        /// </summary>
+        private const int MaxPathResolutions = 24;
+
+        /// <summary>
         /// Drill from root to leaf along the slowest frame's "heaviest child", collecting the methods on this main call path that map to project scripts (in order of appearance, outer→inner).
         /// Path selection and importance are judged by Total (including children) — this is exactly the Profiler Hierarchy's default sort, which surfaces "the user script entry point that triggered the spike".
         /// Only collect nodes with Total ≥ 20% of the frame total (filtering out insignificant side branches), and drop engine/load noise; resolution goes through the cache to control cost.
@@ -1131,6 +1221,7 @@ namespace PerfLint.Runtime
             var childBuf = new List<int>(64);
             int node = frame.GetRootItemID();
             int guard = 0;
+            int resolutions = 0; // first-time script resolutions spent on this drill — see MaxPathResolutions
 
             while (node != -1 && guard++ < 1024)
             {
@@ -1145,8 +1236,12 @@ namespace PerfLint.Runtime
                     if (total >= threshold)
                     {
                         string display = CleanMarkerName(name);
-                        if (!IsFrameworkNoise(display))
+                        // A cache hit is free, so only a FIRST-TIME resolution is charged against the ceiling — which is
+                        // what makes the ceiling bite under Deep Profile and cost nothing without it.
+                        bool cached = _scriptPathCache.ContainsKey(name);
+                        if (!IsFrameworkNoise(display) && (cached || resolutions < MaxPathResolutions))
                         {
+                            if (!cached) resolutions++;
                             string script = ResolveScriptPathCached(name);
                             if (!string.IsNullOrEmpty(script))
                             {

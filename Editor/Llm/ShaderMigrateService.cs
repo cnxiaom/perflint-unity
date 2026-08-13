@@ -360,43 +360,24 @@ namespace PerfLint.Llm
                 return;
             }
 
-            // Baseline: the errors this migration set out to fix (the shader's current recorded state).
-            var baseline = CollectErrorsAt(p.VerifyAssetPath);
+            var outcome = WriteVerifyOrRollback(p, raw, fullTarget);
+            string errorSummary = outcome.Errors;
 
-            try
+            if (outcome.WriteFailure != null) { onDone(false, outcome.WriteFailure); return; }
+
+            if (outcome.Progressed)
             {
-                File.WriteAllText(fullTarget, AdaptLineEndings(p.Migrated, raw), new UTF8Encoding(false));
-            }
-            catch (Exception ex) { onDone(false, ex.Message); return; }
-
-            var (ok, errorSummary, caveat) = VerifyShader(p);
-
-            // Layered-error progress (stress-test lesson: fixing the SurfaceData redefinition let compilation
-            // advance and EXPOSE the next layer in a DIFFERENT file — retries can only edit this round's target,
-            // so the correct fix kept getting rolled back with it). If the original errors are gone and every
-            // remaining error lives outside the rewritten file, this file IS fixed: keep it, report the next
-            // layer honestly, and let the next click target the newly-erroring file.
-            if (!ok)
-            {
-                var after = CollectErrorsAt(p.VerifyAssetPath);
-                if (MadeProgress(baseline, after, p.FilePath))
-                {
-                    onDone(true, L.Tr(
-                        "This file is fixed — its original errors are gone. Compiling further revealed the next layer of errors elsewhere:\n" +
-                        errorSummary + "\nClick AI Migrate on this shader again: the next round will target the newly-erroring file.",
-                        "此文件已修复——原有错误已消除。继续编译揭示了位于其他文件的下一层错误：\n" +
-                        errorSummary + "\n再次对该 shader 点 AI Migrate 即可继续——下一轮会自动指向新报错的文件。"));
-                    return;
-                }
+                onDone(true, L.Tr(
+                    "This file is fixed — its original errors are gone. Compiling further revealed the next layer of errors elsewhere:\n" +
+                    errorSummary + "\nClick AI Migrate on this shader again: the next round will target the newly-erroring file.",
+                    "此文件已修复——原有错误已消除。继续编译揭示了位于其他文件的下一层错误：\n" +
+                    errorSummary + "\n再次对该 shader 点 AI Migrate 即可继续——下一轮会自动指向新报错的文件。"));
+                return;
             }
 
-            if (ok)
+            if (outcome.Kept)
             {
-                // The shader reimport can leave the editor's scene lighting state stale (ambient probe /
-                // lighting-data bindings) — the same thing happens when a shader file is edited by hand.
-                // Nudge the environment lighting; a scene reload fixes the rest, so the message says so.
-                try { DynamicGI.UpdateEnvironment(); } catch { }
-                onDone(true, caveat ?? L.Tr(
+                onDone(true, outcome.Notice ?? L.Tr(
                     "File rewritten and the shader now compiles (verified by actively compiling its passes). Check the visual result in your scene. " +
                     "If the Scene/Game view looks dark or unlit afterwards, reopen the scene — a known editor quirk after shader recompiles; your assets are unaffected.",
                     "文件已重写，该 shader 现已编译通过（已主动编译其 pass 验证）。请进场景确认渲染效果。" +
@@ -404,15 +385,9 @@ namespace PerfLint.Llm
                 return;
             }
 
-            // Failed → roll the file back BEFORE anything else (the project must never sit in a broken state).
-            try
+            if (outcome.RollbackFailure != null)
             {
-                File.WriteAllText(fullTarget, raw, new UTF8Encoding(false));
-                Reimport(p);
-            }
-            catch (Exception ex)
-            {
-                onDone(false, L.Tr("Verification failed AND rollback failed — restore the file from version control: ", "验证失败且回滚失败——请从版本控制恢复该文件：") + ex.Message);
+                onDone(false, L.Tr("Verification failed AND rollback failed — restore the file from version control: ", "验证失败且回滚失败——请从版本控制恢复该文件：") + outcome.RollbackFailure);
                 return;
             }
 
@@ -444,6 +419,78 @@ namespace PerfLint.Llm
                 p2.Attempt = nextAttempt;
                 Attempt(p2, onDone);
             }, disableThinking: true);
+        }
+
+        /// <summary>Outcome of one write → verify → (rollback) round on a shader-family file.</summary>
+        internal struct ShaderApplyOutcome
+        {
+            /// <summary>The new content is on disk and verified (or kept under <see cref="Progressed"/>).</summary>
+            public bool Kept;
+            /// <summary>Verification failed and the original bytes were restored.</summary>
+            public bool RolledBack;
+            /// <summary>This file's own errors are gone; what remains lives in OTHER files — the write is kept.</summary>
+            public bool Progressed;
+            /// <summary>Compiler errors behind a failure, or the next layer's errors when <see cref="Progressed"/>.</summary>
+            public string Errors;
+            /// <summary>Human-facing caveat (e.g. deep per-pass verification unavailable); may be null.</summary>
+            public string Notice;
+            /// <summary>Non-null when the write itself failed — nothing was changed on disk.</summary>
+            public string WriteFailure;
+            /// <summary>Non-null when verification failed AND the restore failed — the file is left broken.</summary>
+            public string RollbackFailure;
+        }
+
+        /// <summary>
+        /// One write → verify → (rollback on failure) round on a shader-family file, with no LLM anywhere in it:
+        /// verification is <see cref="VerifyShader"/> (re-import plus an active per-pass compile) and rollback
+        /// restores the exact bytes read before the write.
+        ///
+        /// Shared by the LLM retry loop (<see cref="Attempt"/>) and the agent-driven <c>perflint_apply_verified</c>,
+        /// so the two can never drift on what "verified" means or on the promise that a failed write leaves the file
+        /// exactly as it was. Unlike the C# path this is fully SYNCHRONOUS — shader compilation does not reload the
+        /// domain, so the verdict is known by the time this returns and needs no out-of-band hand-off.
+        /// </summary>
+        internal static ShaderApplyOutcome WriteVerifyOrRollback(MigrateProposal p, string rawOriginal, string fullTarget)
+        {
+            // Baseline: the errors this write set out to fix (the shader's current recorded state).
+            var baseline = CollectErrorsAt(p.VerifyAssetPath);
+
+            try
+            {
+                File.WriteAllText(fullTarget, AdaptLineEndings(p.Migrated, rawOriginal), new UTF8Encoding(false));
+            }
+            catch (Exception ex) { return new ShaderApplyOutcome { WriteFailure = ex.Message }; }
+
+            var (ok, errorSummary, caveat) = VerifyShader(p);
+
+            // Layered-error progress (stress-test lesson: fixing the SurfaceData redefinition let compilation
+            // advance and EXPOSE the next layer in a DIFFERENT file — retries can only edit this round's target,
+            // so the correct fix kept getting rolled back with it). If the original errors are gone and every
+            // remaining error lives outside the rewritten file, this file IS fixed: keep it and report the next
+            // layer honestly, so the next round can target the newly-erroring file.
+            if (!ok && MadeProgress(baseline, CollectErrorsAt(p.VerifyAssetPath), p.FilePath))
+                return new ShaderApplyOutcome { Kept = true, Progressed = true, Errors = errorSummary };
+
+            if (ok)
+            {
+                // The shader reimport can leave the editor's scene lighting state stale (ambient probe /
+                // lighting-data bindings) — the same thing happens when a shader file is edited by hand.
+                // Nudge the environment lighting; a scene reload fixes the rest, so the message says so.
+                try { DynamicGI.UpdateEnvironment(); } catch { }
+                return new ShaderApplyOutcome { Kept = true, Notice = caveat };
+            }
+
+            // Failed → roll the file back BEFORE anything else (the project must never sit in a broken state).
+            try
+            {
+                File.WriteAllText(fullTarget, rawOriginal, new UTF8Encoding(false));
+                Reimport(p);
+            }
+            catch (Exception ex)
+            {
+                return new ShaderApplyOutcome { Errors = errorSummary, RollbackFailure = ex.Message };
+            }
+            return new ShaderApplyOutcome { RolledBack = true, Errors = errorSummary };
         }
 
         /// <summary>
@@ -564,6 +611,7 @@ namespace PerfLint.Llm
                 "- 某处旧逻辑在新 API 下确实找不到对应物时，宁可用行为最接近的保守等价实现并留一行 // TODO(PerfLint AI Migrate): <说明>，也不要编造 API。\n" +
                 "【硬性要求】\n" +
                 "- 输出必须是完整的整个源文件：从第一行到最后一行逐行给出，不得省略、不得用「// ... 其余不变」占位、不得截断。\n" +
+                MigrateRecipes.EnglishOutputRule +
                 "- 若文件是 .shader：Shader \"名字\" 一个字符都不能改；Properties 块里已有的属性一个都不能删或改名。\n" +
                 "- 只做与消除所列编译错误相关的最小改动：函数结构、变量名、注释、空行布局全部保持原样。\n" +
                 "严格按如下格式回复，不要有任何其他文字或解释：\n" +
